@@ -162,10 +162,12 @@ check_inprocess_sealer() (
     [[ "$VERIFY_RC" -eq 3 ]] || fail "改ざん後の verify が exit 3 ではありません (exit=${VERIFY_RC})"
     [[ "$VERIFY_OUT" == *'検証 NG'* ]] || fail "「検証 NG」が出力されていません"
 
-    echo "== 8. 30 票を投票して SIGTERM → フラッシュしない（原則9。残りの封印は締切の手続きの中でだけ）"
-    seq 501 530 | xargs -P 30 -I{} bash -c 'inject {}' >"$CODES"
-    [[ "$({ grep -c '^201$' "$CODES" || true; })" == 30 ]] || fail "30 票が受理されていません"
-    # 30 件 >= 最小件数 10 だが、前回の封印（height=3）から 10 秒経つ前に止める。
+    echo "== 8. 9 票を投票して SIGTERM → フラッシュしない（原則9。残りの封印は締切の手続きの中でだけ）"
+    seq 501 509 | xargs -P 9 -I{} bash -c 'inject {}' >"$CODES"
+    [[ "$({ grep -c '^201$' "$CODES" || true; })" == 9 ]] || fail "9 票が受理されていません"
+    # 5 節で 25 秒待ったので、前回の封印（height=3）から interval（10 秒）はすでに経っている。最小件数（10）以上を
+    # 入れると、停止より前の tick で時間による封印が起きうる（どちらが先かはタイミング次第）ので、最小件数未満の
+    # 9 票にする。件数でも時間でも封印されない状態で止め、停止がフラッシュしない（ブロックが増えない）ことを確かめる。
     graceful_stop api
     if grep -Eq 'shard=0 height=4 ' "$LOG"; then fail "SIGTERM で停止したときに、ブロックが作られました"; fi
     grep -aq '未封印の票はフラッシュせずに残します' "$LOG" || fail "停止時に、フラッシュしない旨のログがありません"
