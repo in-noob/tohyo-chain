@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# 画面のビルド成果物（trunk build。ファイル名にハッシュが付き、ビルドのたびに変わる）
+/crates/web/dist/
+
 # 秘密情報（session_secret / sealer_signing_seed / admin_token / credentials.csv）
 /secrets/
 .env
