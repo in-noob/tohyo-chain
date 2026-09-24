@@ -1,51 +1,67 @@
-//! ブロック封印の判定ロジック（CLAUDE.md 原則9）。
+//! ブロック封印の判定ロジック（CLAUDE.md 原則9。ADR 0003・0020）。
 //!
 //! すべて純粋関数で、時刻は引数で受け取る。時計・IO・状態は持たない。
-//! 時刻は単調増加する秒カウンタ（`u64`）なら何でもよい。
+//! 時刻の単位は秒（呼び出し側の sealer は UNIX 秒を渡す）。
 //!
-//! 窓（前回の封印時刻からの区間）の管理は呼び出し側（sealer）の責務だが、
-//! 判定後の状態更新は [`SealDecision::next_window_start`] と
-//! [`SealDecision::pending_after`] で純粋関数として提供する。
-//!
-//! ルール（シャードごとに独立）:
-//! 1. 未封印が `max_ballots` 件に達したら、到着順に `max_ballots` 件で即封印し窓をリセット。
+//! ルール（シャードごとに独立して判定する）:
+//! 1. 未封印が `max_ballots` 件に達したら、到着順に `max_ballots` 件ですぐに封印する（[`SealDecision::SealCount`]）。
 //!    超過分は繰り越す。
-//! 2. 窓の開始から `max_interval_secs` 秒経過したとき、未封印が 1 件以上なら全件封印して
-//!    窓をリセット。0 件ならブロックを作らず窓だけリセット（到着時刻の漏洩を防ぐ）。
-//! 3. 選挙締切・sealer 正常停止時は [`decide_flush`] で残りをすべて封印する。
+//! 2. 経過時間の起点（[`window_start`] = max(前回の封印時刻, 投票開始時刻)）から `interval_secs` 秒以上経ち、
+//!    かつ未封印が `min_ballots_after_interval` 件以上なら、全件を封印する（[`SealDecision::SealAll`]）。
+//! 3. 上の 2 つに当てはまらなければ待つ（[`SealDecision::Wait`]）。0 件のときも待つ。ブロックを作らない判定で、
+//!    起点（窓）を動かすことはない（起点が動くのは、封印したときだけ）。
+//! 4. 投票終了（締切の手続き）の中でだけ、[`decide_close`] で残りを件数に関係なく封印する
+//!    （[`SealDecision::CloseFlush`]）。1 ブロックが `max_ballots` 件を超えないよう、`max_ballots` 件以上
+//!    残っている間は [`SealDecision::SealCount`] を返す。0 件なら何もしない。
 
 /// 既定の 1 ブロックあたり最大件数（`seal.max_ballots`）。
 pub const DEFAULT_MAX_BALLOTS: usize = 100;
-/// 既定の窓の最大秒数（`seal.max_interval_secs`）。
-pub const DEFAULT_MAX_INTERVAL_SECS: u64 = 600;
+/// 既定の、時間による封印の間隔（`seal.interval_secs`）。
+pub const DEFAULT_INTERVAL_SECS: u64 = 600;
+/// 既定の、時間による封印に必要な最小件数（`seal.min_ballots_after_interval`）。
+pub const DEFAULT_MIN_BALLOTS_AFTER_INTERVAL: usize = 10;
 
 /// 封印ポリシーの設定値が不正。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
     #[error("max_ballots は 1 以上でなければなりません")]
     ZeroMaxBallots,
-    #[error("max_interval_secs は 1 以上でなければなりません")]
-    ZeroMaxInterval,
+    #[error("interval_secs は 1 以上でなければなりません")]
+    ZeroInterval,
+    #[error("min_ballots_after_interval は 1 以上でなければなりません")]
+    ZeroMinBallots,
 }
 
-/// 封印ポリシー。0 は無限ループや常時封印を招くため、`new` で拒否する。
+/// 封印ポリシー。0 は、常時封印（空のブロック）や判定の無限ループを招くため、`new` で拒否する。
+///
+/// `min_ballots_after_interval > max_ballots` は拒否しない。その場合は、件数による封印が常に先に起きるので、
+/// 時間による封印が起きないだけ（動作は明確）。確認用に `max_ballots` だけを小さくする設定を許すため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealPolicy {
     max_ballots: usize,
-    max_interval_secs: u64,
+    interval_secs: u64,
+    min_ballots_after_interval: usize,
 }
 
 impl SealPolicy {
-    pub fn new(max_ballots: usize, max_interval_secs: u64) -> Result<Self, PolicyError> {
+    pub fn new(
+        max_ballots: usize,
+        interval_secs: u64,
+        min_ballots_after_interval: usize,
+    ) -> Result<Self, PolicyError> {
         if max_ballots == 0 {
             return Err(PolicyError::ZeroMaxBallots);
         }
-        if max_interval_secs == 0 {
-            return Err(PolicyError::ZeroMaxInterval);
+        if interval_secs == 0 {
+            return Err(PolicyError::ZeroInterval);
+        }
+        if min_ballots_after_interval == 0 {
+            return Err(PolicyError::ZeroMinBallots);
         }
         Ok(Self {
             max_ballots,
-            max_interval_secs,
+            interval_secs,
+            min_ballots_after_interval,
         })
     }
 
@@ -53,8 +69,12 @@ impl SealPolicy {
         self.max_ballots
     }
 
-    pub fn max_interval_secs(&self) -> u64 {
-        self.max_interval_secs
+    pub fn interval_secs(&self) -> u64 {
+        self.interval_secs
+    }
+
+    pub fn min_ballots_after_interval(&self) -> usize {
+        self.min_ballots_after_interval
     }
 }
 
@@ -62,7 +82,8 @@ impl Default for SealPolicy {
     fn default() -> Self {
         Self {
             max_ballots: DEFAULT_MAX_BALLOTS,
-            max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
+            interval_secs: DEFAULT_INTERVAL_SECS,
+            min_ballots_after_interval: DEFAULT_MIN_BALLOTS_AFTER_INTERVAL,
         }
     }
 }
@@ -70,268 +91,328 @@ impl Default for SealPolicy {
 /// 封印の判定結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealDecision {
-    /// まだ封印しない。窓もそのまま。
-    Wait,
-    /// 到着順の先頭 N 件で封印し、窓をリセットする。残りは繰り越す。
+    /// 到着順の先頭 N 件（= `max_ballots`）で封印する。残りは繰り越す。
     SealCount(usize),
-    /// 未封印の全件で封印し、窓をリセットする。
+    /// 時間による封印: 未封印の全件で封印する。
     SealAll,
-    /// ブロックは作らず、窓だけリセットする（0 件で窓が満了した場合）。
-    ResetWindowOnly,
+    /// まだ封印しない。起点（窓）も動かさない。
+    Wait,
+    /// 投票終了の手続きの中での封印: 残り（1 件以上 `max_ballots` 件未満）の全件で封印する。
+    CloseFlush,
 }
 
 impl SealDecision {
-    /// この判定を実行した後の窓の開始時刻。`Wait` 以外は窓をリセットして `now` になる。
-    pub fn next_window_start(self, window_start: u64, now: u64) -> u64 {
-        match self {
-            Self::Wait => window_start,
-            Self::SealCount(_) | Self::SealAll | Self::ResetWindowOnly => now,
-        }
-    }
-
     /// この判定を実行した後の未封印件数。
     pub fn pending_after(self, pending: usize) -> usize {
         match self {
             Self::Wait => pending,
             Self::SealCount(n) => pending.saturating_sub(n),
-            Self::SealAll | Self::ResetWindowOnly => 0,
+            Self::SealAll | Self::CloseFlush => 0,
         }
+    }
+
+    /// ブロックを作る判定か（起点を封印時刻に進めるか）。
+    pub fn seals(self) -> bool {
+        !matches!(self, Self::Wait)
     }
 }
 
-/// 通常運転時の封印判定。
+/// 経過時間を測り始める時刻 = max(前回の封印時刻, 投票開始時刻)。
+///
+/// - `last_sealed_at`: このシャードで前回、票を封印した時刻。まだ封印していなければ `None`
+/// - `voting_opened_at`: 投票開始時刻。開始前に投入された票はない前提（原則18 の受付判定が保証する）なので、
+///   最初のブロックの経過時間は、投票開始時刻から測る
+pub fn window_start(last_sealed_at: Option<u64>, voting_opened_at: u64) -> u64 {
+    last_sealed_at.map_or(voting_opened_at, |sealed| sealed.max(voting_opened_at))
+}
+
+/// 投票期間中の封印判定。
 ///
 /// - `pending`: 未封印の票の件数
-/// - `window_start`: 現在の窓の開始時刻（秒）
-/// - `now`: 現在時刻（秒）。`window_start` より前（時計の巻き戻り）なら経過 0 として扱う
+/// - `window_start`: 経過時間の起点（[`window_start`] で求める）
+/// - `now`: 現在時刻。`window_start` より前（時計の巻き戻り）なら経過 0 として扱う
 pub fn decide(pending: usize, window_start: u64, now: u64, policy: &SealPolicy) -> SealDecision {
-    // 件数到達が最優先。時間切れと同時でも、到着順に max_ballots 件だけ封印する。
+    // 件数の到達が最優先。時間の条件と同時でも、到着順に max_ballots 件だけ封印する。
     if pending >= policy.max_ballots {
         return SealDecision::SealCount(policy.max_ballots);
     }
     let elapsed = now.saturating_sub(window_start);
-    if elapsed >= policy.max_interval_secs {
-        return if pending == 0 {
-            SealDecision::ResetWindowOnly
-        } else {
-            SealDecision::SealAll
-        };
+    if elapsed >= policy.interval_secs && pending >= policy.min_ballots_after_interval {
+        return SealDecision::SealAll;
     }
     SealDecision::Wait
 }
 
-/// 選挙締切・sealer 正常停止時の判定。件数や経過時間に関係なく残りをすべて封印する。
-/// 0 件なら空ブロックは作らない（`ResetWindowOnly`）。
-pub fn decide_flush(pending: usize) -> SealDecision {
-    if pending == 0 {
-        SealDecision::ResetWindowOnly
+/// 投票終了（締切の手続き）の中での封印判定。件数や経過時間に関係なく、残りをすべて封印する。
+/// ブロックの票数が `max_ballots` を超えないよう、`max_ballots` 件以上ある間は `SealCount` を返す
+/// （250 件なら SealCount(100) → SealCount(100) → CloseFlush（50 件））。0 件なら `Wait`（空のブロックは作らない）。
+pub fn decide_close(pending: usize, policy: &SealPolicy) -> SealDecision {
+    if pending >= policy.max_ballots {
+        SealDecision::SealCount(policy.max_ballots)
+    } else if pending > 0 {
+        SealDecision::CloseFlush
     } else {
-        SealDecision::SealAll
+        SealDecision::Wait
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use SealDecision::{ResetWindowOnly, SealAll, SealCount, Wait};
+    use SealDecision::{CloseFlush, SealAll, SealCount, Wait};
 
     const P: SealPolicy = SealPolicy {
         max_ballots: DEFAULT_MAX_BALLOTS,
-        max_interval_secs: DEFAULT_MAX_INTERVAL_SECS,
+        interval_secs: DEFAULT_INTERVAL_SECS,
+        min_ballots_after_interval: DEFAULT_MIN_BALLOTS_AFTER_INTERVAL,
     };
+    const MIN: u64 = 60;
+    /// 投票開始時刻（テストの時刻の原点）。
+    const OPEN: u64 = 1_800_000_000;
 
-    /// 判定を連続適用するための、呼び出し側（sealer）相当の状態。
+    /// 判定を連続で適用するための、呼び出し側（sealer）相当の状態。
     struct Sim {
         pending: usize,
-        window_start: u64,
+        last_sealed_at: Option<u64>,
+        opened_at: u64,
     }
 
     impl Sim {
+        fn new(pending: usize) -> Self {
+            Self {
+                pending,
+                last_sealed_at: None,
+                opened_at: OPEN,
+            }
+        }
+
         fn step(&mut self, now: u64) -> SealDecision {
-            let d = decide(self.pending, self.window_start, now, &P);
-            self.window_start = d.next_window_start(self.window_start, now);
-            self.pending = d.pending_after(self.pending);
+            let start = window_start(self.last_sealed_at, self.opened_at);
+            let d = decide(self.pending, start, now, &P);
+            self.apply(d, now);
             d
+        }
+
+        fn close(&mut self, now: u64) -> SealDecision {
+            let d = decide_close(self.pending, &P);
+            self.apply(d, now);
+            d
+        }
+
+        fn apply(&mut self, d: SealDecision, now: u64) {
+            if d.seals() {
+                self.last_sealed_at = Some(now);
+            }
+            self.pending = d.pending_after(self.pending);
+        }
+
+        /// 投票終了の手続き: `Wait` になるまで `decide_close` を繰り返し、封印した件数の列を返す。
+        fn close_all(&mut self, now: u64) -> Vec<usize> {
+            let mut sealed = Vec::new();
+            loop {
+                let before = self.pending;
+                match self.close(now) {
+                    Wait => return sealed,
+                    SealCount(n) => sealed.push(n),
+                    CloseFlush | SealAll => sealed.push(before),
+                }
+            }
         }
     }
 
     // --- 依頼された必須ケース ---
 
     #[test]
-    fn case_99_ballots_at_9m59s_waits() {
-        assert_eq!(decide(99, 0, 9 * 60 + 59, &P), Wait);
+    fn case_99_ballots_at_9m59s_waits_and_100_ballots_seal_at_any_time() {
+        let start = window_start(None, OPEN);
+        assert_eq!(decide(99, start, OPEN + 9 * MIN + 59, &P), Wait);
+        for now in [
+            OPEN,
+            OPEN + 1,
+            OPEN + 9 * MIN + 59,
+            OPEN + 10 * MIN,
+            OPEN + 100 * MIN,
+        ] {
+            assert_eq!(decide(100, start, now, &P), SealCount(100), "now={now}");
+        }
     }
 
     #[test]
-    fn case_100_ballots_at_1s_seals_count_100() {
-        assert_eq!(decide(100, 0, 1, &P), SealCount(100));
-    }
-
-    #[test]
-    fn case_250_ballots_seal_100_100_then_wait_for_window_expiry() {
-        let mut sim = Sim {
-            pending: 250,
-            window_start: 1_000,
-        };
-        assert_eq!(sim.step(1_000), SealCount(100));
-        assert_eq!(sim.pending, 150);
-        assert_eq!(sim.step(1_000), SealCount(100));
+    fn case_250_ballots_seal_100_100_then_the_remaining_50_at_10_minutes() {
+        let mut sim = Sim::new(250);
+        assert_eq!(sim.step(OPEN + 5), SealCount(100));
+        assert_eq!(sim.step(OPEN + 5), SealCount(100));
         assert_eq!(sim.pending, 50);
-        // 残り 50 件は、窓（直前の封印時刻 1_000）が満了するまで待つ。
-        assert_eq!(sim.step(1_000), Wait);
-        assert_eq!(sim.step(1_000 + 599), Wait);
-        assert_eq!(sim.step(1_000 + 600), SealAll);
+        // 残り 50 件は、前回の封印（OPEN + 5）から 10 分経つまで待つ。
+        assert_eq!(sim.step(OPEN + 5), Wait);
+        assert_eq!(sim.step(OPEN + 5 + 10 * MIN - 1), Wait);
+        assert_eq!(sim.step(OPEN + 5 + 10 * MIN), SealAll);
         assert_eq!(sim.pending, 0);
     }
 
     #[test]
-    fn case_1_ballot_at_exactly_600s_seals_all() {
-        assert_eq!(decide(1, 0, 600, &P), SealAll);
+    fn case_9_ballots_at_10_minutes_wait_then_the_10th_at_12_minutes_seals_all_at_once() {
+        let mut sim = Sim::new(9);
+        assert_eq!(sim.step(OPEN + 10 * MIN), Wait);
+        assert_eq!(sim.step(OPEN + 11 * MIN), Wait);
+        // 12 分の時点で 10 件目が届いた: すぐに（その時点で）全 10 件を封印する。
+        sim.pending += 1;
+        let before = sim.pending;
+        assert_eq!(sim.step(OPEN + 12 * MIN), SealAll);
+        assert_eq!(before, 10);
+        assert_eq!(sim.pending, 0);
     }
 
     #[test]
-    fn case_0_ballots_at_600s_resets_window_only() {
-        assert_eq!(decide(0, 0, 600, &P), ResetWindowOnly);
+    fn case_exactly_10_ballots_at_exactly_10_minutes_seals_all() {
+        let start = window_start(None, OPEN);
+        assert_eq!(decide(10, start, OPEN + 10 * MIN, &P), SealAll);
+        // 境界の 1 つ手前（件数・時間のどちらか）は待つ。
+        assert_eq!(decide(9, start, OPEN + 10 * MIN, &P), Wait);
+        assert_eq!(decide(10, start, OPEN + 10 * MIN - 1, &P), Wait);
     }
 
     #[test]
-    fn case_flush_37_ballots_seals_all() {
-        assert_eq!(decide_flush(37), SealAll);
+    fn case_0_ballots_at_10_minutes_wait_without_a_block_or_a_window_reset() {
+        let mut sim = Sim::new(0);
+        assert_eq!(sim.step(OPEN + 10 * MIN), Wait);
+        // 窓はリセットしない: 起点は投票開始のまま。
+        assert_eq!(sim.last_sealed_at, None);
+        // その後 10 件届けば、（窓をリセットしていないので）すぐに封印する。
+        sim.pending = 10;
+        assert_eq!(sim.step(OPEN + 10 * MIN + 1), SealAll);
     }
 
     #[test]
-    fn case_elapsed_is_recomputed_from_the_reset_window() {
-        // 窓 0 で 100 件到達 → 100 秒時点で封印、新しい窓は 100 から始まる。
-        let d = decide(100, 0, 100, &P);
-        assert_eq!(d, SealCount(100));
-        let new_start = d.next_window_start(0, 100);
-        assert_eq!(new_start, 100);
-
-        // 新しい窓の起点（100）から測るので、699 秒（経過 599）はまだ待つ。
-        assert_eq!(decide(1, new_start, 699, &P), Wait);
-        assert_eq!(decide(1, new_start, 700, &P), SealAll);
-        // 古い起点（0）のままなら 699 秒で満了してしまう（これが誤り）。
-        assert_eq!(decide(1, 0, 699, &P), SealAll);
+    fn case_close_seals_3_as_one_block() {
+        let mut sim = Sim::new(3);
+        assert_eq!(sim.close_all(OPEN + MIN), vec![3]);
+        assert_eq!(decide_close(3, &P), CloseFlush);
     }
 
     #[test]
-    fn empty_window_reset_also_restarts_the_clock() {
-        let d = decide(0, 0, 600, &P);
-        let new_start = d.next_window_start(0, 600);
-        assert_eq!(new_start, 600);
-        assert_eq!(decide(1, new_start, 1_199, &P), Wait);
-        assert_eq!(decide(1, new_start, 1_200, &P), SealAll);
+    fn case_close_with_0_ballots_does_nothing() {
+        let mut sim = Sim::new(0);
+        assert_eq!(sim.close_all(OPEN + MIN), Vec::<usize>::new());
+        assert_eq!(decide_close(0, &P), Wait);
+    }
+
+    #[test]
+    fn case_close_splits_250_into_100_100_50() {
+        let mut sim = Sim::new(250);
+        assert_eq!(sim.close_all(OPEN + MIN), vec![100, 100, 50]);
+        assert_eq!(decide_close(250, &P), SealCount(100));
+        assert_eq!(decide_close(100, &P), SealCount(100));
+        assert_eq!(decide_close(50, &P), CloseFlush);
+    }
+
+    #[test]
+    fn case_the_voting_start_is_the_origin_of_the_elapsed_time() {
+        // 開始前に投入された票はない前提。まだ一度も封印していなければ、起点は投票開始時刻。
+        assert_eq!(window_start(None, OPEN), OPEN);
+        // 投票開始から 10 分経たないうちは、10 件以上あっても時間では封印しない
+        // （時計の原点（0）から測っていたら、ここで封印してしまう）。
+        assert_eq!(
+            decide(10, window_start(None, OPEN), OPEN + 10 * MIN - 1, &P),
+            Wait
+        );
+        assert_eq!(
+            decide(10, window_start(None, OPEN), OPEN + 10 * MIN, &P),
+            SealAll
+        );
+        // 投票開始より前の封印（ジェネシスなど）が記録されていても、起点は投票開始時刻。
+        assert_eq!(window_start(Some(OPEN - 3_600), OPEN), OPEN);
+        // 投票開始より後に封印していれば、起点はその封印時刻。
+        assert_eq!(window_start(Some(OPEN + 7), OPEN), OPEN + 7);
     }
 
     // --- 境界・補足 ---
 
     #[test]
-    fn interval_boundary_is_inclusive() {
-        assert_eq!(decide(1, 0, 599, &P), Wait);
-        assert_eq!(decide(1, 0, 600, &P), SealAll);
-        assert_eq!(decide(1, 0, 601, &P), SealAll);
+    fn the_window_is_measured_from_the_last_seal() {
+        let mut sim = Sim::new(100);
+        assert_eq!(sim.step(OPEN + 3 * MIN), SealCount(100));
+        sim.pending = 10;
+        // 前回の封印（3 分）から 10 分経つまでは待つ（投票開始から測ると 10 分を過ぎているが）。
+        assert_eq!(sim.step(OPEN + 12 * MIN), Wait);
+        assert_eq!(sim.step(OPEN + 13 * MIN), SealAll);
     }
 
     #[test]
-    fn zero_pending_before_expiry_waits() {
-        assert_eq!(decide(0, 0, 0, &P), Wait);
-        assert_eq!(decide(0, 0, 599, &P), Wait);
+    fn a_minimum_above_the_maximum_only_disables_sealing_by_time() {
+        let p = SealPolicy::new(3, 10, 10).expect("valid policy");
+        assert_eq!(decide(2, OPEN, OPEN + 1_000, &p), Wait);
+        assert_eq!(decide(3, OPEN, OPEN, &p), SealCount(3));
     }
 
     #[test]
-    fn count_limit_takes_priority_over_expiry() {
-        assert_eq!(decide(250, 0, 600, &P), SealCount(100));
-        assert_eq!(decide(100, 0, 10_000, &P), SealCount(100));
-    }
-
-    #[test]
-    fn count_boundary() {
-        assert_eq!(decide(99, 0, 0, &P), Wait);
-        assert_eq!(decide(100, 0, 0, &P), SealCount(100));
-        assert_eq!(decide(101, 0, 0, &P), SealCount(100));
+    fn count_limit_takes_priority_over_time() {
+        assert_eq!(decide(250, OPEN, OPEN + 10 * MIN, &P), SealCount(100));
+        assert_eq!(decide(101, OPEN, OPEN, &P), SealCount(100));
     }
 
     #[test]
     fn clock_going_backwards_counts_as_zero_elapsed() {
-        assert_eq!(decide(1, 1_000, 500, &P), Wait);
-        assert_eq!(decide(0, u64::MAX, 0, &P), Wait);
+        assert_eq!(decide(50, OPEN, OPEN - 1, &P), Wait);
+        assert_eq!(decide(50, u64::MAX, 0, &P), Wait);
     }
 
     #[test]
-    fn flush_with_zero_pending_makes_no_block() {
-        assert_eq!(decide_flush(0), ResetWindowOnly);
-        assert_eq!(decide_flush(1), SealAll);
-        assert_eq!(decide_flush(100), SealAll);
-        assert_eq!(decide_flush(10_000), SealAll);
-    }
-
-    #[test]
-    fn next_window_start_per_decision() {
-        assert_eq!(Wait.next_window_start(5, 9), 5);
-        assert_eq!(SealCount(100).next_window_start(5, 9), 9);
-        assert_eq!(SealAll.next_window_start(5, 9), 9);
-        assert_eq!(ResetWindowOnly.next_window_start(5, 9), 9);
-    }
-
-    #[test]
-    fn pending_after_per_decision() {
+    fn pending_after_and_seals_per_decision() {
         assert_eq!(Wait.pending_after(42), 42);
         assert_eq!(SealCount(100).pending_after(250), 150);
-        assert_eq!(SealCount(100).pending_after(100), 0);
         assert_eq!(SealAll.pending_after(42), 0);
-        assert_eq!(ResetWindowOnly.pending_after(0), 0);
+        assert_eq!(CloseFlush.pending_after(42), 0);
+        assert!(!Wait.seals());
+        assert!(SealCount(100).seals() && SealAll.seals() && CloseFlush.seals());
     }
 
     #[test]
-    fn policy_rejects_zero_values() {
-        assert_eq!(SealPolicy::new(0, 600), Err(PolicyError::ZeroMaxBallots));
-        assert_eq!(SealPolicy::new(100, 0), Err(PolicyError::ZeroMaxInterval));
-        let p = SealPolicy::new(3, 7).expect("valid policy");
-        assert_eq!((p.max_ballots(), p.max_interval_secs()), (3, 7));
+    fn policy_rejects_invalid_values() {
+        assert_eq!(
+            SealPolicy::new(0, 600, 10),
+            Err(PolicyError::ZeroMaxBallots)
+        );
+        assert_eq!(SealPolicy::new(100, 0, 10), Err(PolicyError::ZeroInterval));
+        assert_eq!(
+            SealPolicy::new(100, 600, 0),
+            Err(PolicyError::ZeroMinBallots)
+        );
+        let p = SealPolicy::new(3, 7, 2).expect("valid policy");
+        assert_eq!(
+            (
+                p.max_ballots(),
+                p.interval_secs(),
+                p.min_ballots_after_interval()
+            ),
+            (3, 7, 2)
+        );
     }
 
     #[test]
-    fn default_policy_is_100_ballots_600_secs() {
-        let p = SealPolicy::default();
-        assert_eq!((p.max_ballots(), p.max_interval_secs()), (100, 600));
+    fn default_policy_is_100_ballots_600_secs_10_ballots() {
+        assert_eq!(SealPolicy::default(), P);
+        let p = SealPolicy::new(100, 600, 10).expect("valid policy");
+        assert_eq!(p, SealPolicy::default());
     }
 
     #[test]
-    fn custom_policy_is_respected() {
-        let p = SealPolicy::new(3, 10).expect("valid policy");
-        assert_eq!(decide(3, 0, 0, &p), SealCount(3));
-        assert_eq!(decide(2, 0, 9, &p), Wait);
-        assert_eq!(decide(2, 0, 10, &p), SealAll);
-    }
-
-    #[test]
-    fn one_arrival_per_second_seals_every_ballot_exactly_once() {
-        let mut sim = Sim {
-            pending: 0,
-            window_start: 0,
-        };
+    fn one_arrival_per_minute_seals_every_ballot_exactly_once() {
+        let mut sim = Sim::new(0);
         let mut sealed = Vec::new();
-        let mut record = |d: SealDecision, before: usize| match d {
-            SealCount(n) => sealed.push(n),
-            SealAll => sealed.push(before),
-            Wait | ResetWindowOnly => {}
-        };
-
-        // 250 件が 1 秒に 1 件ずつ到着する。
-        for t in 1..=250u64 {
+        // 25 件が 1 分に 1 件ずつ到着する。
+        for i in 1..=25u64 {
             sim.pending += 1;
             let before = sim.pending;
-            let d = sim.step(t);
-            record(d, before);
+            match sim.step(OPEN + i * MIN) {
+                SealCount(n) => sealed.push(n),
+                SealAll | CloseFlush => sealed.push(before),
+                Wait => {}
+            }
         }
-        // 到着が止んだ後、時間だけ進めて残りを封印させる。
-        for t in 251..=2_000u64 {
-            let before = sim.pending;
-            let d = sim.step(t);
-            record(d, before);
-        }
-
-        assert_eq!(sealed, vec![100, 100, 50]);
+        // 10 分（10 件）で 1 ブロック、次の 10 分（20 分時点で 10 件）で 1 ブロック、残り 5 件は締切で。
+        assert_eq!(sealed, vec![10, 10]);
+        assert_eq!(sim.close_all(OPEN + 26 * MIN), vec![5]);
         assert_eq!(sim.pending, 0);
     }
 }

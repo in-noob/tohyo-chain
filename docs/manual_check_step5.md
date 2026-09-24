@@ -11,7 +11,8 @@
   ```
   APP__SESSION__SECRET=dev-secret-0123456789abcdef cargo run -p api --features dev-tools
   ```
-  （ポート 18080。票の封印を短い間隔で確かめたいときは `APP__SEAL__MAX_INTERVAL_SECS=10` を付ける）
+  （ポート 18080。票の封印を短い間隔で確かめたいときは `APP__SEAL__INTERVAL_SECS=10 APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1` を付ける。
+  既定の最小件数は 10 件で、それ未満の票は時間では封印されない。原則9）
 - [ ] 端末 B で画面を起動: `cd crates/web && trunk serve`
 - [ ] ブラウザで http://localhost:8080 を開く。ログイン画面が表示される
 - [ ] 開発者ツール（F12）を開き、Console にエラーが出ていない
@@ -104,6 +105,6 @@
 ## 11. 任意: 封印との連携
 
 - [ ] `curl http://localhost:18080/debug/pool` の `total` が、画面から行った投票数と一致する
-- [ ] `APP__SEAL__MAX_INTERVAL_SECS=10` で API を起動して投票し、10 秒ほど後に
+- [ ] `APP__SEAL__INTERVAL_SECS=10 APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1` で API を起動して投票し、10 秒ほど後に
       `cargo run -q -p verifier -- verify --api http://localhost:18080` が「検証 OK」になる
       （完了画面の文言は「受け付けました」のみで、封印の完了とは無関係であることも確認する）

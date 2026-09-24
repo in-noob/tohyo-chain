@@ -64,7 +64,14 @@ fn default_toml_alone_is_valid_and_has_the_documented_defaults() {
     assert_eq!(c.db.backend, DbBackend::Cassandra);
     assert_eq!(c.db.nodes, vec!["127.0.0.1:9042".to_string()]);
     assert_eq!(c.db.keyspace, "vote");
-    assert_eq!((c.seal.max_ballots, c.seal.max_interval_secs), (100, 600));
+    assert_eq!(
+        (
+            c.seal.max_ballots,
+            c.seal.interval_secs,
+            c.seal.min_ballots_after_interval
+        ),
+        (100, 600, 10)
+    );
     assert_eq!(c.sealer.lease_ttl_secs, 30);
     assert_eq!(c.sealer.id, None);
     assert_eq!(c.shard.count.get(), 1);
@@ -99,7 +106,7 @@ fn layers_override_in_order_default_env_file_local_secrets_env() {
     let (config, secrets) = (TempDir::new(), TempDir::new());
     config.write(
         "dev.toml",
-        "[seal]\nmax_ballots = 10\nmax_interval_secs = 20\n[shard]\ncount = 2\n",
+        "[seal]\nmax_ballots = 10\ninterval_secs = 20\n[shard]\ncount = 2\n",
     );
     config.write("local.toml", "[seal]\nmax_ballots = 30\n");
     let loaded = load_from(&sources(
@@ -110,7 +117,7 @@ fn layers_override_in_order_default_env_file_local_secrets_env() {
     .expect("valid");
     let c = &loaded.config;
     assert_eq!(c.seal.max_ballots, 5, "環境変数が最優先");
-    assert_eq!(c.seal.max_interval_secs, 20, "dev.toml が既定を上書き");
+    assert_eq!(c.seal.interval_secs, 20, "dev.toml が既定を上書き");
     assert_eq!(c.shard.count.get(), 2);
     assert_eq!(c.api.port, 18080, "どこにも無ければ既定値");
     assert_eq!(
@@ -118,7 +125,7 @@ fn layers_override_in_order_default_env_file_local_secrets_env() {
         Some(&Origin::Env("APP__SEAL__MAX_BALLOTS".to_string()))
     );
     assert_eq!(
-        loaded.origin("seal.max_interval_secs"),
+        loaded.origin("seal.interval_secs"),
         Some(&Origin::File(config.path().join("dev.toml")))
     );
 
@@ -400,7 +407,8 @@ fn field_validation_rules() {
         ("db.nodes", "h:99999", "port"),
         ("db.keyspace", "a-b", "英字"),
         ("db.keyspace", &"k".repeat(49), "48"),
-        ("seal.max_interval_secs", "0", "1 以上"),
+        ("seal.interval_secs", "0", "1 以上"),
+        ("seal.min_ballots_after_interval", "0", "1 以上"),
         ("sealer.lease_ttl_secs", "2", "3 以上"),
         ("auth.mode", "ldap", "stub / db"),
         ("auth.argon2.memory_kib", "4", "8 以上"),
@@ -626,7 +634,13 @@ fn shipped_config_files_are_valid() {
         ..dev
     };
     let loaded = load_from(&dev).expect("dev.toml is valid");
-    assert_eq!(loaded.config.seal.max_interval_secs, 10);
+    assert_eq!(
+        (
+            loaded.config.seal.interval_secs,
+            loaded.config.seal.min_ballots_after_interval
+        ),
+        (10, 10)
+    );
 
     config.write(
         "production.toml",

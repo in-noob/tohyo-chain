@@ -106,7 +106,7 @@ fn config(shards: u16) -> Config {
             iterations: 1,
             parallelism: 1,
         },
-        seal_policy: SealPolicy::new(100, 10).expect("valid policy"),
+        seal_policy: SealPolicy::new(100, 10, 10).expect("valid policy"),
         sealer_signing_seed: Some([7u8; 32]),
         reveal: api::RevealPolicy::Always,
         request_timeout: std::time::Duration::from_secs(10),
@@ -749,7 +749,7 @@ async fn chain_endpoints_expose_sealed_blocks_without_authentication() {
     assert_eq!(head["signer_public_key"].as_str().expect("key").len(), 64);
 
     vote_many(&app, 5).await;
-    let outcome = sealer.flush().await;
+    let outcome = sealer.close_flush().await;
     assert!(outcome.errors.is_empty());
     assert_eq!(outcome.events.len(), 1);
 
@@ -798,7 +798,7 @@ async fn chain_endpoints_expose_sealed_blocks_without_authentication() {
 async fn chain_fetched_over_http_verifies_with_the_published_key() {
     let (app, mut sealer) = built(1, 1_000).await;
     vote_many(&app, 12).await;
-    sealer.flush().await;
+    sealer.close_flush().await;
 
     let (blocks, public_key) = fetch_chain(&app).await;
     assert_eq!(blocks.len(), 2);
@@ -816,7 +816,7 @@ async fn chain_fetched_over_http_verifies_with_the_published_key() {
 async fn tamper_breaks_chain_verification_and_reveals_only_the_location() {
     let (app, mut sealer) = built(1, 1_000).await;
     vote_many(&app, 6).await;
-    sealer.flush().await;
+    sealer.close_flush().await;
 
     let (blocks, public_key) = fetch_chain(&app).await;
     let verifier = Ed25519Verifier::from_public_key(&public_key).expect("key");
@@ -866,7 +866,7 @@ async fn latest_anchor_is_absent_until_created_and_then_verifies_against_the_cha
     assert_error(&body, "not_found");
 
     vote_many(&app, 6).await;
-    sealer.flush().await;
+    sealer.close_flush().await;
     let anchor = sealer.anchor().await.expect("anchor").expect("created");
 
     // 認証なしで取得でき、署名の公開鍵（head が示すもの）で検証でき、head が実チェーンと一致する。
@@ -948,7 +948,7 @@ async fn audit_counts_report_participation_and_pending_per_ballot_only() {
     assert_eq!((status, body), (StatusCode::OK, expected(3, 2)));
 
     // 封印すると pending だけが 0 になり、participation は変わらない。
-    sealer.flush().await;
+    sealer.close_flush().await;
     let (_, body) = send(&app, "GET", "/api/v1/audit/counts", None, None).await;
     assert_eq!(body, expected(0, 0));
     // 集計値だけで、投票者・票の中身は含まれない。
@@ -1000,7 +1000,7 @@ async fn seal_one_by_one(app: &Router, sealer: &mut Sealer, voters: std::ops::Ra
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert!(sealer.flush().await.errors.is_empty());
+        assert!(sealer.close_flush().await.errors.is_empty());
     }
 }
 

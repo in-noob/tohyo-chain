@@ -1,10 +1,13 @@
-//! `Sealer` を tokio タスクとして周期実行し、停止時にフラッシュする。
+//! `Sealer` を tokio タスクとして周期実行する。
+//!
+//! 残りの票の封印（フラッシュ）は、選挙状態が closing の間（締切の手続き）にだけ行う。停止（SIGTERM）では
+//! フラッシュしない（原則9）。未封印の票はストアに残り、次の起動・締切の手続きで封印される。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use application::{ElectionStateStore, StoreError};
-use domain::{ElectionPhase, automatic_transition};
+use application::{ElectionStateSnapshot, ElectionStateStore, StoreError};
+use domain::{ElectionPhase, automatic_transition, voting_started_at};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -24,7 +27,7 @@ pub struct SealerHandle {
 }
 
 impl SealerHandle {
-    /// 停止を指示し、締切フラッシュ（残りをすべて封印）が終わるまで待つ。
+    /// 停止を指示し、終了処理（最終アンカーの確認・リースの解放）が終わるまで待つ。票のフラッシュはしない。
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         // 受信側（タスク）が既に終わっていても構わない。
         let _ = self.stop.send(true);
@@ -35,8 +38,8 @@ impl SealerHandle {
 /// `sealer` をバックグラウンドタスクとして起動する（`init` 済みであること）。リースは使わず、全シャードを
 /// このプロセスが担当する（`app.mode=memory` のプロセス内 sealer 用）。
 ///
-/// `anchor_interval` ごとに、アンカーを作るかどうかを判定する（変化がなければ作らない）。ハンドルが `shutdown` されるか、破棄されて送信側が閉じると、
-/// フラッシュしてから終了する。
+/// `anchor_interval` ごとに、アンカーを作るかどうかを判定する（変化がなければ作らない）。ハンドルが `shutdown` されるか、
+/// 破棄されて送信側が閉じると、最終アンカー（変化がなければ確認だけ）を済ませて終了する。票のフラッシュはしない（原則9）。
 ///
 /// `election` / `election_grace`: 選挙状態（scheduled → open → closing → closed）の自動遷移と
 /// 締切の手続きを、このプロセス内のスケジューラが行う（原則17。memory モードにはリース・複数プロセスが
@@ -58,6 +61,11 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = timer.tick() => {
+                    let snapshot = election_snapshot(&election).await;
+                    // 経過時間の起点（投票開始時刻）を、選挙状態から毎周期取り直す。
+                    if let Some(snapshot) = &snapshot {
+                        sealer.set_voting_started_at(voting_started_at(snapshot.period, snapshot.opened_at));
+                    }
                     // 失敗は tick 内でログ済み。次の周期で再試行する。
                     sealer.tick().await;
                     if anchors.due(sealer.now())
@@ -65,14 +73,15 @@ pub fn spawn(
                     {
                         tracing::error!(error = %e, "アンカーの作成に失敗しました");
                     }
-                    election_tick(&mut sealer, &election, election_grace, &mut closing_deadline).await;
+                    if let Some(snapshot) = snapshot {
+                        election_tick(&mut sealer, &election, snapshot, election_grace, &mut closing_deadline).await;
+                    }
                 }
                 // 停止指示、または送信側の破棄。
                 _ = stopped.changed() => break,
             }
         }
-        tracing::info!("停止を受け付けました。残りの票をフラッシュします");
-        sealer.flush().await;
+        tracing::info!("停止を受け付けました（未封印の票はフラッシュせずに残します）");
         // 最終アンカー: 変化がなければ、最後のアンカーが最新の状態を指していることを確認するだけ（作らない）。
         if let Err(e) = sealer.finalize_anchor().await {
             tracing::error!(error = %e, "最終アンカーの確認に失敗しました");
@@ -81,22 +90,29 @@ pub fn spawn(
     SealerHandle { stop, task }
 }
 
+/// 選挙状態を読む。未初期化（`ensure_initialized` が呼ばれていない。この選挙は状態機械を使わない）や
+/// 読み込みの失敗は `None`。
+async fn election_snapshot(
+    election: &Arc<dyn ElectionStateStore>,
+) -> Option<ElectionStateSnapshot> {
+    match election.get().await {
+        Ok(snapshot) => Some(snapshot),
+        Err(StoreError::Unavailable) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "選挙状態の取得に失敗しました");
+            None
+        }
+    }
+}
+
 /// memory モードの選挙状態の遷移（原則17）。`spawn` のループから、tick ごとに呼ぶ。
 async fn election_tick(
     sealer: &mut Sealer,
     election: &Arc<dyn ElectionStateStore>,
+    snapshot: ElectionStateSnapshot,
     grace: Duration,
     closing_deadline: &mut Option<Duration>,
 ) {
-    let snapshot = match election.get().await {
-        Ok(snapshot) => snapshot,
-        // 未初期化（`ensure_initialized` が呼ばれていない）: この選挙は状態機械を使わない。
-        Err(StoreError::Unavailable) => return,
-        Err(e) => {
-            tracing::warn!(error = %e, "選挙状態の取得に失敗しました");
-            return;
-        }
-    };
     let wall_now = i64::try_from(sealer.wall_now_unix_secs()).unwrap_or(i64::MAX);
     const ACTOR: &str = "sealer:memory";
 
@@ -121,8 +137,9 @@ async fn election_tick(
             }
         }
         ElectionPhase::Closing => {
-            // 単一プロセスなので、シャードの担当という概念はなく、常に全シャードをフラッシュする。
-            sealer.flush().await;
+            // 投票終了の手続き（原則9）: 単一プロセスなので、シャードの担当という概念はなく、常に全シャードを
+            // フラッシュする。
+            sealer.close_flush().await;
             let deadline = *closing_deadline.get_or_insert_with(|| sealer.now() + grace);
             if sealer.now() < deadline {
                 return;
@@ -166,7 +183,7 @@ async fn election_tick(
 
 /// リースを使う sealer（`Coordinator`）をバックグラウンドタスクとして起動する。
 ///
-/// 停止時は、保持しているシャードを締切フラッシュし、リースを解放してから終了する。
+/// 停止時は、フラッシュせずに（原則9）、アンカー担当なら最終アンカーを済ませ、リースを解放してから終了する。
 pub fn spawn_coordinator(mut coordinator: Coordinator, tick: Duration) -> SealerHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -182,7 +199,7 @@ pub fn spawn_coordinator(mut coordinator: Coordinator, tick: Duration) -> Sealer
             }
         }
         tracing::info!(
-            "停止を受け付けました。保持しているシャードをフラッシュしてリースを解放します"
+            "停止を受け付けました。リースを解放します（未封印の票はフラッシュせずに残します）"
         );
         coordinator.shutdown().await;
     });

@@ -72,14 +72,17 @@ check_seal_policy() (
         exit 1
     }
     # 依頼された必須ケース（テスト名）。消す・改名すると失敗する。
+    # 原則9（ADR 0020）: 時刻は引数で渡し、実際には待たない。
     REQUIRED=(
-        case_99_ballots_at_9m59s_waits
-        case_100_ballots_at_1s_seals_count_100
-        case_250_ballots_seal_100_100_then_wait_for_window_expiry
-        case_1_ballot_at_exactly_600s_seals_all
-        case_0_ballots_at_600s_resets_window_only
-        case_flush_37_ballots_seals_all
-        case_elapsed_is_recomputed_from_the_reset_window
+        case_99_ballots_at_9m59s_waits_and_100_ballots_seal_at_any_time
+        case_250_ballots_seal_100_100_then_the_remaining_50_at_10_minutes
+        case_9_ballots_at_10_minutes_wait_then_the_10th_at_12_minutes_seals_all_at_once
+        case_exactly_10_ballots_at_exactly_10_minutes_seals_all
+        case_0_ballots_at_10_minutes_wait_without_a_block_or_a_window_reset
+        case_close_seals_3_as_one_block
+        case_close_with_0_ballots_does_nothing
+        case_close_splits_250_into_100_100_50
+        case_the_voting_start_is_the_origin_of_the_elapsed_time
     )
     if ! out="$(cargo test -p domain --lib seal_policy:: 2>&1)"; then
         echo "$out" >&2
@@ -183,7 +186,7 @@ check_config() (
 
     REQUIRED_KEYS=(
         app.env app.mode api.port api.request_timeout_secs web.port db.backend db.nodes db.keyspace
-        seal.max_ballots seal.max_interval_secs sealer.lease_ttl_secs shard.count
+        seal.max_ballots seal.interval_secs seal.min_ballots_after_interval sealer.lease_ttl_secs shard.count
         auth.mode auth.argon2.memory_kib auth.argon2.iterations auth.argon2.parallelism session.ttl_secs
         credentials.output_file_enabled credentials.output_path credentials.password_length credentials.login_id_length
         election.seed_dir election.election_id election.voting_opens_at election.voting_closes_at
@@ -429,8 +432,8 @@ check_config() (
         with_config "$D_NONE" "$EMPTY_SECRETS" "$S1" APP__APP__ENV=production -- "$API_BIN"
 
     D="$(new_dir)"
-    printf '[seal]\nmax_ballots = 0\nmax_interval_secs = 0\n[shard]\ncount = 0\n' >"$D/local.toml"
-    expect_failure "api: 複数の問題を一度に報告" "3 件" "seal.max_ballots" "seal.max_interval_secs" "shard.count" -- \
+    printf '[seal]\nmax_ballots = 0\ninterval_secs = 0\n[shard]\ncount = 0\n' >"$D/local.toml"
+    expect_failure "api: 複数の問題を一度に報告" "3 件" "seal.max_ballots" "seal.interval_secs" "shard.count" -- \
         with_config "$D" "$EMPTY_SECRETS" "$S1" -- "$API_BIN"
 
     expect_failure "sealer: app.mode=memory では起動できない" "app.mode=db" -- \
@@ -502,7 +505,9 @@ check_bench_tool() (
     echo "== 9-2. スモーク計測（shard.count=4, sealer 2, api 2。設定を短縮）"
     export BENCH_WARMUP_SECONDS=3 BENCH_WARMUP_RATE=100 BENCH_RATE_SECONDS=8 BENCH_STEADY_RATE=300
     export BENCH_SAT_SECONDS=8 BENCH_STORE_SECONDS=5
-    export BENCH_CONCURRENCY=32 BENCH_INTERVAL_SECS=10 BENCH_LEASE_TTL_SECS=6 BENCH_DRAIN_MAX_SECONDS=90
+    # 最小件数 1: ツールの動作確認なので、ドレインで端数まで封印させて「未封印 0」を確かめる
+    # （最小件数そのもの（原則9）は chain.sh#8 と domain::seal_policy のテストが確認する）。
+    export BENCH_CONCURRENCY=32 BENCH_INTERVAL_SECS=10 BENCH_MIN_BALLOTS=1 BENCH_LEASE_TTL_SECS=6 BENCH_DRAIN_MAX_SECONDS=90
     ./scripts/bench.sh run --configs 4:2:2:drain --out "$OUT" >"$OUT/run.log" 2>&1 \
         || { tail -n 40 "$OUT/run.log" >&2; fail "bench.sh run が失敗しました"; }
     ./scripts/bench.sh store --shards 4 --out "$OUT" >"$OUT/store.log" 2>&1 \

@@ -1,5 +1,8 @@
 # 0005: sealer・公開チェーン API・票フォーマットへの contest_id 追加
 
+> **改訂**（[ADR 0020](0020-seal-policy-min-ballots.md)）: 停止時（SIGTERM）のフラッシュ（`decide_flush`・`trigger=flush`）は廃止した。
+> 残りの票は、締切の手続き（選挙状態 closing）の中でだけ封印する（`trigger=close`）。封印の経過時間は壁時計で測る。
+
 ## 背景
 Step 4 で、未封印の票をブロックに封印する sealer と、封印済みチェーンを公開して検証する仕組みを実装する。
 封印済みブロックは公開・不変のデータなので、フォーマットは今のうちに固める必要がある。

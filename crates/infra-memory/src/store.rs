@@ -42,6 +42,7 @@ struct Inner {
 struct ElectionState {
     phase: ElectionPhase,
     period: Period,
+    opened_at: Option<i64>,
     closing_started_at: Option<i64>,
 }
 
@@ -371,6 +372,7 @@ impl ElectionStateStore for InMemoryStore {
         let state = inner.election_state.get_or_insert(ElectionState {
             phase: ElectionPhase::Scheduled,
             period,
+            opened_at: None,
             closing_started_at: None,
         });
         Ok(snapshot(*state))
@@ -415,6 +417,9 @@ impl ElectionStateStore for InMemoryStore {
             return Ok(false);
         }
         state.phase = to;
+        if to == ElectionPhase::Open {
+            state.opened_at = Some(at_unix_secs);
+        }
         if to == ElectionPhase::Closing {
             state.closing_started_at = Some(at_unix_secs);
         }
@@ -440,6 +445,7 @@ fn snapshot(state: ElectionState) -> ElectionStateSnapshot {
     ElectionStateSnapshot {
         phase: state.phase,
         period: state.period,
+        opened_at: state.opened_at,
         closing_started_at: state.closing_started_at,
     }
 }

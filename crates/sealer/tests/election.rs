@@ -1,6 +1,6 @@
 //! memory モードの選挙状態スケジューラ（`sealer::spawn` に組み込まれた原則17の自動遷移）。
 //!
-//! 単調時計（`ManualClock`）は封印の窓に、壁時計（`ManualWall`）は選挙状態の判定に使う。
+//! 単調時計（`ManualClock`）は締切の手続きの待ち時間に、壁時計（`ManualWall`）は選挙状態の判定と封印の経過時間に使う。
 //! 両方を明示的に進めることで、実時間の sleep に頼らず決定的にテストする。
 
 use std::num::NonZeroU16;
@@ -44,7 +44,7 @@ async fn memory_scheduler_advances_through_the_full_lifecycle() {
         signer,
         wall.clone(),
         mono.clone(),
-        SealPolicy::new(100, 10).expect("valid policy"),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
     );
     sealer.init().await.expect("init");
@@ -126,7 +126,7 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
         signer,
         wall.clone(),
         mono.clone(),
-        SealPolicy::new(100, 10).expect("valid policy"),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
     );
     sealer.init().await.expect("init");

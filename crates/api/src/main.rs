@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         sealer::spawn(
             sealer,
             DEFAULT_TICK,
-            Duration::from_secs(config.seal_policy.max_interval_secs()),
+            Duration::from_secs(config.seal_policy.interval_secs()),
             built.state.election_state.clone(),
             config.election_grace,
         )
@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
         %addr,
         shards = config.shard_count.get(),
         max_ballots = config.seal_policy.max_ballots(),
-        max_interval_secs = config.seal_policy.max_interval_secs(),
+        interval_secs = config.seal_policy.interval_secs(),
+        min_ballots_after_interval = config.seal_policy.min_ballots_after_interval(),
         "api を起動しました"
     );
     #[cfg(feature = "dev-tools")]
@@ -121,8 +122,8 @@ async fn main() -> anyhow::Result<()> {
         let _ = admin_task.await;
     }
 
-    // HTTP の受付が止まった後で、プロセス内の sealer があれば、残りの票を締切フラッシュしてから終了する。
-    // （サーバが異常終了した場合も、受理済みの票は必ず封印する。）
+    // HTTP の受付が止まった後で、プロセス内の sealer があれば止める（最終アンカーの確認だけ。未封印の票は
+    // フラッシュしない。原則9: 残りの封印は、締切の手続き（選挙状態 closing）の中でだけ行う）。
     if let Some(sealer) = sealer {
         sealer
             .shutdown()

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # scripts/dev_up.sh が起動したものをすべて止める（何も起動していなくても成功する）。
 #
-#   画面（trunk）→ api → sealer の順に止める。api と sealer には SIGTERM を送り、残りの票を締切フラッシュして
-#   から終了するのを待つ（sealer はリースも解放する）。cassandra モードでは docker compose stop（ボリュームは削除しない）。
+#   画面（trunk）→ api → sealer の順に止める。api と sealer には SIGTERM を送り、終了するのを待つ（sealer は
+#   リースも解放する）。未封印の票はフラッシュしない（原則9。残りの封印は、締切の手続きの中でだけ行う）。cassandra モードでは docker compose stop（ボリュームは削除しない）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

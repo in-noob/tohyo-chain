@@ -43,7 +43,21 @@ fi
 grep -q '11\.' CLAUDE.md && grep -q 'config/' CLAUDE.md || fail "CLAUDE.md に原則 11（設定の集約）がありません"
 echo "旧来の環境変数名なし / 環境変数の直接参照なし / CLAUDE.md の記載: OK"
 
-echo "== 3. 全スクリプトの構文（bash -n）"
+echo "== 3. 封印ルールの旧名が残っていない（原則9。ADR 0020）"
+# 旧ルールの設定名・判定・ログのきっかけ（max_interval_secs・ResetWindowOnly・decide_flush・trigger=flush）が、
+# コード・設定・スクリプト・README・CLAUDE.md・手順書に残っていない（ADR・docs/testing.md は経緯の記録なので対象外。
+# README の旧来の環境変数名の対応表にある裸の SEAL_MAX_INTERVAL_SECS は、旧名の説明なので対象外）。
+OLD_SEAL='(max_interval_secs|APP__SEAL__MAX_INTERVAL_SECS|ResetWindowOnly|decide_flush|trigger=flush|Trigger::Flush|窓をリセットしました)'
+old_seal_hits="$(grep -rnE "$OLD_SEAL" crates config scripts README.md CLAUDE.md docs/manual_check_*.md 2>/dev/null \
+    | grep -v 'scripts/check/docs.sh' || true)"
+if [[ -n "$old_seal_hits" ]]; then
+    echo "$old_seal_hits" >&2
+    fail "封印ルールの旧名が残っています（seal.interval_secs / seal.min_ballots_after_interval / trigger=close へ）"
+fi
+grep -q 'seal.min_ballots_after_interval' CLAUDE.md && grep -q 'CloseFlush' CLAUDE.md || fail "CLAUDE.md に原則9 の実装（ADR 0020）の記載がありません"
+echo "封印ルールの旧名なし / CLAUDE.md の記載: OK"
+
+echo "== 4. 全スクリプトの構文（bash -n）"
 n=0
 for f in scripts/*.sh scripts/check/*.sh scripts/lib/*.sh; do
     bash -n "$f" || fail "$f に構文エラーがあります"

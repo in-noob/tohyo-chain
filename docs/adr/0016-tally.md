@@ -3,6 +3,8 @@
 > 追記（[ADR 0019](0019-election-lifecycle.md)）: 前提確認の 3 番目（締切=時刻による判定）は、選挙状態
 > （`ElectionPhase`。`closed` かどうか）による判定に置き換えた。`--allow-interim` は `app.env=dev` のときだけ。
 > 以下の「決定」は、置き換え前の記述として残す。
+> 追記（[ADR 0020](0020-seal-policy-min-ballots.md)）: 「締切フラッシュ = sealer の正常停止（SIGTERM）」は廃止した。残りの票は、
+> 締切の手続き（選挙状態 closing）の中でだけ封印する。未封印が残っているときの案内も、closed を待つよう改めた。
 
 ## 背景
 チェーン（封印済みのブロック）と participation（投票済み記録）はあるが、選挙区・都道府県・選挙の種類ごとの得票を出す手段がなかった。

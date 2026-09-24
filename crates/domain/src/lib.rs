@@ -25,10 +25,12 @@ pub use chain::{BLOCK_VERSION, ChainError, SealError, genesis, seal_block, verif
 pub use election::{
     Candidate, Contest, District, Election, ElectionError, ElectionType, VotingMethod,
 };
-pub use election_state::{ElectionPhase, Period, VoteGate, automatic_transition, vote_gate};
+pub use election_state::{
+    ElectionPhase, Period, VoteGate, automatic_transition, vote_gate, voting_started_at,
+};
 pub use ids::{CandidateId, ContestId, DistrictId, ElectionId, ElectionTypeCode, IdError};
 pub use merkle::{InclusionProof, Side, inclusion_proof, merkle_root, verify_inclusion};
-pub use seal_policy::{PolicyError, SealDecision, SealPolicy, decide, decide_flush};
+pub use seal_policy::{PolicyError, SealDecision, SealPolicy, decide, decide_close, window_start};
 pub use shard::{ShardId, shard_for};
 pub use signature::{Ed25519Signer, Ed25519Verifier, SignatureError, Signer, Verifier};
 pub use types::{Ballot, BallotId, Block, BlockHeader, Hash32, SignatureBytes};

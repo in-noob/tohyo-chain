@@ -32,7 +32,7 @@
   （時刻は引数）。
 - **closing の間のフラッシュは全 sealer が行う**: 「アンカー担当だけが判定する」のは状態遷移そのもの
   （schedule/open/closing/closed の付け替え）だけで、**フラッシュは、closing を観測した全 sealer が、
-  それぞれ自分の持っているシャードを直ちに行う**（`Coordinator::flush_if_closing`。アンカー担当かどうかを問わない）。
+  それぞれ自分の持っているシャードを直ちに行う**（`Coordinator::close_flush_held`。アンカー担当かどうかを問わない。ADR 0020 で `flush_if_closing` から改名）。
   シャードごとに単一の sealer だけが書ける前提（原則の既存の制約）を保ったまま、`closing` を検知した全プロセスが
   自分の担当分をすぐに封印できるようにするため。
 - **締切の手続き**（アンカー担当だけが行う）: `closing` を検知 → 待ち時間（`election.state_cache_secs +

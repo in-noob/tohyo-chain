@@ -57,7 +57,8 @@ scripts/dev_down.sh                      # 停止
   `verify` と改ざんデモのコマンド、ログの `tail` コマンドが表示される。
 - ポートは **画面 8080、api 18080**。`/api` は [crates/web/Trunk.toml](crates/web/Trunk.toml) の proxy が api へ転送する（同一オリジンなので CORS は不要）。
 - ログは `logs/{api,sealer,trunk}.log`、PID は `.dev/pids`（どちらも git 管理外）。
-- `dev_down.sh` は、api と sealer に SIGTERM を送り、残りの票を締切フラッシュしてから止める（sealer はリースも解放する）。
+- `dev_down.sh` は、api と sealer に SIGTERM を送って止める（sealer はリースも解放する）。未封印の票はフラッシュしない
+  （原則9。残りは、次の起動の後に封印ルールで封印されるか、締切の手続きの中で封印される。cassandra モードでは DB に残る）。
   cassandra モードでは `docker compose stop` も行う（ボリュームは削除しないので、データは残る）。
 - **cassandra モード**は、既定のキースペース `vote` にスキーマを投入する（`IF NOT EXISTS`。既存のデータは残る）。
   `shard.count`（既定 1）と署名鍵が `vote` に登録済みの値と食い違うと、起動を拒否される（ログに理由が出る）。
@@ -132,13 +133,19 @@ APP__SEALER__ID=sealer-b cargo run -p sealer
 ```
 
 - sealer は、DB のリース（TTL 付きの LWT）を取ったシャードだけを封印する。1 つが落ちると、リースの期限（TTL）が切れた後に、
-  残りの sealer がそのシャードを引き継ぐ。リースを失ったシャードは直ちに処理を止める。SIGTERM では、フラッシュしてリースを解放してから終了する。
+  残りの sealer がそのシャードを引き継ぐ。リースを失ったシャードは直ちに処理を止める。SIGTERM では、票をフラッシュせずに
+  （原則9）、アンカー担当なら最終アンカーを済ませ、リースを解放してから終了する。
 - `sealer.signing_seed`（64 桁の hex。秘密情報）は sealer が持つ。**全 sealer で同じ値**にする（別の鍵だと DB が登録を拒否する）。
   api は署名の公開鍵を DB から読むので、秘密の種を持たない。
-- `seal.max_interval_secs`（既定 600 秒 = 10 分）ごとに、全シャードの head を署名でまとめた**アンカー**を作るかどうかを判定する。
+- **封印のルール**（原則9。シャードごとに独立。[ADR 0020](docs/adr/0020-seal-policy-min-ballots.md)）: 未封印が `seal.max_ballots`（100）件に
+  達したら 100 件ですぐに封印（`trigger=count`）。前回の封印（または投票開始）から `seal.interval_secs`（600）秒以上経ち、かつ未封印が
+  `seal.min_ballots_after_interval`（10）件以上なら全件を封印（`trigger=time`）。それ以外は待つ（0 件でも待つ。窓はリセットしない）。
+  残りを件数に関係なく封印するのは、締切の手続き（選挙状態 `closing`）の中でだけ（`trigger=close`）。SIGTERM ではフラッシュしない。
+  投票開始時刻は、選挙状態が `open` に移った時刻（DB の `election_state.opened_at`）と設定の開始時刻の遅い方。
+- `seal.interval_secs`（既定 600 秒 = 10 分）ごとに、全シャードの head を署名でまとめた**アンカー**を作るかどうかを判定する。
   **データに更新がない場合は、ブロックチェーンに何も追加しない**: 直前のアンカー以降、どのシャードの先頭ブロックも変わっていなければ、
   アンカーは作らない（タイマーだけ進め、DEBUG ログに `skip` と出す。ジェネシスだけの状態も「更新なし」）。ブロックも、
-  0 件のまま窓が満了しても、0 件で締切フラッシュしても作らない。停止時（締切フラッシュの後）の最終アンカーは、変化がなければ、
+  0 件（または最小件数未満）のまま間隔が過ぎても、締切の手続きで 0 件でも作らない。停止時・締切の手続きの最終アンカーは、変化がなければ、
   最後のアンカーが最新の状態を指していることを確認するだけで、作らない（変化があれば、追いつかせるために 1 つ作る）。
   ブロックが封印された直後に間隔が過ぎたときは、アンカーは最大 1 間隔遅れて作られる。
   （ログと `GET /api/v1/anchors/latest`）。
@@ -278,8 +285,8 @@ scripts/tally.sh --allow-interim          # closed になる前の中間集計�
 1. チェーン全体の検証と、投票済み記録（participation）との突合 — 失敗したら中止（終了コード 3）。突合は、投票用紙ごとの
    件数の一致、`ballot_id` の重複、アンカーの確認。
 2. 未封印の票が残っていないこと — 残っていれば、件数を表示して中止（終了コード 4）。`--allow-interim` でも通らない。
-   **締切フラッシュ**（sealer を SIGTERM で正常停止すると、残りの票をすべて封印する）をしてから、もう一度実行するか、
-   選挙状態が `closing` の間は自動の締切の手続き（[選挙状態](#選挙状態選挙のスケジュールscriptselectionsh)を参照）を待つ。
+   残りの票は、締切の手続き（選挙状態 `closing`。[選挙状態](#選挙状態選挙のスケジュールscriptselectionsh)を参照）の中でだけ
+   封印される（sealer の停止ではフラッシュしない）ので、`closed` になるのを待ってから、もう一度実行する。
 3. 選挙状態（`scripts/election.sh status` で確認できる）が `closed` であること — それより前は、`--allow-interim` が
    なければ中止（終了コード 4）。`--allow-interim` 自体は `app.env=dev` のときだけ使える（それ以外では終了コード 2）。
    中間集計の漏洩を防ぐため。
@@ -353,7 +360,7 @@ eval "$(cargo run -q -p app-config -- web-env)"   # 画面の文言（labels.*�
 | `app.env` / `app.mode` | `dev` / `memory` | 環境 / 保存先（`memory` = api 内のメモリ、`db` = DB。`db` では sealer は別プロセス）|
 | `api.port` / `web.port` | 18080 / 8080 | api の待ち受けポート / 画面（trunk serve）のポート。`crates/web/Trunk.toml` と一致させる |
 | `db.backend` / `db.nodes` / `db.keyspace` | `cassandra` / `["127.0.0.1:9042"]` / `vote` | DB の種類 / 接続先 / キースペース |
-| `seal.max_ballots` / `seal.max_interval_secs` | 100 / 600 | 封印の件数・秒数の上限（アンカーの判定の間隔も後者。変化がなければアンカーは作らない）|
+| `seal.max_ballots` / `seal.interval_secs` / `seal.min_ballots_after_interval` | 100 / 600 / 10 | 封印のルール（原則9）: この件数ですぐに封印 / 前回の封印（または投票開始）からこの秒数以上経ち、かつ最小件数以上なら全件を封印（アンカーの判定の間隔も `interval_secs`。変化がなければアンカーは作らない）|
 | `sealer.id` / `sealer.lease_ttl_secs` | 空（ランダム）/ 30 | sealer の識別名（一意に）/ リースの TTL（3 以上）|
 | `shard.count` | 1 | シャード数。api と全 sealer で同じ値にする |
 | `session.ttl_secs` | 3600 | セッションの有効秒数 |
@@ -375,7 +382,7 @@ eval "$(cargo run -q -p app-config -- web-env)"   # 画面の文言（labels.*�
 | `SCYLLA_NODES` / `SCYLLA_KEYSPACE` / `SCYLLA_URI` | `APP__DB__NODES` / `APP__DB__KEYSPACE` / `APP__DB__NODES` |
 | `DB_BACKEND` | `APP__DB__BACKEND` |
 | `SHARD_COUNT` | `APP__SHARD__COUNT` |
-| `SEAL_MAX_BALLOTS` / `SEAL_MAX_INTERVAL_SECS` | `APP__SEAL__MAX_BALLOTS` / `APP__SEAL__MAX_INTERVAL_SECS` |
+| `SEAL_MAX_BALLOTS` / `SEAL_MAX_INTERVAL_SECS` | `APP__SEAL__MAX_BALLOTS` / `APP__SEAL__INTERVAL_SECS`（あわせて `APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL` が増えた）|
 | `SEALER_ID` / `SEALER_LEASE_TTL_SECS` | `APP__SEALER__ID` / `APP__SEALER__LEASE_TTL_SECS` |
 | `SESSION_TTL_SECS` | `APP__SESSION__TTL_SECS` |
 | `ELECTION_SEED_PATH`（`election.json` のパス）| `APP__ELECTION__SEED_DIR`（ディレクトリ）+ `APP__ELECTION__ELECTION_ID`（選挙の ID）。旧 `seed/election.json` は廃止 |
@@ -458,7 +465,8 @@ scripts/bench.sh store --shards "1,4,8"         --out bench/results/x   # api �
 scripts/bench.sh report --out bench/results/x                           # 集計し直す（tables.md）
 ```
 
-本番相当の封印設定（`seal.max_ballots=100`、`seal.max_interval_secs=600`）では、ドレイン（端数の票の時間満了を待つ）に
+本番相当の封印設定（`seal.max_ballots=100`、`seal.interval_secs=600`、`seal.min_ballots_after_interval=10`）では、ドレイン
+（どのシャードの未封印も 10 件未満になる = 時間ではもう封印されない、まで待つ）に
 1 構成あたり約 10 分かかる。Cassandra のヒープは計測用に 4G / 1G（`CASSANDRA_MAX_HEAP` / `CASSANDRA_HEAP_NEW`。ペアで指定）にする。
 短縮した設定での動作確認は `scripts/check/core.sh`（性能計測ツールの節）。
 投票する有権者と投票用紙は、`seedgen` で生成した選挙データの名簿から作る（`BENCH_VOTERS`（既定 20000）人 × 9 枚の投票計画。尽きたら止まる）。
@@ -481,11 +489,11 @@ scripts/check_all.sh        # 上記に加えて、scripts/check/*.sh の全ス�
 | スイート | 内容 | 目安の時間 |
 |---|---|---|
 | `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`） | 約 5 分（Docker が必要） |
-| `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API | 約 7〜8 分（Docker が必要） |
+| `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API・封印ルール（原則9: 最小件数・close --now での締切の封印） | 約 8〜9 分（Docker が必要） |
 | `election.sh` | 投票フロー（ログイン・状態・候補者・投票・再投票拒否・並列・対象外・秘密投票）・47 都道府県規模の選挙データ（生成・表示範囲・投票順・壊れたデータの検出）・選挙状態の遷移と投票の受付期間（schedule → 自動 open → 自動 closing → closed・期間の境界・締切直前の票の封印・公開用ポートと管理用リスナーの分離） | 約 1.5 分 |
 | `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh` | 約 1.5 分（Docker が必要） |
 | `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release` | 数秒〜数十秒 |
-| `docs.sh` | 旧来の呼び名・環境変数名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
+| `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
 
 `core.sh` と `chain.sh`、`auth.sh` は Docker（Compose プラグイン）が必要で、DB を起動する。DB の起動に失敗したときは、
 コンテナのログの FATAL / ERROR 行をそのまま表示して終了する。使う DB は `db.backend`（既定 `cassandra`。ScyllaDB は

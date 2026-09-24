@@ -61,7 +61,8 @@ impl Refusal {
         match self {
             Self::Unsealed { ballots, contests } => format!(
                 "未封印の票が {ballots} 件（{contests} 枚の{ballot_item}）残っています。集計を中止しました。\n\
-                 sealer を SIGTERM で正常停止して（締切フラッシュ: 残りの票をすべて封印します）から、もう一度集計してください。"
+                 残りの票は、投票終了の手続き（選挙状態 closing。締切時刻か scripts/election.sh close --now）の中でだけ\
+                 封印されます（sealer の停止ではフラッシュしません）。選挙状態が closed になってから、もう一度集計してください。"
             ),
             Self::NotClosed { phase } => format!(
                 "選挙状態が {phase}（closed ではありません）なので、集計を中止しました。\n\
@@ -113,7 +114,7 @@ mod tests {
             contests: 2,
         }
         .message("投票用紙");
-        assert!(m.contains("3 件") && m.contains("2 枚の投票用紙") && m.contains("SIGTERM"));
+        assert!(m.contains("3 件") && m.contains("2 枚の投票用紙") && m.contains("close --now"));
         let m = Refusal::NotClosed { phase: Open }.message("投票用紙");
         assert!(m.contains("--allow-interim") && m.contains("open"));
     }
