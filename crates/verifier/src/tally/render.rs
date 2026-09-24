@@ -68,7 +68,9 @@ pub fn rank(d: &DistrictTally, index: usize) -> usize {
     1 + d.candidates.iter().filter(|c| c.votes > votes).count()
 }
 
-fn district_table(d: &DistrictTally) -> String {
+/// 選挙区 1 つの表。候補者（順位つき）の後に、白票（`blank_name`）・合計・投票済み者数を、候補者とは別の行で置く
+/// （白票には順位も政党も付けない）。
+fn district_table(d: &DistrictTally, blank_name: &str) -> String {
     let mut rows: Vec<Vec<String>> = d
         .candidates
         .iter()
@@ -90,7 +92,7 @@ fn district_table(d: &DistrictTally) -> String {
             n.to_string(),
         ]
     };
-    rows.push(extra("白票（無効票）", d.blank));
+    rows.push(extra(blank_name, d.blank));
     rows.push(extra("合計", d.total));
     rows.push(extra("投票済み者数", d.participation));
     let scope = if d.prefectures.is_empty() {
@@ -107,7 +109,7 @@ fn district_table(d: &DistrictTally) -> String {
     out
 }
 
-fn group_table(title: &str, groups: &[GroupTotal], grand: &GroupTotal) -> String {
+fn group_table(title: &str, groups: &[GroupTotal], grand: &GroupTotal, blank_name: &str) -> String {
     let mut rows: Vec<Vec<String>> = groups
         .iter()
         .map(|g| {
@@ -126,7 +128,7 @@ fn group_table(title: &str, groups: &[GroupTotal], grand: &GroupTotal) -> String
             "名称",
             "選挙区数",
             "有効票",
-            "白票（無効票）",
+            blank_name,
             "合計",
             "投票済み数",
         ],
@@ -175,7 +177,7 @@ pub fn render(
     };
     let _ = writeln!(out, "【選挙区別】{} 選挙区\n", tally.districts.len());
     for d in &tally.districts[..shown] {
-        out.push_str(&district_table(d));
+        out.push_str(&district_table(d, meta.blank_name));
         out.push('\n');
     }
     if shown < tally.districts.len() {
@@ -194,12 +196,14 @@ pub fn render(
         &format!("都道府県別の合計（{note}）"),
         &tally.prefectures,
         &grand,
+        meta.blank_name,
     ));
     out.push('\n');
     out.push_str(&group_table(
         &format!("選挙の種類別の合計（{note}）"),
         &tally.types,
         &grand,
+        meta.blank_name,
     ));
     out.push('\n');
     out.push_str(&render_reconciliation(recon, item));
@@ -235,7 +239,7 @@ mod tests {
     fn full_width_characters_count_as_two_columns() {
         assert_eq!(display_width("abc"), 3);
         assert_eq!(display_width("東京1区"), 7);
-        assert_eq!(display_width("白票（無効票）"), 14);
+        assert_eq!(display_width("白票"), 4);
         assert_eq!(display_width("ｱ"), 1);
     }
 
@@ -275,5 +279,41 @@ mod tests {
         };
         let ranks: Vec<usize> = (0..4).map(|i| rank(&d, i)).collect();
         assert_eq!(ranks, [1, 2, 2, 4]);
+    }
+
+    #[test]
+    fn blank_is_a_separate_row_named_by_the_label_without_a_rank() {
+        let d = DistrictTally {
+            contest_id: String::new(),
+            district_id: String::new(),
+            name: "東京1区".to_string(),
+            election_type: String::new(),
+            type_name: "小選挙区".to_string(),
+            prefectures: Vec::new(),
+            candidates: vec![super::super::compute::CandidateVotes {
+                candidate_id: "c1".to_string(),
+                name: "甲".to_string(),
+                party: "党".to_string(),
+                votes: 2,
+            }],
+            blank: 7,
+            valid: 2,
+            total: 9,
+            participation: 9,
+        };
+        let out = district_table(&d, "白票（設定の呼び名）");
+        let blank_line = out
+            .lines()
+            .find(|l| l.contains("白票（設定の呼び名）"))
+            .expect("blank row");
+        // 順位の列は空で、得票数の列に 7。候補者の行（順位 1）とは別の行。
+        assert!(
+            blank_line.trim_start().starts_with("白票（設定の呼び名）"),
+            "{out}"
+        );
+        assert!(blank_line.trim_end().ends_with('7'), "{out}");
+        let candidate_line = out.lines().find(|l| l.contains('甲')).expect("candidate");
+        assert!(candidate_line.trim_start().starts_with('1'), "{out}");
+        assert!(!candidate_line.contains("白票"), "{out}");
     }
 }

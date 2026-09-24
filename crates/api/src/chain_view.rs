@@ -122,12 +122,15 @@ pub fn block_detail(
             .iter()
             .map(|b| {
                 let contest = election.contest(&b.contest_id);
-                let candidate =
-                    contest.and_then(|c| c.candidates.iter().find(|c| c.id == b.candidate_id));
+                // 白票は候補者ではないので、候補者の表示名を付けない（`blank` で示す）。
+                let candidate = b.candidate_id.candidate().and_then(|code| {
+                    contest.and_then(|c| c.candidates.iter().find(|c| &c.id == code))
+                });
                 BallotDto {
                     ballot_id: hex::encode(&b.ballot_id.0),
                     contest_id: b.contest_id.to_string(),
                     candidate_id: b.candidate_id.to_string(),
+                    blank: b.candidate_id.is_blank(),
                     district_name: contest.map(|c| c.district.name.clone()),
                     candidate_name: candidate.map(|c| c.name.clone()),
                     party: candidate.map(|c| c.party.clone()),
@@ -151,8 +154,8 @@ pub fn block_detail(
 mod tests {
     use domain::election::{Candidate, District, ElectionType, VotingMethod};
     use domain::{
-        Ballot, BallotId, CandidateId, ContestId, DistrictId, Ed25519Signer, ElectionId,
-        ElectionTypeCode, genesis, seal_block,
+        Ballot, BallotId, CandidateCode, CandidateId, ContestId, DistrictId, Ed25519Signer,
+        ElectionId, ElectionTypeCode, genesis, seal_block,
     };
 
     use super::*;
@@ -233,7 +236,7 @@ mod tests {
             order: 1,
         };
         let candidates = vec![Candidate {
-            id: CandidateId::parse("smd.13.01.c1").expect("candidate"),
+            id: CandidateCode::parse("smd.13.01.c1").expect("candidate"),
             name: "甲".to_string(),
             party: "党".to_string(),
             profile: String::new(),
@@ -298,6 +301,34 @@ mod tests {
             (Some("東京1区"), Some("甲"), Some("党"))
         );
         assert_eq!(shown.signer_public_key, Some(hex::encode(&key)));
+        assert!(!b.blank);
+        // 候補者の票の JSON には、blank を出さない（false は省く）。
+        assert!(!serde_json::to_string(b).expect("json").contains("blank"));
+    }
+
+    #[test]
+    fn the_reserved_blank_value_is_the_same_for_web_and_domain() {
+        // web は domain に依存しないので、shared_types に同じ値を置いている（原則5）。食い違うと白票が通らない。
+        assert_eq!(shared_types::BLANK_CANDIDATE_ID, domain::BLANK_CANDIDATE_ID);
+        assert_eq!(
+            CandidateId::Blank.as_str(),
+            shared_types::BLANK_CANDIDATE_ID
+        );
+    }
+
+    #[test]
+    fn a_blank_ballot_is_marked_blank_and_has_no_candidate_names() {
+        let block = block_with("e1/smd.13.01", "blank");
+        let shown = block_detail(&block, true, &election(), None);
+        let b = &shown.ballots[0];
+        assert!(b.blank);
+        assert_eq!(b.candidate_id, "blank");
+        assert_eq!(b.district_name.as_deref(), Some("東京1区"));
+        assert_eq!((&b.candidate_name, &b.party), (&None, &None));
+        // 伏せた詳細には、白票かどうかも現れない。
+        let hidden = block_detail(&block, false, &election(), None);
+        let json = serde_json::to_string(&hidden).expect("json");
+        assert!(!json.contains("blank"), "{json}");
     }
 
     #[test]

@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(config.seal_policy.interval_secs()),
             built.state.election_state.clone(),
             config.election_grace,
+            config.rules,
         )
     });
 

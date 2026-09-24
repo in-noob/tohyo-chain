@@ -44,7 +44,7 @@ impl Workload {
                         let candidate = contest
                             .candidates
                             .get((voter_hash(voter) + k) % contest.candidates.len())?;
-                        Some((contest.id.clone(), candidate.id.clone()))
+                        Some((contest.id.clone(), CandidateId::from(candidate.id.clone())))
                     })
                     .collect();
                 (voter, picks)
@@ -124,7 +124,7 @@ mod tests {
             let d = DistrictId::new(d).expect("valid");
             (1..=n)
                 .map(|i| Candidate {
-                    id: CandidateId::new(&d, i).expect("valid"),
+                    id: domain::CandidateCode::new(&d, i).expect("valid"),
                     name: format!("c{i}"),
                     party: String::new(),
                     profile: String::new(),
@@ -189,7 +189,7 @@ mod tests {
         for i in 0..plan.len() as u64 {
             let w = plan.get(i).expect("item");
             let contest = data.election.contest(&w.contest).expect("exists");
-            assert!(contest.has_candidate(&w.candidate), "{w:?}");
+            assert!(contest.accepts(&w.candidate, false), "{w:?}");
         }
     }
 }

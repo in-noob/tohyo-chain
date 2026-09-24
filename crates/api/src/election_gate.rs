@@ -63,6 +63,7 @@ mod tests {
                 period,
                 opened_at: None,
                 closing_started_at: None,
+                rules: None,
             })
         }
 
@@ -73,6 +74,7 @@ mod tests {
                 period: Period::default(),
                 opened_at: None,
                 closing_started_at: None,
+                rules: None,
             })
         }
 
@@ -84,6 +86,7 @@ mod tests {
             &self,
             _from: ElectionPhase,
             _to: ElectionPhase,
+            _rules: domain::ElectionRules,
             _actor: &str,
             _at_unix_secs: i64,
         ) -> Result<bool, StoreError> {

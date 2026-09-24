@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use domain::election::Election;
 use domain::ids::prefecture_name;
-use domain::{CandidateId, ContestId};
+use domain::{CandidateCode, CandidateId, ContestId};
 use serde::Serialize;
 
 use crate::verify::{ContestRow, ShardReport};
@@ -19,6 +19,11 @@ pub enum TallyError {
         "チェーンに、選挙データ（seed）に存在しない投票用紙 {0} の票があります（election.election_id / election.seed_dir が、この選挙のものか確認してください）"
     )]
     UnknownContest(String),
+    /// API は、投票用紙の候補者か白票しか受け付けない。それ以外の票がチェーンにあるのは、選挙データの取り違えか不具合。
+    #[error(
+        "チェーンに、投票用紙 {contest} の候補者ではない {candidate} への票があります（選挙データ（seed）が、この選挙のものか確認してください）"
+    )]
+    ForeignCandidate { contest: String, candidate: String },
 }
 
 /// 候補者 1 人の得票。
@@ -42,7 +47,7 @@ pub struct DistrictTally {
     pub prefectures: Vec<String>,
     /// 得票の多い順（同数なら、選挙データの候補者の並び順）。0 票の候補者も含む。
     pub candidates: Vec<CandidateVotes>,
-    /// 白票（無効票）: 選挙区の候補者ではない票。
+    /// 白票: どの候補者にも投票しない票（票の `candidate_id` が予約値 `blank`）。候補者とは別に数える。
     pub blank: u64,
     /// 有効票（候補者への票の合計）。
     pub valid: u64,
@@ -80,7 +85,8 @@ pub struct Tally {
 
 /// 検証済みのシャードの票を、選挙マスタに従って集計する。
 ///
-/// `rows` は突合の行（participation の出所）。チェーンに、選挙マスタに無い投票用紙の票があれば `Err`。
+/// `rows` は突合の行（participation の出所）。チェーンに、選挙マスタに無い投票用紙の票や、投票用紙の候補者でも
+/// 白票でもない票があれば `Err`（集計しない）。
 pub fn compute(
     election: &Election,
     reports: &[&ShardReport],
@@ -106,7 +112,23 @@ pub fn compute(
 
     let mut districts = Vec::with_capacity(election.contests().len());
     for contest in election.contests() {
-        let cast = votes.get(&contest.id);
+        // 投票先ごとの票数を、候補者と白票に振り分ける（`match` で、白票の扱いを必ず決める）。
+        let mut per_candidate: HashMap<&CandidateCode, u64> = HashMap::new();
+        let mut blank = 0;
+        for (&choice, &n) in votes.get(&contest.id).into_iter().flatten() {
+            match choice {
+                CandidateId::Blank => blank += n,
+                CandidateId::Candidate(code) if contest.has_candidate(code) => {
+                    *per_candidate.entry(code).or_default() += n;
+                }
+                CandidateId::Candidate(code) => {
+                    return Err(TallyError::ForeignCandidate {
+                        contest: contest.id.to_string(),
+                        candidate: code.to_string(),
+                    });
+                }
+            }
+        }
         let mut candidates: Vec<CandidateVotes> = contest
             .candidates
             .iter()
@@ -114,11 +136,10 @@ pub fn compute(
                 candidate_id: c.id.to_string(),
                 name: c.name.clone(),
                 party: c.party.clone(),
-                votes: cast.and_then(|m| m.get(&c.id)).copied().unwrap_or(0),
+                votes: per_candidate.get(&c.id).copied().unwrap_or(0),
             })
             .collect();
         let valid: u64 = candidates.iter().map(|c| c.votes).sum();
-        let total: u64 = cast.map_or(0, |m| m.values().sum());
         // 安定ソート: 同数なら、選挙データの並び順のまま。
         candidates.sort_by_key(|c| std::cmp::Reverse(c.votes));
         let type_name = election
@@ -140,9 +161,9 @@ pub fn compute(
                 .map(|code| prefecture_name(code).unwrap_or(code.as_str()).to_string())
                 .collect(),
             candidates,
-            blank: total.saturating_sub(valid),
+            blank,
             valid,
-            total,
+            total: valid + blank,
             participation: participation
                 .get(contest.id.to_string().as_str())
                 .copied()
@@ -253,7 +274,7 @@ mod tests {
 
     fn cand(district: &str, seq: u32, name: &str, party: &str) -> Candidate {
         Candidate {
-            id: CandidateId::parse(&format!("{district}.c{seq}")).expect("candidate id"),
+            id: CandidateCode::parse(&format!("{district}.c{seq}")).expect("candidate id"),
             name: name.to_string(),
             party: party.to_string(),
             profile: String::new(),
@@ -378,16 +399,43 @@ mod tests {
     }
 
     #[test]
-    fn a_vote_for_someone_outside_the_contest_is_a_blank_ballot() {
+    fn blank_votes_are_counted_apart_from_the_candidates() {
         let e = election();
-        // 東京 1 区の投票用紙に、東京 2 区の候補者への票（選挙区の候補者ではない）。
+        let r = report(&[
+            ("smd.13.01", "smd.13.01.c1", 1),
+            ("smd.13.01", "blank", 4),
+            ("smd.13.02", "smd.13.02.c2", 2),
+        ]);
+        let t =
+            compute(&e, &[&r], &[row("smd.13.01", 5, 5), row("smd.13.02", 2, 2)]).expect("tally");
+        let d = &t.districts[0];
+        // 白票は候補者の一覧に入らない（得票数が最多でも、順位の対象にしない）。
+        assert!(d.candidates.iter().all(|c| c.candidate_id != "blank"));
+        assert_eq!(d.candidates.len(), 3);
+        assert_eq!(d.candidates[0].votes, 1);
+        assert_eq!((d.valid, d.blank, d.total), (1, 4, 5));
+        assert_eq!(t.districts[1].blank, 0);
+        // 合計にも、白票は候補者とは別に足し込む。
+        let all = t.grand_total();
+        assert_eq!((all.valid, all.blank, all.total), (3, 4, 7));
+        assert_eq!((t.types[0].valid, t.types[0].blank), (3, 4));
+    }
+
+    #[test]
+    fn a_vote_for_someone_outside_the_contest_stops_the_tally() {
+        let e = election();
+        // 東京 1 区の投票用紙に、東京 2 区の候補者への票（API は受け付けないので、チェーンにあれば異常）。
         let r = report(&[
             ("smd.13.01", "smd.13.01.c1", 1),
             ("smd.13.01", "smd.13.02.c1", 2),
         ]);
-        let t = compute(&e, &[&r], &[row("smd.13.01", 3, 3)]).expect("tally");
-        let d = &t.districts[0];
-        assert_eq!((d.valid, d.blank, d.total), (1, 2, 3));
+        assert_eq!(
+            compute(&e, &[&r], &[row("smd.13.01", 3, 3)]),
+            Err(TallyError::ForeignCandidate {
+                contest: "e1/smd.13.01".to_string(),
+                candidate: "smd.13.02.c1".to_string(),
+            })
+        );
     }
 
     #[test]

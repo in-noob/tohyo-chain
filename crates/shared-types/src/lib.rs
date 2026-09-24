@@ -98,12 +98,21 @@ pub struct CandidateDto {
 /// `GET /api/v1/contests/{election_id}/{district_id}/candidates` のレスポンス。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CandidatesResponse {
+    /// 候補者（選挙データの並び順）。白票は含めない（候補者ではないので、`allow_blank` で別に示す）。
     pub candidates: Vec<CandidateDto>,
+    /// 白票（`candidate_id` = [`BLANK_CANDIDATE_ID`]）を選べるか。選挙状態が open になった時点で固定した
+    /// 選挙のルール（設定 `vote.allow_blank`。原則19）。画面は、真のときだけ候補者一覧の最後に白票の選択肢を置く。
+    pub allow_blank: bool,
 }
+
+/// 白票を表す `candidate_id` の予約値（domain の `BLANK_CANDIDATE_ID` と同じ。web は domain に依存しないので、
+/// ここにも置く。一致はテストで確かめる）。
+pub const BLANK_CANDIDATE_ID: &str = "blank";
 
 /// `POST /api/v1/contests/{election_id}/{district_id}/vote` のリクエスト。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VoteRequest {
+    /// 候補者の ID、または白票の予約値 [`BLANK_CANDIDATE_ID`]。
     pub candidate_id: String,
 }
 
@@ -133,7 +142,11 @@ pub struct HeaderDto {
 pub struct BallotDto {
     pub ballot_id: String,
     pub contest_id: String,
+    /// 候補者の ID、または白票の予約値 [`BLANK_CANDIDATE_ID`]。
     pub candidate_id: String,
+    /// 白票か。白票は候補者ではないので、`candidate_name`・`party` を付けない（画面は、白票の呼び名で別に表示する）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blank: bool,
     /// 選挙区の表示名。選挙データに無ければ省く。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub district_name: Option<String>,

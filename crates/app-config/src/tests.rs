@@ -86,6 +86,13 @@ fn default_toml_alone_is_valid_and_has_the_documented_defaults() {
     );
     assert_eq!(c.labels.ballot_item, "投票用紙");
     assert_eq!(c.labels.progress, "{total}枚中{current}枚目");
+    assert!(c.vote.allow_blank, "白票は既定で選べる");
+    assert_eq!(c.labels.blank_option, "白票（どの候補者にも投票しない）");
+    assert_eq!(
+        c.labels.blank_confirm,
+        "白票として投票します。よろしいですか？"
+    );
+    assert_eq!(c.labels.blank_name, "白票");
     loaded.ensure_supported().expect("defaults are supported");
 }
 
@@ -581,6 +588,34 @@ fn web_env_exports_quoted_labels() {
         out.contains("export APP_WEB_PROGRESS='{total}枚中{current}枚目'\n"),
         "{out}"
     );
+    for (name, value) in [
+        ("APP_WEB_BLANK_OPTION", "白票（どの候補者にも投票しない）"),
+        (
+            "APP_WEB_BLANK_CONFIRM",
+            "白票として投票します。よろしいですか？",
+        ),
+        ("APP_WEB_BLANK_NAME", "白票"),
+    ] {
+        assert!(out.contains(&format!("export {name}='{value}'\n")), "{out}");
+    }
+    // vote.allow_blank は、ビルド時ではなく実行時に API から受け取る（open の時点で固定するため）。
+    assert!(!out.contains("ALLOW_BLANK"), "{out}");
+}
+
+#[test]
+fn allow_blank_can_be_turned_off_and_must_be_a_boolean() {
+    let loaded = load_for_test(&[("vote.allow_blank", "false")]).expect("valid");
+    assert!(!loaded.config.vote.allow_blank);
+    let text = err_text(load_for_test(&[("vote.allow_blank", "maybe")]));
+    assert!(text.contains("vote.allow_blank"), "{text}");
+    for key in [
+        "labels.blank_option",
+        "labels.blank_confirm",
+        "labels.blank_name",
+    ] {
+        let text = err_text(load_for_test(&[(key, " ")]));
+        assert!(text.contains(key) && text.contains("空"), "{text}");
+    }
 }
 
 #[test]

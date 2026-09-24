@@ -76,12 +76,15 @@ pub fn run() -> anyhow::Result<()> {
         .get(TARGET_INDEX)
         .context("対象の票が見つかりません")?
         .clone();
-    // 連番を 1 つ進めた、形式は正しい別の候補者 ID に書き換える。
-    let district = DistrictId::new(original.candidate_id.district_part())
-        .context("候補者 ID の選挙区が不正です")?;
+    // 形式は正しい別の投票先に書き換える（候補者は連番を 1 つ進め、白票は 1 番目の候補者にする）。
+    let district = DistrictId::new(original.contest_id.district_part())
+        .context("投票用紙の選挙区が不正です")?;
+    let seq = match &original.candidate_id {
+        CandidateId::Blank => 1,
+        CandidateId::Candidate(code) => code.sequence() + 1,
+    };
     let forged = Ballot {
-        candidate_id: CandidateId::new(&district, original.candidate_id.sequence() + 1)
-            .context("候補者 ID を作れません")?,
+        candidate_id: CandidateId::new(&district, seq).context("候補者 ID を作れません")?,
         ..original.clone()
     };
     // 検証済みのチェーンは残したまま、複製に対して改ざんする。

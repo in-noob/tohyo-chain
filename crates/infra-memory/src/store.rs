@@ -17,7 +17,10 @@ use application::{
     ElectionStateStore, LeaseStore, SealStore, StoreError, VoteStore,
 };
 use async_trait::async_trait;
-use domain::{Anchor, Ballot, BallotId, Block, ContestId, ElectionPhase, Period, ShardId, VoterId};
+use domain::{
+    Anchor, Ballot, BallotId, Block, ContestId, ElectionPhase, ElectionRules, Period, ShardId,
+    VoterId,
+};
 
 #[derive(Default)]
 struct Inner {
@@ -44,6 +47,8 @@ struct ElectionState {
     period: Period,
     opened_at: Option<i64>,
     closing_started_at: Option<i64>,
+    /// open に遷移した時点で固定した選挙のルール（原則19）。
+    rules: Option<ElectionRules>,
 }
 
 pub struct InMemoryStore {
@@ -374,6 +379,7 @@ impl ElectionStateStore for InMemoryStore {
             period,
             opened_at: None,
             closing_started_at: None,
+            rules: None,
         });
         Ok(snapshot(*state))
     }
@@ -402,6 +408,7 @@ impl ElectionStateStore for InMemoryStore {
         &self,
         from: ElectionPhase,
         to: ElectionPhase,
+        rules: ElectionRules,
         actor: &str,
         at_unix_secs: i64,
     ) -> Result<bool, StoreError> {
@@ -419,6 +426,8 @@ impl ElectionStateStore for InMemoryStore {
         state.phase = to;
         if to == ElectionPhase::Open {
             state.opened_at = Some(at_unix_secs);
+            // 原則19: 選挙のルールは open の時点で固定する（以降の遷移では変えない）。
+            state.rules = Some(rules);
         }
         if to == ElectionPhase::Closing {
             state.closing_started_at = Some(at_unix_secs);
@@ -447,6 +456,7 @@ fn snapshot(state: ElectionState) -> ElectionStateSnapshot {
         period: state.period,
         opened_at: state.opened_at,
         closing_started_at: state.closing_started_at,
+        rules: state.rules,
     }
 }
 
@@ -499,11 +509,16 @@ mod dev {
                 .get_mut(height_index)
                 .and_then(|b| b.ballots.get_mut(index))
                 .ok_or(TamperError::NotFound)?;
-            // 連番を 1 つ進めると、必ず別の（形式は正しい）候補者 ID になる。
-            let district = DistrictId::new(ballot.candidate_id.district_part())
+            // 候補者の票は連番を 1 つ進め、白票はその選挙区の 1 番目の候補者にする。どちらも、必ず別の
+            // （形式は正しい）投票先になる。
+            let district = DistrictId::new(ballot.contest_id.district_part())
                 .map_err(|_| TamperError::NotFound)?;
-            ballot.candidate_id = CandidateId::new(&district, ballot.candidate_id.sequence() + 1)
-                .map_err(|_| TamperError::NotFound)?;
+            let seq = match &ballot.candidate_id {
+                CandidateId::Blank => 1,
+                CandidateId::Candidate(code) => code.sequence() + 1,
+            };
+            ballot.candidate_id =
+                CandidateId::new(&district, seq).map_err(|_| TamperError::NotFound)?;
             Ok(TamperedAt {
                 shard,
                 height: height_index as u64,
@@ -612,7 +627,7 @@ mod tests {
         let got: Vec<u32> = s
             .ballots_in_shard(ShardId(0))
             .iter()
-            .map(|b| b.candidate_id.sequence() as u32)
+            .map(|b| b.candidate_id.candidate().expect("candidate").sequence() as u32)
             .collect();
         assert_eq!(got, vec![101, 102, 103]);
     }
@@ -715,7 +730,7 @@ mod tests {
         let rest: Vec<u32> = s
             .ballots_in_shard(ShardId(0))
             .iter()
-            .map(|b| b.candidate_id.sequence() as u32)
+            .map(|b| b.candidate_id.candidate().expect("candidate").sequence() as u32)
             .collect();
         assert_eq!(rest, vec![104, 105]);
         assert_eq!(s.head(ShardId(0)).await, Ok(Some(block.clone())));
@@ -991,6 +1006,36 @@ mod tests {
         );
         assert_eq!(seqs(s.latest_anchors(2).await.expect("two")), vec![3, 2]);
         assert_eq!(s.latest_anchors(0).await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn election_rules_are_fixed_when_the_election_opens() {
+        let s = store(1);
+        let on = ElectionRules { allow_blank: true };
+        let off = ElectionRules { allow_blank: false };
+        let initial = s.ensure_initialized(Period::default()).await.expect("init");
+        assert_eq!(initial.rules, None, "scheduled の間は、まだ固定しない");
+        assert!(
+            s.transition(ElectionPhase::Scheduled, ElectionPhase::Open, off, "t", 10)
+                .await
+                .expect("open")
+        );
+        assert_eq!(s.get().await.expect("get").rules, Some(off));
+        // 後の遷移に別のルールを渡しても、open の時点で固定した値のまま。
+        for (from, to) in [
+            (ElectionPhase::Open, ElectionPhase::Closing),
+            (ElectionPhase::Closing, ElectionPhase::Closed),
+        ] {
+            assert!(s.transition(from, to, on, "t", 20).await.expect("advance"));
+            assert_eq!(s.get().await.expect("get").rules, Some(off));
+        }
+        // 失敗した遷移（既に動いている）でも変わらない。
+        assert!(
+            !s.transition(ElectionPhase::Scheduled, ElectionPhase::Open, on, "t", 30)
+                .await
+                .expect("stale")
+        );
+        assert_eq!(s.get().await.expect("get").rules, Some(off));
     }
 
     #[cfg(feature = "dev-tools")]

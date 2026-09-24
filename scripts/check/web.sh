@@ -4,6 +4,8 @@
 #   2. デザイントークン（色の直接指定がないこと）・テーマのテスト（コントラスト比など）・選択状態を色だけで表さない部品
 #   3. trunk build --release（旧 check_step5.sh・check_step15.sh は、それぞれ別にビルドしていたが、ここでは 1 回にまとめ、
 #      その成果物に対して、両方の確認を行う。docs/testing.md の「除外した項目」を参照）
+#   4. 白票: 候補者一覧の最後に白票の選択肢（allow_blank=false なら出さない）・確認画面の文言・ビューアの別の行
+#      （API と集計の確認は core.sh#10）
 # ブラウザでの動作確認は docs/manual_check_step5.md・docs/manual_check_step15.md（手動）で行う。
 # 注意: trunk は crates/web で実行する（このスクリプトは、ワークスペースのルートから実行する）。
 set -euo pipefail
@@ -265,8 +267,55 @@ check_trunk_build() (
     echo "OK: web#3 trunk build --release"
 )
 
+# ===========================================================================
+# 4. 白票（画面。API・封印・集計は core.sh#10）
+# ===========================================================================
+check_blank_choice() (
+    set -euo pipefail
+    fail() {
+        echo "FAIL: $1" >&2
+        exit 1
+    }
+    echo "== 4-1. 白票の表示ロジックのテスト（必須ケース）"
+    REQUIRED=(
+        flow::tests::blank_option_is_listed_last_only_when_allowed
+        flow::tests::confirming_a_blank_vote_says_so_explicitly
+        flow::tests::a_blank_vote_goes_through_pick_confirm_submit_with_the_reserved_id
+        chain::tests::a_blank_ballot_is_shown_with_the_blank_name_not_as_a_candidate
+        chain::tests::choice_counts_put_blank_on_its_own_row_after_the_candidates
+        labels::tests::defaults_match_config_default_toml
+    )
+    if ! out="$(cargo test -p web --lib 2>&1)"; then
+        echo "$out" >&2
+        fail "web のテストが失敗しました"
+    fi
+    for name in "${REQUIRED[@]}"; do
+        grep -Eq "^test ${name} \.\.\. ok$" <<<"$out" \
+            || fail "必須テスト ${name} が成功していません（存在しない可能性があります）"
+    done
+    echo "白票の表示ロジック: 必須 ${#REQUIRED[@]} 件 OK（allow_blank=false では選択肢に出さない・確認画面は labels.blank_confirm）"
+
+    echo "== 4-2. 画面が、API の allow_blank と設定の文言で、白票の選択肢・確認の文言・ビューアの行を組み立てている"
+    VOTE=crates/web/src/pages/vote.rs
+    grep -q 'flow::choices(' "$VOTE" && grep -q 'response.allow_blank' "$VOTE" && grep -q 'labels::blank_option()' "$VOTE" \
+        || fail "$VOTE が、flow::choices に API の allow_blank と labels::blank_option() を渡していません"
+    grep -q 'flow::confirm_message(' "$VOTE" && grep -q 'labels::blank_confirm()' "$VOTE" \
+        || fail "$VOTE の確認画面が、flow::confirm_message と labels::blank_confirm() を使っていません"
+    if grep -n '"blank"' "$VOTE"; then
+        fail "$VOTE に白票の予約値が直接書かれています（shared_types::BLANK_CANDIDATE_ID を使う flow に任せる）"
+    fi
+    grep -q 'chain::choice_counts(' crates/web/src/pages/chain.rs && grep -q 'labels::blank_name()' crates/web/src/pages/chain.rs \
+        || fail "ビューアが、白票を別の行にする chain::choice_counts と labels::blank_name() を使っていません"
+    grep -qF '.candidate.blank' crates/web/style.css && grep -qF 'table.ballots tr.blank' crates/web/style.css \
+        || fail "style.css に、白票の選択肢・ビューアの行の書式（.candidate.blank / table.ballots tr.blank）がありません"
+    echo "投票画面（選択肢・確認）・ビューア（別の行）・書式: OK"
+
+    echo "OK: web#4 白票"
+)
+
 check_flow_and_purity
 check_design_tokens_and_theme
 check_trunk_build
+check_blank_choice
 
 echo "OK: check/web.sh"

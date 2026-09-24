@@ -57,6 +57,7 @@ fn group_csv(
     name: &str,
     key_header: &str,
     groups: &[GroupTotal],
+    blank_name: &str,
 ) -> anyhow::Result<()> {
     let mut w = csv_file(dir, name)?;
     w.write_record([
@@ -65,7 +66,7 @@ fn group_csv(
         "複数の都道府県にまたがる",
         "選挙区数",
         "有効票",
-        "白票（無効票）",
+        blank_name,
         "合計",
         "投票済み数",
     ])?;
@@ -110,7 +111,7 @@ pub fn write_all(
         "選挙の種類",
         "都道府県",
         "有効票",
-        "白票（無効票）",
+        meta.blank_name,
         "合計",
         "投票済み者数",
     ])?;
@@ -157,8 +158,20 @@ pub fn write_all(
     }
     w.flush()?;
 
-    group_csv(&dir, "prefectures.csv", "key", &tally.prefectures)?;
-    group_csv(&dir, "types.csv", "election_type", &tally.types)?;
+    group_csv(
+        &dir,
+        "prefectures.csv",
+        "key",
+        &tally.prefectures,
+        meta.blank_name,
+    )?;
+    group_csv(
+        &dir,
+        "types.csv",
+        "election_type",
+        &tally.types,
+        meta.blank_name,
+    )?;
 
     let mut w = csv_file(&dir, "reconciliation.csv")?;
     w.write_record(["contest_id", "投票済み記録", "封印済み", "未封印", "一致"])?;

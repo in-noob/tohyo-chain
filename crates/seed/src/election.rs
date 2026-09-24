@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use domain::{
-    Candidate, CandidateId, District, DistrictId, Election, ElectionId, ElectionType,
+    Candidate, CandidateCode, District, DistrictId, Election, ElectionId, ElectionType,
     ElectionTypeCode, VotingMethod,
 };
 use serde::Deserialize;
@@ -289,7 +289,7 @@ fn read_candidates(
     files.sort();
     let mut out = Vec::new();
     // 候補者 ID → 初出の (ファイル, 行)。
-    let mut seen: HashMap<CandidateId, (PathBuf, usize)> = HashMap::new();
+    let mut seen: HashMap<CandidateCode, (PathBuf, usize)> = HashMap::new();
     for path in files {
         let stem = path
             .file_stem()
@@ -315,7 +315,8 @@ fn read_candidates(
         };
         for row in &table.rows {
             let line = row.line;
-            let candidate_id = match CandidateId::parse(table.get(row, "candidate_id")) {
+            // 白票の予約値 "blank" は、候補者コードとして拒否される（CandidateCode::parse）。
+            let candidate_id = match CandidateCode::parse(table.get(row, "candidate_id")) {
                 Ok(id) => id,
                 Err(e) => {
                     issues.push(&path, Some(line), format!("candidate_id: {e}"));

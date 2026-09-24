@@ -26,9 +26,13 @@ pub use election::{
     Candidate, Contest, District, Election, ElectionError, ElectionType, VotingMethod,
 };
 pub use election_state::{
-    ElectionPhase, Period, VoteGate, automatic_transition, vote_gate, voting_started_at,
+    ElectionPhase, ElectionRules, Period, VoteGate, automatic_transition, vote_gate,
+    voting_started_at,
 };
-pub use ids::{CandidateId, ContestId, DistrictId, ElectionId, ElectionTypeCode, IdError};
+pub use ids::{
+    BLANK_CANDIDATE_ID, CandidateCode, CandidateId, ContestId, DistrictId, ElectionId,
+    ElectionTypeCode, IdError,
+};
 pub use merkle::{InclusionProof, Side, inclusion_proof, merkle_root, verify_inclusion};
 pub use seal_policy::{PolicyError, SealDecision, SealPolicy, decide, decide_close, window_start};
 pub use shard::{ShardId, shard_for};

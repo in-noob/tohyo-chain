@@ -139,12 +139,19 @@ async fn ballot_status(
     Ok(Json(BallotStatusResponse { ballots }))
 }
 
+/// 候補者の一覧（選挙データの並び順）と、白票を選べるか（`allow_blank`）。白票は候補者ではないので、一覧には入れない
+/// （画面が、`allow_blank` のときだけ、一覧の最後に白票の選択肢を置く）。
 async fn candidates(
     State(state): State<Arc<AppState>>,
     AuthedVoter(voter): AuthedVoter,
     Path((election_id, district_id)): Path<(String, String)>,
 ) -> Result<Json<CandidatesResponse>, ApiError> {
     let contest = contest_from_path(&election_id, &district_id)?;
+    let snapshot = state
+        .election_gate
+        .snapshot(state.clock.now_unix_secs())
+        .await?;
+    let allow_blank = state.rules(&snapshot).allow_blank;
     let candidates = state
         .voting
         .candidates(&voter, &contest)
@@ -156,7 +163,10 @@ async fn candidates(
             party: c.party,
         })
         .collect();
-    Ok(Json(CandidatesResponse { candidates }))
+    Ok(Json(CandidatesResponse {
+        candidates,
+        allow_blank,
+    }))
 }
 
 async fn vote(
@@ -178,10 +188,15 @@ async fn vote(
     }
 
     let contest = contest_from_path(&election_id, &district_id)?;
-    // 候補者 ID の形式が不正なら、その投票用紙に存在しない候補者として扱う。
+    // 候補者 ID の形式が不正なら、その投票用紙に存在しない候補者として扱う。予約値 "blank" は白票。
     let candidate =
         CandidateId::parse(&req.candidate_id).map_err(|_| ApiError::InvalidCandidate)?;
-    state.voting.cast_vote(&voter, contest, candidate).await?;
+    // 白票を受け付けるかは、open の時点で固定した選挙のルール（原則19）。
+    let allow_blank = state.rules(&snapshot).allow_blank;
+    state
+        .voting
+        .cast_vote(&voter, contest, candidate, allow_blank)
+        .await?;
     // 秘密投票: ここでは投票者も候補者もログに出さない。
     tracing::debug!("投票を受理しました");
     Ok((

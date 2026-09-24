@@ -14,6 +14,12 @@ pub const DEFAULT_LOGIN_HEADING: &str = "ログイン";
 pub const DEFAULT_BALLOT_ITEM: &str = "投票用紙";
 /// 進捗の表示の型（`labels.progress`）。`{total}` と `{current}` を置き換える。
 pub const DEFAULT_PROGRESS: &str = "{total}枚中{current}枚目";
+/// 候補者一覧の最後に置く白票の選択肢（`labels.blank_option`）。
+pub const DEFAULT_BLANK_OPTION: &str = "白票（どの候補者にも投票しない）";
+/// 確認画面で白票を選んだときの文言（`labels.blank_confirm`）。
+pub const DEFAULT_BLANK_CONFIRM: &str = "白票として投票します。よろしいですか？";
+/// 白票の呼び名（`labels.blank_name`）。ビューアの票の一覧で使う。
+pub const DEFAULT_BLANK_NAME: &str = "白票";
 
 pub fn site_title() -> &'static str {
     option_env!("APP_WEB_SITE_TITLE").unwrap_or(DEFAULT_SITE_TITLE)
@@ -37,6 +43,18 @@ pub fn progress_template() -> &'static str {
     option_env!("APP_WEB_PROGRESS").unwrap_or(DEFAULT_PROGRESS)
 }
 
+pub fn blank_option() -> &'static str {
+    option_env!("APP_WEB_BLANK_OPTION").unwrap_or(DEFAULT_BLANK_OPTION)
+}
+
+pub fn blank_confirm() -> &'static str {
+    option_env!("APP_WEB_BLANK_CONFIRM").unwrap_or(DEFAULT_BLANK_CONFIRM)
+}
+
+pub fn blank_name() -> &'static str {
+    option_env!("APP_WEB_BLANK_NAME").unwrap_or(DEFAULT_BLANK_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +76,15 @@ mod tests {
         }
         if option_env!("APP_WEB_PROGRESS").is_none() {
             assert_eq!(progress_template(), "{total}枚中{current}枚目");
+        }
+        if option_env!("APP_WEB_BLANK_OPTION").is_none() {
+            assert_eq!(blank_option(), "白票（どの候補者にも投票しない）");
+        }
+        if option_env!("APP_WEB_BLANK_CONFIRM").is_none() {
+            assert_eq!(blank_confirm(), "白票として投票します。よろしいですか？");
+        }
+        if option_env!("APP_WEB_BLANK_NAME").is_none() {
+            assert_eq!(blank_name(), "白票");
         }
     }
 }

@@ -6,7 +6,7 @@
 //! | `election_type` | 選挙の種類のコード | `shugiin_smd` |
 //! | `district_id` | 選挙区。先頭のセグメントが選挙の種類 | `shugiin_smd.13.01`（都道府県は JIS X 0401 の 2 桁）|
 //! | `contest_id` | `{election_id}/{district_id}`（投票用紙 1 枚 = 選挙 × 選挙区）| `2026-general/shugiin_smd.13.01` |
-//! | `candidate_id` | `{district_id}.c{連番}`（連番の桁数は固定しない）| `shugiin_smd.13.01.c3` |
+//! | `candidate_id` | `{district_id}.c{連番}`（連番の桁数は固定しない）。票では、白票の予約値 `blank` も使う | `shugiin_smd.13.01.c3` |
 //!
 //! 文字種は小文字の ASCII 英数字・`_`・`-`（選挙区と候補者はセグメントの区切りに `.`、`contest_id` は
 //! `election_id` と `district_id` の区切りに `/`）。**選挙区の再編などで将来変わり得る意味は ID に埋め込まない**
@@ -46,6 +46,12 @@ pub enum IdError {
     #[error("{kind} の形式が不正です: {reason}")]
     Malformed {
         kind: &'static str,
+        reason: &'static str,
+    },
+    #[error("{kind} に {value:?} は使えません（{reason}）")]
+    Reserved {
+        kind: &'static str,
+        value: &'static str,
         reason: &'static str,
     },
 }
@@ -232,12 +238,16 @@ impl ContestId {
 }
 id_common!(ContestId);
 
-/// 候補者の ID: `{district_id}.c{連番}`（連番は 1 以上の 10 進数で、先頭に 0 を付けない。桁数は固定しない）。
-/// 最大 80 文字。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CandidateId(String);
+/// 白票を表す `candidate_id` の予約値。候補者の ID（[`CandidateCode`]）には使えない。
+pub const BLANK_CANDIDATE_ID: &str = "blank";
 
-impl CandidateId {
+/// 候補者の ID（候補者コード）: `{district_id}.c{連番}`（連番は 1 以上の 10 進数で、先頭に 0 を付けない。
+/// 桁数は固定しない）。最大 80 文字。白票の予約値 [`BLANK_CANDIDATE_ID`] は、この形式に合わないうえ、
+/// 読み込み時にも明示的に拒否する（選挙データの候補者を白票と取り違えないため）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CandidateCode(String);
+
+impl CandidateCode {
     pub const KIND: &'static str = "candidate_id";
 
     /// 選挙区と連番から作る。
@@ -246,6 +256,13 @@ impl CandidateId {
     }
 
     pub fn parse(raw: &str) -> Result<Self, IdError> {
+        if raw == BLANK_CANDIDATE_ID {
+            return Err(IdError::Reserved {
+                kind: Self::KIND,
+                value: BLANK_CANDIDATE_ID,
+                reason: "白票の予約値",
+            });
+        }
         check_len(Self::KIND, raw, CANDIDATE_ID_MAX_LEN)?;
         let Some((district, seq)) = raw.rsplit_once(".c") else {
             return Err(IdError::Malformed {
@@ -282,7 +299,75 @@ impl CandidateId {
             .map_or("", |(district, _)| district)
     }
 }
-id_common!(CandidateId);
+id_common!(CandidateCode);
+
+/// 票の投票先（票の `candidate_id`）: 候補者か、白票（どの候補者にも投票しない）。
+///
+/// 文字列表現は、候補者なら候補者コード、白票なら予約値 [`BLANK_CANDIDATE_ID`]（`"blank"`）。
+/// ブロックの正規化形式（原則4・ADR 0013）はこの文字列を埋め込むので、白票を加えても形式の版は変わらない。
+/// `enum` にしてあるのは、集計・表示のたびに `match` で白票の扱いを必ず決めさせるため（文字列の比較だと漏れる）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CandidateId {
+    /// 白票。
+    Blank,
+    /// 候補者。
+    Candidate(CandidateCode),
+}
+
+impl CandidateId {
+    pub const KIND: &'static str = CandidateCode::KIND;
+
+    /// 選挙区と連番から、候補者への投票先を作る。
+    pub fn new(district: &DistrictId, seq: u64) -> Result<Self, IdError> {
+        CandidateCode::new(district, seq).map(Self::Candidate)
+    }
+
+    /// `"blank"` なら白票、それ以外は候補者コードとして検証する。
+    pub fn parse(raw: &str) -> Result<Self, IdError> {
+        if raw == BLANK_CANDIDATE_ID {
+            Ok(Self::Blank)
+        } else {
+            CandidateCode::parse(raw).map(Self::Candidate)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Blank => BLANK_CANDIDATE_ID,
+            Self::Candidate(code) => code.as_str(),
+        }
+    }
+
+    pub fn is_blank(&self) -> bool {
+        matches!(self, Self::Blank)
+    }
+
+    /// 候補者への票なら、その候補者コード。白票なら `None`。
+    pub fn candidate(&self) -> Option<&CandidateCode> {
+        match self {
+            Self::Blank => None,
+            Self::Candidate(code) => Some(code),
+        }
+    }
+}
+
+impl From<CandidateCode> for CandidateId {
+    fn from(code: CandidateCode) -> Self {
+        Self::Candidate(code)
+    }
+}
+
+impl fmt::Display for CandidateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for CandidateId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
 
 /// 都道府県名（JIS X 0401 の順。添字 0 が `01`）。
 pub const PREFECTURE_NAMES: [&str; 47] = [
@@ -363,9 +448,13 @@ mod tests {
         assert_eq!(ContestId::parse(contest.as_str()), Ok(contest.clone()));
         assert_eq!(contest.election_part(), "2026-general");
         assert_eq!(contest.district_part(), "shugiin_smd.13.01");
-        let candidate = CandidateId::new(&district, 3).expect("valid");
+        let candidate = CandidateCode::new(&district, 3).expect("valid");
         assert_eq!(candidate.as_str(), "shugiin_smd.13.01.c3");
         assert_eq!(candidate.district_part(), "shugiin_smd.13.01");
+        assert_eq!(
+            CandidateId::parse(candidate.as_str()),
+            Ok(CandidateId::Candidate(candidate))
+        );
         assert_eq!(district.type_segment(), "shugiin_smd");
         assert!(ElectionTypeCode::new("supreme_court_review").is_ok());
         // 合区: 都道府県は ID に埋め込まない（属性で持つ）。ID は英数字・_・- のセグメント。
@@ -376,8 +465,9 @@ mod tests {
     fn candidate_sequence_has_no_fixed_width() {
         let district = DistrictId::new("shugiin_pr.tokyo").expect("valid");
         for seq in [1u64, 9, 10, 123, 99_999, 12_345_678_901] {
-            let id = CandidateId::new(&district, seq).expect("valid");
+            let id = CandidateCode::new(&district, seq).expect("valid");
             assert_eq!(id.as_str(), format!("shugiin_pr.tokyo.c{seq}"));
+            assert_eq!(id.sequence(), seq);
         }
         assert!(
             CandidateId::parse("shugiin_pr.tokyo.c0").is_err(),
@@ -432,8 +522,35 @@ mod tests {
         assert_eq!(CANDIDATE_ID_MAX_LEN, 80);
         let district = DistrictId::new(&format!("a.{}", "b".repeat(62))).expect("64 chars");
         assert_eq!(district.as_str().len(), DISTRICT_ID_MAX_LEN);
-        let candidate = CandidateId::new(&district, 12_345_678_901_234).expect("14 digits");
+        let candidate = CandidateCode::new(&district, 12_345_678_901_234).expect("14 digits");
         assert_eq!(candidate.as_str().len(), CANDIDATE_ID_MAX_LEN);
+    }
+
+    #[test]
+    fn blank_is_a_reserved_value_of_the_vote_but_never_a_candidate_code() {
+        // 票の投票先としては、予約値 "blank" が白票になる（文字列表現は往復する）。
+        let blank = CandidateId::parse("blank").expect("blank");
+        assert_eq!(blank, CandidateId::Blank);
+        assert!(blank.is_blank());
+        assert_eq!(blank.as_str(), BLANK_CANDIDATE_ID);
+        assert_eq!(blank.to_string(), "blank");
+        assert_eq!(blank.candidate(), None);
+        // 候補者コードには使えない（選挙データの候補者を白票と取り違えない）。
+        assert_eq!(
+            CandidateCode::parse("blank"),
+            Err(IdError::Reserved {
+                kind: "candidate_id",
+                value: "blank",
+                reason: "白票の予約値",
+            })
+        );
+        // 大文字や前後の空白は予約値ではなく、ただの不正な ID。
+        for bad in ["Blank", "BLANK", " blank", "blank ", "blank.c1x", ""] {
+            assert!(CandidateId::parse(bad).is_err(), "{bad:?}");
+        }
+        let candidate = CandidateId::parse("shugiin_smd.13.01.c2").expect("valid");
+        assert!(!candidate.is_blank());
+        assert_eq!(candidate.candidate().map(CandidateCode::sequence), Some(2));
     }
 
     #[test]

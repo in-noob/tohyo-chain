@@ -394,6 +394,22 @@ fn malformed_ids_and_values_are_reported() {
 }
 
 #[test]
+fn the_reserved_blank_value_cannot_be_a_candidate_code() {
+    // 票の candidate_id の "blank" は白票の予約値。選挙データの候補者コードに使うと、ファイル・行・理由つきで拒否する。
+    let seed = valid();
+    seed.write(
+        "candidates/governor.csv",
+        "candidate_id,district_id,name\ngovernor.13.c1,governor.13,田中 一郎\nblank,governor.13,白票さん\n",
+    );
+    let text = error_text(load_dir(&seed));
+    assert!(text.contains("governor.csv:3"), "{text}");
+    assert!(
+        text.contains("\"blank\"") && text.contains("白票の予約値"),
+        "{text}"
+    );
+}
+
+#[test]
 fn too_long_ids_are_rejected() {
     let seed = valid();
     let long = format!("governor.{}", "x".repeat(60)); // 69 文字

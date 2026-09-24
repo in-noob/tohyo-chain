@@ -13,8 +13,9 @@ use domain::anchor::GENESIS_ANCHOR_PREV;
 use domain::encoding::ballot_order_key;
 use domain::seal_policy::SealPolicy;
 use domain::{
-    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ElectionPhase, Period,
-    ShardHead, ShardId, VoterId, build_anchor, verify_anchor, verify_anchor_link, verify_chain,
+    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ElectionPhase, ElectionRules,
+    Period, ShardHead, ShardId, VoterId, build_anchor, verify_anchor, verify_anchor_link,
+    verify_chain,
 };
 use infra_memory::InMemoryStore;
 use sealer::{FinalAnchor, ManualClock, SealEvent, Sealer, SealerError, TickOutcome, Trigger};
@@ -435,6 +436,7 @@ async fn spawned_task_seals_periodically_and_does_not_flush_on_shutdown() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
+        ElectionRules { allow_blank: true },
     );
 
     // 100 件到着 → 次の周期（200ms 以内）で件数封印される。
@@ -472,6 +474,7 @@ async fn spawned_task_flushes_only_in_the_closing_procedure() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
+        ElectionRules { allow_blank: true },
     );
     run_spawned_for(&clock, 1).await;
     assert_eq!(store.get().await.expect("state").phase, ElectionPhase::Open);
@@ -487,6 +490,7 @@ async fn spawned_task_flushes_only_in_the_closing_procedure() {
             .transition(
                 ElectionPhase::Open,
                 ElectionPhase::Closing,
+                ElectionRules { allow_blank: true },
                 "test",
                 opens_at + 6
             )
@@ -694,6 +698,7 @@ async fn spawned_task_adds_nothing_while_idle_and_finalizes_only_on_change() {
         Duration::from_secs(10),
         f.store.clone(),
         Duration::from_secs(1),
+        ElectionRules { allow_blank: true },
     );
 
     // 票が無いまま 60 秒（封印・アンカーの間隔が 6 回ずつ）: ブロックもアンカーも増えない。
@@ -735,6 +740,7 @@ async fn spawned_task_finalizes_the_anchor_on_shutdown_without_flushing() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
+        ElectionRules { allow_blank: true },
     );
     cast(&store, 0, 0, 104).await;
     tokio::time::sleep(Duration::from_millis(250)).await;

@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use application::{ElectionStateSnapshot, ElectionStateStore, LeaseStore, StoreError};
-use domain::{Anchor, ElectionPhase, ShardId, automatic_transition, voting_started_at};
+use domain::{
+    Anchor, ElectionPhase, ElectionRules, ShardId, automatic_transition, voting_started_at,
+};
 
 use crate::clock::MonotonicClock;
 use crate::schedule::AnchorSchedule;
@@ -69,6 +71,8 @@ pub struct Coordinator {
     election: Arc<dyn ElectionStateStore>,
     /// 締切の手続きの待ち時間（`election.state_cache_secs + api.request_timeout_secs`）。
     election_grace: Duration,
+    /// open に遷移させるときに固定する選挙のルール（設定 `vote.allow_blank`。原則19）。
+    rules: ElectionRules,
     /// closing を検知してからの、締切の手続きの期限（単調時計）。アンカー担当のときだけ使う。
     closing_deadline: Option<Duration>,
 }
@@ -79,7 +83,8 @@ impl Coordinator {
     ///
     /// `election` / `election_grace`: アンカーのリースを持っている間だけ、選挙状態（scheduled → open →
     /// closing → closed）の自動遷移と締切の手続きを行う（原則17）。`election_grace` は、closing を検知
-    /// してから、全シャードのフラッシュを確認し始めるまでの待ち時間。
+    /// してから、全シャードのフラッシュを確認し始めるまでの待ち時間。`rules` は、open に遷移させるときに
+    /// 選挙状態へ固定する選挙のルール（原則19）。
     pub fn new(
         sealer: Sealer,
         leases: Arc<dyn LeaseStore>,
@@ -87,6 +92,7 @@ impl Coordinator {
         anchor_interval: Duration,
         election: Arc<dyn ElectionStateStore>,
         election_grace: Duration,
+        rules: ElectionRules,
     ) -> Self {
         let mono = sealer.clock();
         let shard_count = sealer.shard_count();
@@ -102,6 +108,7 @@ impl Coordinator {
             anchors: AnchorSchedule::new(anchor_interval),
             election,
             election_grace,
+            rules,
             closing_deadline: None,
         }
     }
@@ -369,7 +376,7 @@ impl Coordinator {
                 };
                 match self
                     .election
-                    .transition(snapshot.phase, next, &actor, wall_now)
+                    .transition(snapshot.phase, next, self.rules, &actor, wall_now)
                     .await
                 {
                     Ok(true) => {
@@ -408,6 +415,7 @@ impl Coordinator {
                             .transition(
                                 ElectionPhase::Closing,
                                 ElectionPhase::Closed,
+                                self.rules,
                                 &actor,
                                 wall_now,
                             )

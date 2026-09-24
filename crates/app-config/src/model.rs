@@ -79,6 +79,7 @@ pub struct AppConfig {
     pub session: Session,
     pub credentials: Credentials,
     pub election: Election,
+    pub vote: Vote,
     pub chain: Chain,
     pub admin: Admin,
     pub labels: Labels,
@@ -173,6 +174,13 @@ pub struct Election {
     pub state_cache_secs: u64,
 }
 
+/// 投票のルール（原則19: 選挙状態が open に移った時点の値を固定し、それ以降は設定を変えても使わない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vote {
+    /// 白票（どの候補者にも投票しない）を選べるか。
+    pub allow_blank: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayTimezone {
     pub name: &'static str,
@@ -211,6 +219,12 @@ pub struct Labels {
     pub voting_closing_message: String,
     /// 終了後に投票しようとしたときのメッセージ。
     pub voting_closed_message: String,
+    /// 候補者一覧の最後に置く、白票の選択肢の表示名。
+    pub blank_option: String,
+    /// 確認画面で、白票を選んだときに表示する文言。
+    pub blank_confirm: String,
+    /// 集計結果・ビューア・API のエラーでの、白票の呼び名。
+    pub blank_name: String,
 }
 
 impl Election {
@@ -523,6 +537,8 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
     );
     let state_cache_secs = r.uint("election.state_cache_secs", 0, 3600);
 
+    let allow_blank = r.boolean("vote.allow_blank");
+
     let reveal = r.choice(
         "chain.reveal_ballots",
         &[
@@ -546,6 +562,9 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         voting_not_started_message: r.label("labels.voting_not_started_message", 200),
         voting_closing_message: r.label("labels.voting_closing_message", 200),
         voting_closed_message: r.label("labels.voting_closed_message", 200),
+        blank_option: r.label("labels.blank_option", 100),
+        blank_confirm: r.label("labels.blank_confirm", 200),
+        blank_name: r.label("labels.blank_name", 30),
     };
     if !labels.progress.contains("{total}") || !labels.progress.contains("{current}") {
         r.bad(
@@ -639,6 +658,7 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
             display_timezone,
             state_cache_secs,
         },
+        vote: Vote { allow_blank },
         chain: Chain {
             reveal_ballots: reveal,
         },

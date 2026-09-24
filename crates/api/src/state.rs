@@ -10,8 +10,8 @@ use application::{
     Authenticator, ChainRead, Clock, DbAuthenticator, ElectionStateStore, RandomBallotIds,
     SealStore, SessionSigner, StubAuthenticator, VoteStore, VoterRoll, VotingService,
 };
-use domain::Ed25519Signer;
 use domain::election::Election;
+use domain::{Ed25519Signer, ElectionRules};
 use infra_memory::{InMemoryStore, StaticElectionRepository, StaticVoterRoll};
 use infra_scylla::{ScyllaConfig, ScyllaStore};
 use sealer::{MonotonicClock, Sealer};
@@ -41,6 +41,9 @@ pub struct AppState {
     pub election_state: Arc<dyn ElectionStateStore>,
     /// 選挙状態の短期キャッシュ（原則18: 投票の受け付けの判定に使う）。
     pub election_gate: ElectionGate,
+    /// このプロセスの設定の選挙のルール（`vote.allow_blank`）。open に遷移させるときに固定する値。
+    /// 固定した後は、選挙状態に保存した値が優先する（[`AppState::rules`]。原則19）。
+    pub configured_rules: ElectionRules,
     /// 画面に表示するタイムゾーン（`election.display_timezone`）。
     pub display_timezone: DisplayTimezone,
     /// 管理用エンドポイントのトークン（秘密情報）。未設定なら管理用エンドポイントはすべて拒否する。
@@ -64,6 +67,15 @@ pub struct ApiLabels {
     pub voting_closing_message: String,
     /// 終了後に投票しようとしたときのメッセージ。
     pub voting_closed_message: String,
+    /// 白票の呼び名（`labels.blank_name`）。白票を受け付けない選挙で、白票が指定されたときのメッセージに使う。
+    pub blank_name: String,
+}
+
+impl AppState {
+    /// 実際に使う選挙のルール: open の時点で固定した値があればそれ、無ければこのプロセスの設定の値。
+    pub fn rules(&self, snapshot: &application::ElectionStateSnapshot) -> ElectionRules {
+        ElectionRules::effective(snapshot.rules, self.configured_rules)
+    }
 }
 
 impl Default for ApiLabels {
@@ -74,6 +86,7 @@ impl Default for ApiLabels {
             voting_closing_message: "投票の受付を締め切っています。しばらくお待ちください"
                 .to_string(),
             voting_closed_message: "投票の受付は終了しました".to_string(),
+            blank_name: "白票".to_string(),
         }
     }
 }
@@ -217,6 +230,16 @@ pub async fn build(
             "設定ファイルの投票期間と、保存されている期間が異なります。保存されている値を使います"
         );
     }
+    // 選挙のルールは open の時点で固定する（原則19）。固定した後に設定を変えても、保存されている値を使う。
+    if let Some(frozen) = election_snapshot.rules
+        && frozen != config.rules
+    {
+        tracing::warn!(
+            configured = ?config.rules,
+            stored = ?frozen,
+            "設定ファイルの選挙のルール（vote.*）と、open の時点で固定したルールが異なります。固定した値を使います"
+        );
+    }
 
     // 認証と名簿。stub は入力 ID を採用し、名簿は voters.csv（メモリのキャッシュ）。db は、事前登録した
     // ログイン ID とパスワードで認証し、名簿は DB（voter_roll）から、リクエストごとに引く（状態を持たない）。
@@ -261,6 +284,7 @@ pub async fn build(
         labels: config.labels.clone(),
         election_state,
         election_gate,
+        configured_rules: config.rules,
         display_timezone: config.display_timezone,
         admin_token: config.admin_token.clone(),
         request_timeout: config.request_timeout,

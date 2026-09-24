@@ -18,6 +18,8 @@ pub enum ApiError {
     NotFound,
     AlreadyVoted,
     InvalidCandidate,
+    /// 白票を受け付けない選挙（open の時点で固定した `vote.allow_blank` が偽）で、白票が指定された。
+    BlankNotAllowed,
     /// 名簿で、この有権者に属さない投票用紙（名簿に無い有権者を含む）。
     NotEligible,
     Unavailable,
@@ -38,6 +40,7 @@ impl ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::AlreadyVoted => (StatusCode::CONFLICT, "already_voted"),
             Self::InvalidCandidate => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_candidate"),
+            Self::BlankNotAllowed => (StatusCode::UNPROCESSABLE_ENTITY, "blank_not_allowed"),
             Self::NotEligible => (StatusCode::FORBIDDEN, "not_eligible"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             Self::NotSupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
@@ -58,6 +61,7 @@ impl ApiError {
             Self::NotFound => format!("{ballot_item}が見つかりません。"),
             Self::AlreadyVoted => format!("この{ballot_item}には投票済みです。"),
             Self::InvalidCandidate => format!("指定した候補者は、この{ballot_item}にいません。"),
+            Self::BlankNotAllowed => format!("この選挙では、{}は選べません。", labels.blank_name),
             Self::NotEligible => format!("この{ballot_item}は、あなたの投票対象ではありません。"),
             Self::Unavailable => {
                 "サービスが利用できません。しばらくしてからもう一度お試しください。".to_string()
@@ -113,6 +117,7 @@ impl From<ServiceError> for ApiError {
         match e {
             ServiceError::ContestNotFound => Self::NotFound,
             ServiceError::InvalidCandidate => Self::InvalidCandidate,
+            ServiceError::BlankNotAllowed => Self::BlankNotAllowed,
             ServiceError::AlreadyVoted => Self::AlreadyVoted,
             ServiceError::NotEligible => Self::NotEligible,
             ServiceError::Unavailable => {

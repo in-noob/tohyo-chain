@@ -17,7 +17,7 @@ use credgen::{
     mailing_columns, random_voter_id, register,
 };
 use domain::{
-    Candidate, CandidateId, District, DistrictId, Election, ElectionId, ElectionType,
+    Candidate, CandidateCode, District, DistrictId, Election, ElectionId, ElectionType,
     ElectionTypeCode, VoterId, VotingMethod,
 };
 
@@ -163,7 +163,7 @@ fn election() -> Election {
     let candidates = districts
         .iter()
         .map(|d| Candidate {
-            id: CandidateId::new(&d.id, 1).expect("valid"),
+            id: CandidateCode::new(&d.id, 1).expect("valid"),
             name: "候補".to_string(),
             party: String::new(),
             profile: String::new(),

@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 pub use crate::ids::{
-    CandidateId, ContestId, DistrictId, ElectionId, ElectionTypeCode, IdError, is_prefecture_code,
+    CandidateCode, CandidateId, ContestId, DistrictId, ElectionId, ElectionTypeCode, IdError,
+    is_prefecture_code,
 };
 
 /// 投票方式。今回実装しているのは、候補者を 1 人選ぶ `SingleChoice` だけ。将来の拡張に備えて `enum` にしてある。
@@ -57,9 +58,10 @@ pub struct District {
 }
 
 /// 候補者。氏名・政党・略歴は属性（将来の候補者詳細画面で使う）。
+/// ID は候補者コード（[`CandidateCode`]）なので、白票（[`CandidateId::Blank`]）は型の上で候補者になれない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    pub id: CandidateId,
+    pub id: CandidateCode,
     pub name: String,
     pub party: String,
     pub profile: String,
@@ -74,8 +76,17 @@ pub struct Contest {
 }
 
 impl Contest {
-    pub fn has_candidate(&self, id: &CandidateId) -> bool {
+    pub fn has_candidate(&self, id: &CandidateCode) -> bool {
         self.candidates.iter().any(|c| &c.id == id)
+    }
+
+    /// この投票用紙の投票先として受け付けられるか。白票は `allow_blank`（open の時点で固定した
+    /// 選挙のルール `vote.allow_blank`）が真のときだけ、候補者はこの選挙区の候補者のときだけ。
+    pub fn accepts(&self, choice: &CandidateId, allow_blank: bool) -> bool {
+        match choice {
+            CandidateId::Blank => allow_blank,
+            CandidateId::Candidate(code) => self.has_candidate(code),
+        }
     }
 }
 
@@ -91,7 +102,7 @@ pub enum ElectionError {
     #[error("選挙区 {0} が重複しています")]
     DuplicateDistrict(DistrictId),
     #[error("候補者 {0} が重複しています")]
-    DuplicateCandidate(CandidateId),
+    DuplicateCandidate(CandidateCode),
     #[error("選挙区 {district} の選挙の種類 {election_type} が定義されていません")]
     UnknownType {
         district: DistrictId,
@@ -107,7 +118,7 @@ pub enum ElectionError {
     #[error("選挙区 {district} の都道府県コード {code:?} が不正です（01〜47）")]
     InvalidPrefecture { district: DistrictId, code: String },
     #[error("候補者 {candidate} が、存在しない選挙区を参照しています")]
-    UnknownDistrict { candidate: CandidateId },
+    UnknownDistrict { candidate: CandidateCode },
     #[error("選挙区 {0} に候補者がいません")]
     EmptyDistrict(DistrictId),
 }
@@ -298,7 +309,7 @@ mod tests {
     fn candidate(district: &str, seq: u64) -> Candidate {
         let district = DistrictId::new(district).expect("valid");
         Candidate {
-            id: CandidateId::new(&district, seq).expect("valid"),
+            id: CandidateCode::new(&district, seq).expect("valid"),
             name: format!("候補者 {seq}"),
             party: "無所属".to_string(),
             profile: String::new(),
@@ -363,9 +374,11 @@ mod tests {
         let id = ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid");
         let contest = e.contest(&id).expect("exists");
         assert_eq!(contest.candidates.len(), 2);
-        assert!(contest.has_candidate(&CandidateId::parse("shugiin_smd.13.01.c2").expect("valid")));
         assert!(
-            !contest.has_candidate(&CandidateId::parse("shugiin_smd.13.02.c1").expect("valid"))
+            contest.has_candidate(&CandidateCode::parse("shugiin_smd.13.01.c2").expect("valid"))
+        );
+        assert!(
+            !contest.has_candidate(&CandidateCode::parse("shugiin_smd.13.02.c1").expect("valid"))
         );
         assert_eq!(e.contest_position(&id), Some(1));
         let district = DistrictId::new("governor.13").expect("valid");
@@ -381,6 +394,22 @@ mod tests {
             e.election_type(&ElectionTypeCode::new("governor").expect("valid"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_contest_accepts_its_own_candidates_and_blank_only_when_allowed() {
+        let e = build(base_types(), base_districts(), base_candidates()).expect("valid");
+        let contest = e
+            .contest(&ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"))
+            .expect("exists");
+        let own = CandidateId::parse("shugiin_smd.13.01.c1").expect("valid");
+        let other = CandidateId::parse("shugiin_smd.13.02.c1").expect("valid");
+        for allow_blank in [true, false] {
+            assert!(contest.accepts(&own, allow_blank));
+            assert!(!contest.accepts(&other, allow_blank));
+        }
+        assert!(contest.accepts(&CandidateId::Blank, true));
+        assert!(!contest.accepts(&CandidateId::Blank, false));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use application::{ChainRead, Clock, ElectionStateStore, SealStore};
 use domain::seal_policy::SealPolicy;
-use domain::{Ed25519Signer, ElectionPhase, Period};
+use domain::{Ed25519Signer, ElectionPhase, ElectionRules, Period};
 use infra_memory::InMemoryStore;
 use sealer::{ManualClock, Sealer};
 
@@ -65,11 +65,14 @@ async fn memory_scheduler_advances_through_the_full_lifecycle() {
         Duration::from_secs(600),
         store.clone(),
         Duration::from_secs(1), // 締切の手続きの猶予。
+        ElectionRules { allow_blank: false },
     );
 
-    // 開始時刻に達しているので、次の tick で open になる。
+    // 開始時刻に達しているので、次の tick で open になる。open にしたプロセスの設定のルールが固定される（原則19）。
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(store.get().await.expect("state").phase, ElectionPhase::Open);
+    let opened = store.get().await.expect("state");
+    assert_eq!(opened.phase, ElectionPhase::Open);
+    assert_eq!(opened.rules, Some(ElectionRules { allow_blank: false }));
 
     // 終了時刻に進める → closing。
     wall.set(1_010);
@@ -156,6 +159,7 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
         Duration::from_secs(600),
         store.clone(),
         Duration::from_secs(1),
+        ElectionRules { allow_blank: true },
     );
     tokio::time::sleep(Duration::from_millis(50)).await; // scheduled -> open
 

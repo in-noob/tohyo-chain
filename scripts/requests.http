@@ -59,6 +59,15 @@ Content-Type: application/json
   "candidate_id": "shugiin_pr.tokyo.c3"
 }
 
+### 白票（予約値 "blank"）→ 201（vote.allow_blank=false の選挙では 422 blank_not_allowed）
+POST {{baseUrl}}/api/v1/contests/2026-general/sangiin_district.13/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "blank"
+}
+
 ### 候補者がその投票用紙にいない → 422
 POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/vote
 Authorization: Bearer {{token}}

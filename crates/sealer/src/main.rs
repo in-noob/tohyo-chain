@@ -68,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
             "設定ファイルの投票期間と DB の期間が異なります。DB の値を使います"
         );
     }
+    // 選挙のルールは open の時点で固定する（原則19）。固定した後に設定を変えても、DB の値を使う。
+    if let Some(frozen) = election_state.rules
+        && frozen != config.rules
+    {
+        tracing::warn!(
+            configured = ?config.rules,
+            db = ?frozen,
+            "設定ファイルの選挙のルール（vote.*）と、open の時点で固定したルールが異なります。固定した値を使います"
+        );
+    }
 
     let coordinator = Coordinator::new(
         sealer,
@@ -81,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(config.policy.interval_secs()),
         store as Arc<dyn ElectionStateStore>,
         config.election_grace,
+        config.rules,
     );
     tracing::info!(
         sealer_id = %config.sealer_id,

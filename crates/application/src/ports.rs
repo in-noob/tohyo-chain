@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use domain::{
-    Anchor, Ballot, BallotId, Block, ContestId, DistrictId, Election, ElectionPhase, Period,
-    ShardId, VoterId,
+    Anchor, Ballot, BallotId, Block, ContestId, DistrictId, Election, ElectionPhase, ElectionRules,
+    Period, ShardId, VoterId,
 };
 
 /// ログイン時に受け取る資格情報。
@@ -261,6 +261,9 @@ pub struct ElectionStateSnapshot {
     pub opened_at: Option<i64>,
     /// closing に遷移した時刻（締切の手続きの待ち時間の起点）。closing 以外では意味を持たない。
     pub closing_started_at: Option<i64>,
+    /// open に遷移した時点で固定した選挙のルール（原則19）。scheduled の間は `None`
+    /// （ルールを記録する前の版で open にした選挙も `None`。そのときは各プロセスの設定の値を使う）。
+    pub rules: Option<ElectionRules>,
 }
 
 /// 選挙状態（scheduled → open → closing → closed）の保存先（原則17）。
@@ -283,10 +286,14 @@ pub trait ElectionStateStore: Send + Sync {
     /// `from` → `to`（原則17の順で 1 段）を、条件付きで行う。`from` から動いていなければ成功して
     /// `true` を返し、`election_audit` に 1 行記録する。既に動いていた（他のプロセスが先に遷移させた）
     /// 場合は何もせず `false`。
+    ///
+    /// `rules` は、`to` が open のときだけ、状態の変更と同じ条件付き書き込みで保存する（原則19: open の時点で
+    /// 固定する）。他の遷移では無視する（保存済みのルールは変えない）。
     async fn transition(
         &self,
         from: ElectionPhase,
         to: ElectionPhase,
+        rules: ElectionRules,
         actor: &str,
         at_unix_secs: i64,
     ) -> Result<bool, StoreError>;

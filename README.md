@@ -296,14 +296,17 @@ scripts/tally.sh --allow-interim          # closed になる前の中間集計�
 
 | 内容 | 出力 |
 |---|---|
-| 選挙区ごとの候補者別得票数（多い順。同数は同順位、0 票の候補者も表示）・白票（無効票）・合計・投票済み者数 | 表示、`districts.csv`（選挙区の合計）、`candidates.csv`（候補者別）、`tally.json` |
+| 選挙区ごとの候補者別得票数（多い順。同数は同順位、0 票の候補者も表示）・白票（候補者とは別の行）・合計・投票済み者数 | 表示、`districts.csv`（選挙区の合計）、`candidates.csv`（候補者別）、`tally.json` |
 | 都道府県別の合計 | 表示、`prefectures.csv`、`tally.json` |
 | 選挙の種類別の合計 | 表示、`types.csv`、`tally.json` |
 | 突合の結果（シャード・ブロック・票数、投票用紙ごとの一致、重複、アンカー） | 表示、`reconciliation.csv`、`tally.json` |
 
-- 表示名は、seed（選挙区・候補者・政党・選挙の種類・都道府県）と、設定 `labels.ballot_item`（表の見出し）から取る。
-- **白票（無効票）**は、投票用紙の候補者ではない票。今は、白票を投じる手段（API・画面）がないので、通常は 0（チェーンに、
-  その選挙区にいない候補者の票があれば、白票として数える）。チェーンに、選挙データに無い投票用紙の票があれば、集計を中止する（終了コード 3）。
+- 表示名は、seed（選挙区・候補者・政党・選挙の種類・都道府県）と、設定 `labels.ballot_item`（表の見出し）・`labels.blank_name`
+  （白票の行・列の名前。既定「白票」）から取る。
+- **白票**は、票の `candidate_id` が予約値 `blank` の票（[白票](#白票)を参照）。候補者とは別に数え、表では候補者の後の、順位の
+  無い別の行に、CSV では `districts.csv` などの白票の列に出す（`candidates.csv` には入れない）。有効票（候補者への票）+ 白票 = 合計。
+- チェーンに、選挙データに無い投票用紙の票や、投票用紙の候補者でも白票でもない票（API は受け付けないので、選挙データの取り違えか
+  不具合）があれば、集計を中止する（終了コード 3）。
 - **都道府県別**: 単独の都道府県の選挙区は、その都道府県へ。複数の都道府県にまたがる選挙区（合区・比例ブロック・全国）は、按分できないので、
   選挙区ごとに 1 行にする（「複数の都道府県」と表示）。
 - **投票済み者数**は選挙区ごとの値。都道府県別・選挙の種類別の「投票済み数」は、投票用紙の枚数の合計（同じ有権者が複数の
@@ -368,8 +371,9 @@ eval "$(cargo run -q -p app-config -- web-env)"   # 画面の文言（labels.*�
 | `credentials.*` | 出力しない・16 文字・10 文字 | credgen の設定: `output_file_enabled`（平文を CSV に出すか）/ `output_path`（既定 `secrets/credentials.csv`）/ `password_length`（8〜128）/ `login_id_length`（8〜32）|
 | `election.seed_dir` / `election.election_id` | `seed` / `2026-general` | 選挙データのディレクトリと、読み込む選挙の ID（`<seed_dir>/<election_id>/`）。[選挙データ](#選挙データ)を参照 |
 | `election.voting_opens_at` / `voting_closes_at` | 空 | 投票の開始（RFC 3339。**未実装**）/ 締切（RFC 3339。`verifier tally` の「締切後の集計か」の判定と、`chain.reveal_ballots=after_close` の公開の判定に使う。空だと `--allow-interim` なしでは集計できない。api は、締切後の投票を拒否しない）|
+| `vote.allow_blank` | `true` | 白票を選べるか（[白票](#白票)）。選挙状態が `open` に移った時点の値を固定し、それ以降は設定を変えても使わない（原則19）|
 | `chain.reveal_ballots` | `always` | ブロックの詳細で票の中身を公開するタイミング（`always` = 常に / `after_close` = `election.voting_closes_at` 以後だけ。要 `voting_closes_at`）。[ビューア](#ブロックチェーンのビューアchain)を参照 |
-| `labels.*` | 現行の文言 | 画面・API のエラー・集計の文言（`site_title` / `done_message` / `login_heading` / `ballot_item`（既定「投票用紙」）/ `progress`（既定「{total}枚中{current}枚目」））|
+| `labels.*` | 現行の文言 | 画面・API のエラー・集計の文言（`site_title` / `done_message` / `login_heading` / `ballot_item`（既定「投票用紙」）/ `progress`（既定「{total}枚中{current}枚目」）/ `blank_option`（白票の選択肢。既定「白票（どの候補者にも投票しない）」）/ `blank_confirm`（白票の確認の文言。既定「白票として投票します。よろしいですか？」）/ `blank_name`（集計・ビューア・エラーでの白票の呼び名。既定「白票」））|
 
 **旧来の環境変数名からの移行**（旧名は廃止した）:
 
@@ -414,7 +418,7 @@ CSV は表計算ソフトで編集できる（UTF-8・ヘッダ行あり・列�
 | `election_type` | 選挙の種類のコード | `shugiin_smd` `shugiin_pr` `sangiin_district` `sangiin_pr` `governor` `pref_assembly` `municipal_head` `municipal_assembly` `supreme_court_review` | 32 |
 | `district_id` | 選挙区（先頭のセグメントが選挙の種類。都道府県は JIS X 0401 の 2 桁）| `shugiin_smd.13.01`（東京 1 区）| 64 |
 | `contest_id` | `{election_id}/{district_id}`（投票用紙 1 枚）| `2026-general/shugiin_smd.13.01` | 97 |
-| `candidate_id` | `{district_id}.c{連番}`（連番の桁数は固定しない）| `shugiin_smd.13.01.c3` | 80 |
+| `candidate_id` | `{district_id}.c{連番}`（連番の桁数は固定しない）。予約値 `blank`（白票）は、選挙データの候補者には使えない（読み込み時にエラー）| `shugiin_smd.13.01.c3` | 80 |
 
 - 合区のように 1 つの選挙区が複数の都道府県にまたがる場合も、**ID は変えず**、選挙区の属性 `prefectures`（リスト）で持つ
   （例: `sangiin_district.31_32` の `prefectures` は `31;32`）。区割りの変更などで将来変わり得る意味は、ID に埋め込まない。
@@ -448,6 +452,25 @@ cargo run -q -p seedgen -- --check seed              # 既存のデータ（手�
 **API**（有権者に関係する投票用紙だけが見える）: `GET /api/v1/ballot-status`（表示順・固定）、
 `GET|POST /api/v1/contests/{election_id}/{district_id}/candidates|vote`（対象外は 403）。旧 `GET /api/v1/status` は廃止した。
 エラー応答は `error`（コード）と `message`（`labels.ballot_item` から作る文言）。
+
+### 白票
+
+有権者は、候補者の代わりに**白票**（どの候補者にも投票しない）を選べる。
+
+- **画面**: 候補者一覧の最後に、白票の選択肢（`labels.blank_option`）を、候補者と区切って置く。確認画面では、候補者の名前の型
+  （「「○○」に投票します」）ではなく、`labels.blank_confirm`（「白票として投票します。よろしいですか？」）を表示する。
+- **API**: `POST /api/v1/contests/{election_id}/{district_id}/vote` の `candidate_id` に、予約値 `"blank"` を指定する（小文字の
+  完全一致。`"BLANK"` などは存在しない候補者として 422 `invalid_candidate`）。`GET …/candidates` は、候補者の一覧（白票は含めない）と、
+  白票を選べるか（`allow_blank`）を返す。白票でも、その投票用紙は投票済みになる（再投票は 409）。
+- **白票を使わない選挙**: `vote.allow_blank = false` にすると、画面に白票の選択肢を出さず、API も 422 `blank_not_allowed` で拒否する。
+  この値は選挙のルールなので、選挙状態が `open` に移った時点で、open に移したプロセス（db モードは sealer、memory モードと
+  `open --now` は api）の設定の値を選挙状態（DB の `election_state.allow_blank`。memory モードはプロセス内）に固定し、それ以降は
+  設定を変えて再起動しても、固定した値を使う（食い違いは起動時に警告する。原則19・[ADR 0021](docs/adr/0021-blank-vote.md)）。
+- **チェーン・ビューア・集計**: 票の `candidate_id` に `blank` がそのまま入る（ブロックの形式は変わらない）。ビューアは、白票を
+  `labels.blank_name` で、候補者と区別できる書式で表示し、ブロックの「投票先別の票数」でも候補者の後の別の行にする。集計は上記の
+  [集計](#集計verifier-tally--scriptstallysh)を参照。
+- この列を追加する前に作った DB のキースペースは、`ALTER TABLE <keyspace>.election_state ADD allow_blank boolean;` を一度実行するか、
+  `scripts/db_reset.sh --all` で作り直す。
 
 **チェーンの形式（版 2）**: 票の `contest_id` / `candidate_id` は文字列で、票の正規化バイト列は
 `ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id`（[ADR 0013](docs/adr/0013-string-ids-and-chain-format-v2.md)）。
@@ -488,11 +511,11 @@ scripts/check_all.sh        # 上記に加えて、scripts/check/*.sh の全ス�
 
 | スイート | 内容 | 目安の時間 |
 |---|---|---|
-| `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`） | 約 5 分（Docker が必要） |
+| `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`）・白票（投票 → 封印 → tally の白票の数・`vote.allow_blank=false` での拒否） | 約 5 分（Docker が必要） |
 | `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API・封印ルール（原則9: 最小件数・close --now での締切の封印） | 約 8〜9 分（Docker が必要） |
 | `election.sh` | 投票フロー（ログイン・状態・候補者・投票・再投票拒否・並列・対象外・秘密投票）・47 都道府県規模の選挙データ（生成・表示範囲・投票順・壊れたデータの検出）・選挙状態の遷移と投票の受付期間（schedule → 自動 open → 自動 closing → closed・期間の境界・締切直前の票の封印・公開用ポートと管理用リスナーの分離） | 約 1.5 分 |
 | `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh` | 約 1.5 分（Docker が必要） |
-| `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release` | 数秒〜数十秒 |
+| `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release`・白票（選択肢・確認の文言・ビューアの別の行） | 数秒〜数十秒 |
 | `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
 
 `core.sh` と `chain.sh`、`auth.sh` は Docker（Compose プラグイン）が必要で、DB を起動する。DB の起動に失敗したときは、

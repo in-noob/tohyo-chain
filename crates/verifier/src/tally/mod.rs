@@ -18,6 +18,8 @@ use gate::Phase;
 pub struct Meta<'a> {
     /// 設定の `labels.ballot_item`。
     pub ballot_item: &'a str,
+    /// 設定の `labels.blank_name`（白票の行・列の表示名）。
+    pub blank_name: &'a str,
     pub generated_at_unix: i64,
     pub phase: Phase,
     /// 設定の `election.voting_closes_at`（未設定なら `None`）。
