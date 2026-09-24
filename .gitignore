@@ -12,7 +12,7 @@
 
 # 実環境の設定（コミットするのは *.example.toml だけ）
 config/production.toml
-config/local.toml
+/config/local.toml
 *.local.toml
 
 # ログ
