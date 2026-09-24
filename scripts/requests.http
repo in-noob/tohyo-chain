@@ -1,0 +1,87 @@
+# VS Code「REST Client」拡張用のリクエスト集。
+# 事前にサーバを起動しておく（票の件数確認 /debug/pool は dev-tools 有効時のみ）:
+#   APP__SESSION__SECRET=dev-secret-0123456789abcdef cargo run -p api --features dev-tools
+# 同等の curl 版は scripts/requests.sh。
+
+@baseUrl = http://localhost:18080
+@voterId = alice
+
+### ヘルスチェック
+GET {{baseUrl}}/healthz
+
+### ログイン（マイナンバー欄は受け取って破棄される）
+# @name login
+POST {{baseUrl}}/api/v1/login
+Content-Type: application/json
+
+{
+  "voter_id": "{{voterId}}",
+  "my_number": "123456789012"
+}
+
+### ログイン結果のトークン（上のリクエストを先に実行する）
+@token = {{login.response.body.token}}
+
+### 自分に関係する投票用紙（表示順・固定。投票済みフラグつき）
+# 有権者は、サンプルの選挙データ seed/2026-general の alice（東京 1 区）の想定。
+# 投票用紙の ID は {election_id}/{district_id}、候補者の ID は {district_id}.c{連番}。
+GET {{baseUrl}}/api/v1/ballot-status
+Authorization: Bearer {{token}}
+
+### 候補者取得（東京 1 区）
+GET {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/candidates
+Authorization: Bearer {{token}}
+
+### 投票 → 201
+POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "shugiin_smd.13.01.c1"
+}
+
+### 同じ投票用紙への再投票 → 409
+POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "shugiin_smd.13.01.c2"
+}
+
+### 次の投票用紙（比例東京）には投票できる → 201
+POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_pr.tokyo/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "shugiin_pr.tokyo.c3"
+}
+
+### 候補者がその投票用紙にいない → 422
+POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "shugiin_pr.tokyo.c1"
+}
+
+### 対象外の投票用紙（大阪 1 区）→ 403
+GET {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.27.01/candidates
+Authorization: Bearer {{token}}
+
+### 存在しない投票用紙 → 404
+GET {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.99.99/candidates
+Authorization: Bearer {{token}}
+
+### トークンなし → 401
+GET {{baseUrl}}/api/v1/ballot-status
+
+### 状態取得（投票後）
+GET {{baseUrl}}/api/v1/ballot-status
+Authorization: Bearer {{token}}
+
+### シャードごとの未封印件数（dev-tools 有効時のみ。無効時は 404）
+GET {{baseUrl}}/debug/pool

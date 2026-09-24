@@ -1,0 +1,23 @@
+[package]
+name = "web"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# wasm のエントリポイント（trunk がビルドする）。
+[[bin]]
+name = "web"
+path = "src/main.rs"
+
+[dependencies]
+console_error_panic_hook.workspace = true
+gloo-net.workspace = true
+leptos.workspace = true
+leptos_router.workspace = true
+serde.workspace = true
+web-sys.workspace = true
+# web が依存してよいワークスペースクレートは shared-types のみ（原則5）。
+shared-types = { path = "../shared-types" }

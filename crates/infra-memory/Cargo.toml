@@ -1,0 +1,20 @@
+[package]
+name = "infra-memory"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# 開発用のデバッグ機能（改ざんデモ）。本番ビルドでは有効にしない。
+dev-tools = []
+
+[dependencies]
+application = { path = "../application" }
+async-trait.workspace = true
+domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

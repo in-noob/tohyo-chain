@@ -1,0 +1,19 @@
+[package]
+name = "infra-scylla"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+application = { path = "../application" }
+async-trait.workspace = true
+domain = { path = "../domain" }
+rand.workspace = true
+scylla.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+app-config = { path = "../app-config" }
+tokio.workspace = true

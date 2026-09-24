@@ -1,0 +1,41 @@
+{
+  "accepted": 370869,
+  "concurrency": 128,
+  "duration_s": 90.0,
+  "elapsed_s": 90.28924739,
+  "end_unix_ms": 1789907543826,
+  "from_schedule_us": {
+    "count": 370869,
+    "max": 859951,
+    "mean": 31088.06658685412,
+    "min": 691,
+    "p50": 11115,
+    "p90": 87219,
+    "p99": 146763,
+    "p999": 397764
+  },
+  "label": "sat",
+  "mode": "saturate",
+  "next_index": 434870,
+  "requests": 370869,
+  "service_us": {
+    "count": 370869,
+    "max": 859951,
+    "mean": 31088.06658685412,
+    "min": 691,
+    "p50": 11115,
+    "p90": 87219,
+    "p99": 146763,
+    "p999": 397764
+  },
+  "start_index": 64001,
+  "start_unix_ms": 1789907453537,
+  "status_counts": {
+    "201": 370869
+  },
+  "target_rate": null,
+  "targets": [
+    "http://127.0.0.1:18100"
+  ],
+  "throughput_rps": 4107.565526579809
+}

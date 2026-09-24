@@ -1,0 +1,41 @@
+{
+  "accepted": 64001,
+  "concurrency": 128,
+  "duration_s": 20.0,
+  "elapsed_s": 20.166646386,
+  "end_unix_ms": 1789907453518,
+  "from_schedule_us": {
+    "count": 64001,
+    "max": 456405,
+    "mean": 40007.77122232465,
+    "min": 706,
+    "p50": 23565,
+    "p90": 98117,
+    "p99": 164278,
+    "p999": 335003
+  },
+  "label": "warmup",
+  "mode": "saturate",
+  "next_index": 64001,
+  "requests": 64001,
+  "service_us": {
+    "count": 64001,
+    "max": 456405,
+    "mean": 40007.77122232465,
+    "min": 706,
+    "p50": 23565,
+    "p90": 98117,
+    "p99": 164278,
+    "p999": 335003
+  },
+  "start_index": 0,
+  "start_unix_ms": 1789907433351,
+  "status_counts": {
+    "201": 64001
+  },
+  "target_rate": null,
+  "targets": [
+    "http://127.0.0.1:18100"
+  ],
+  "throughput_rps": 3173.606497331678
+}

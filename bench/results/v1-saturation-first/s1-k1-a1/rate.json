@@ -1,0 +1,41 @@
+{
+  "accepted": 369540,
+  "concurrency": 128,
+  "duration_s": 180.0,
+  "elapsed_s": 180.076197011,
+  "end_unix_ms": 1789907726099,
+  "from_schedule_us": {
+    "count": 369540,
+    "max": 4143942,
+    "mean": 231264.16464252854,
+    "min": 807,
+    "p50": 1810,
+    "p90": 700175,
+    "p99": 3625431,
+    "p999": 4027539
+  },
+  "label": "rate",
+  "mode": "rate",
+  "next_index": 804410,
+  "requests": 369540,
+  "service_us": {
+    "count": 369540,
+    "max": 783675,
+    "mean": 20778.455420252205,
+    "min": 781,
+    "p50": 1705,
+    "p90": 74805,
+    "p99": 200681,
+    "p999": 418121
+  },
+  "start_index": 434870,
+  "start_unix_ms": 1789907546023,
+  "status_counts": {
+    "201": 369540
+  },
+  "target_rate": 2053.0,
+  "targets": [
+    "http://127.0.0.1:18100"
+  ],
+  "throughput_rps": 2052.1312984937513
+}

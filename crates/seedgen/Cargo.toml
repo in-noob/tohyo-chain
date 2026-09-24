@@ -1,0 +1,15 @@
+[package]
+name = "seedgen"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# ダミーの選挙データの生成ツール。47 都道府県規模（候補者 1 万人以上）のデータを、引数で規模を指定して作る。
+# 出力は seed/<election_id>/ と同じ構成（election.toml・districts.csv・candidates/*.csv・voters.csv）で、
+# 生成後に `seed` クレートの検証を通す。使い方は README の「選挙データ」と `seedgen --help`。
+
+[dependencies]
+anyhow.workspace = true
+csv.workspace = true
+domain = { path = "../domain" }
+seed = { path = "../seed" }

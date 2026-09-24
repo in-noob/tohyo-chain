@@ -1,0 +1,13 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+# 画面は 8080 で配信する（scripts/dev_up.sh の構成。api は 18080）。
+addresses = ["127.0.0.1"]
+port = 8080
+
+# /api を API サーバ（18080。api.port（既定 18080）で起動する）へそのまま転送する。画面から見ると同一オリジンになるので
+# CORS の設定は不要。
+[[proxy]]
+backend = "http://localhost:18080/api/"

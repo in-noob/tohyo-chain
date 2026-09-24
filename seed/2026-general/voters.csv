@@ -1,0 +1,5 @@
+voter_id,districts
+alice,shugiin_smd.13.01;shugiin_pr.tokyo;sangiin_district.13;sangiin_pr.national;governor.13;pref_assembly.13.01;municipal_head.13.101;municipal_assembly.13.101;supreme_court_review.national
+carol,shugiin_smd.13.02;shugiin_pr.tokyo;sangiin_district.13;sangiin_pr.national;governor.13;pref_assembly.13.01;municipal_head.13.101;municipal_assembly.13.101;supreme_court_review.national
+bob,shugiin_smd.27.01;shugiin_pr.kinki;sangiin_district.27;sangiin_pr.national;governor.27;pref_assembly.27.01;municipal_head.27.127;municipal_assembly.27.127;supreme_court_review.national
+dave,shugiin_smd.31.01;shugiin_pr.chugoku;sangiin_district.31_32;sangiin_pr.national;governor.31;supreme_court_review.national

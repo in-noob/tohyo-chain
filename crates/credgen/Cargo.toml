@@ -1,0 +1,36 @@
+[package]
+name = "credgen"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 有権者ごとのログイン ID・パスワードを生成して、DB に事前登録する CLI（app.mode=db のみ）。
+# 有権者は seed の voters.csv（seedgen が作る名簿）から読む。DB に残るのは、ログイン ID・Argon2id のハッシュ・
+# 内部用の voter_id だけ。平文のパスワードは、credentials.output_file_enabled=true のときだけ CSV に出力する。
+
+[lib]
+name = "credgen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credgen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+app-config = { path = "../app-config" }
+application = { path = "../application" }
+csv.workspace = true
+domain = { path = "../domain" }
+infra-scylla = { path = "../infra-scylla" }
+rand.workspace = true
+seed = { path = "../seed" }
+shared-types = { path = "../shared-types" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+csv.workspace = true

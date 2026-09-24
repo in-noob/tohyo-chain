@@ -1,0 +1,60 @@
+# 選挙の定義。id は、このディレクトリの名前と一致させる（election_id）。
+# 手書きの小さなサンプル（東京・大阪・鳥取島根の一部）。47 都道府県規模のダミーデータは seedgen で生成する。
+id = "2026-general"
+name = "サンプル統一選挙 2026"
+
+# 選挙の種類。order は表示順（小さいほど先）。method は投票方式（今は single_choice だけ）。
+[[types]]
+code = "shugiin_smd"
+name = "衆議院小選挙区選挙"
+order = 10
+method = "single_choice"
+
+[[types]]
+code = "shugiin_pr"
+name = "衆議院比例代表選挙"
+order = 20
+method = "single_choice"
+
+[[types]]
+code = "sangiin_district"
+name = "参議院選挙区選挙"
+order = 30
+method = "single_choice"
+
+[[types]]
+code = "sangiin_pr"
+name = "参議院比例代表選挙"
+order = 40
+method = "single_choice"
+
+[[types]]
+code = "governor"
+name = "都道府県知事選挙"
+order = 50
+method = "single_choice"
+
+[[types]]
+code = "pref_assembly"
+name = "都道府県議会議員選挙"
+order = 60
+method = "single_choice"
+
+[[types]]
+code = "municipal_head"
+name = "市区町村長選挙"
+order = 70
+method = "single_choice"
+
+[[types]]
+code = "municipal_assembly"
+name = "市区町村議会議員選挙"
+order = 80
+method = "single_choice"
+
+[[types]]
+code = "supreme_court_review"
+name = "最高裁判所裁判官国民審査"
+order = 90
+method = "single_choice"
+

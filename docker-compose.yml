@@ -1,0 +1,90 @@
+# 開発用の DB（1 ノード）と、スキーマ投入ジョブ。DB はプロファイルで選ぶ。
+#
+#   cassandra（ローカル開発の既定）: Apache Cassandra 5.0
+#   scylla   （明示したときだけ）  : ScyllaDB
+#
+#   docker compose --profile cassandra up -d --wait cassandra   # 起動し、healthy になるまで待つ
+#   docker compose --profile cassandra run --rm schema-cassandra # docs/schema.cql を流す（冪等。キースペースは vote）
+#   SCHEMA_KEYSPACE=my_ks docker compose --profile cassandra run --rm schema-cassandra   # 別のキースペースへ
+#   docker compose --profile cassandra --profile scylla down -v  # 停止してデータも消す
+#
+# scylla を使うときは、上の cassandra を scylla に、schema-cassandra を schema-scylla に読み替える。
+# 接続先: 127.0.0.1:9042（環境変数 DB_PORT で変更可）。どちらも同じ docs/schema.cql を使う（共通の CQL）。
+#
+# ChromeOS の Linux（aarch64、仮想アドレス空間 39 ビット）では ScyllaDB が起動できないため、
+# ローカルの既定は Cassandra にしている。ScyllaDB は起動時に 32TiB の仮想アドレス空間を予約する。
+name: vote-prototype
+
+services:
+  cassandra:
+    image: cassandra:5.0
+    profiles: ["cassandra"]
+    environment:
+      CASSANDRA_CLUSTER_NAME: vote-dev
+      # ヒープの 2 つの設定は必ずセットで指定する（片方だけだと cassandra-env.sh が起動を拒否する）。
+      # 既定は 1G / 256M。性能計測では環境変数 CASSANDRA_MAX_HEAP / CASSANDRA_HEAP_NEW（ペアで）で上書きする。
+      MAX_HEAP_SIZE: ${CASSANDRA_MAX_HEAP:-1G}
+      HEAP_NEWSIZE: ${CASSANDRA_HEAP_NEW:-256M}
+    ports:
+      - "127.0.0.1:${DB_PORT:-9042}:9042"
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      # CQL で問い合わせに成功するまで待つ。
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 40s
+
+  scylla:
+    image: scylladb/scylla:2026.2.7
+    profiles: ["scylla"]
+    command: ["--smp", "1", "--memory", "1G", "--overprovisioned", "1", "--developer-mode", "1"]
+    ports:
+      - "127.0.0.1:${DB_PORT:-9042}:9042"
+    volumes:
+      - scylla-data:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 20s
+
+  # スキーマ投入ジョブ（1 回実行して終了する）。DB が healthy になってから流す。
+  schema-cassandra:
+    image: cassandra:5.0
+    profiles: ["cassandra"]
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    # docs/schema.cql はキースペース名のテンプレート（{{KEYSPACE}}）。環境変数 SCHEMA_KEYSPACE（既定 vote）で
+    # 置き換えて流す。確認スクリプト（check_step6〜8）は、実行ごとの専用の名前を渡す。
+    entrypoint:
+      - sh
+      - -c
+      - sed "s/{{KEYSPACE}}/${SCHEMA_KEYSPACE:-vote}/g" /schema.cql > /tmp/schema.cql && cqlsh --connect-timeout=60 --request-timeout=180 cassandra 9042 -f /tmp/schema.cql
+    volumes:
+      - ./docs/schema.cql:/schema.cql:ro
+    restart: "no"
+
+  schema-scylla:
+    image: scylladb/scylla:2026.2.7
+    profiles: ["scylla"]
+    depends_on:
+      scylla:
+        condition: service_healthy
+    # docs/schema.cql はキースペース名のテンプレート（{{KEYSPACE}}）。環境変数 SCHEMA_KEYSPACE（既定 vote）で
+    # 置き換えて流す。確認スクリプト（check_step6〜8）は、実行ごとの専用の名前を渡す。
+    entrypoint:
+      - sh
+      - -c
+      - sed "s/{{KEYSPACE}}/${SCHEMA_KEYSPACE:-vote}/g" /schema.cql > /tmp/schema.cql && cqlsh --connect-timeout=60 --request-timeout=180 scylla 9042 -f /tmp/schema.cql
+    volumes:
+      - ./docs/schema.cql:/schema.cql:ro
+    restart: "no"
+
+volumes:
+  cassandra-data:
+  scylla-data:

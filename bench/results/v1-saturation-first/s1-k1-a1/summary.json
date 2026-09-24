@@ -1,0 +1,178 @@
+{
+  "config": {
+    "apis": 1,
+    "cassandra_heap_new": "1G",
+    "cassandra_max_heap": "4G",
+    "concurrency": 128,
+    "interval_secs": 600,
+    "lease_ttl_secs": 30,
+    "max_ballots": 100,
+    "rate_secs": 180,
+    "sat_secs": 90,
+    "sealers": 1,
+    "shards": 1,
+    "warmup_secs": 20
+  },
+  "cpu_pct": {
+    "saturation": {
+      "api": {
+        "max": 83.0,
+        "mean": 65.6086956521739
+      },
+      "bench": {
+        "max": 205.0,
+        "mean": 87.1159420289855
+      },
+      "db": {
+        "max": 504.0,
+        "mean": 371.1159420289855
+      },
+      "machine": {
+        "max": 669.0,
+        "mean": 537.9565217391304
+      },
+      "sealer": {
+        "max": 17.0,
+        "mean": 6.217391304347826
+      }
+    },
+    "steady": {
+      "api": {
+        "max": 63.0,
+        "mean": 53.935251798561154
+      },
+      "bench": {
+        "max": 155.0,
+        "mean": 50.10071942446043
+      },
+      "db": {
+        "max": 480.0,
+        "mean": 309.32374100719426
+      },
+      "machine": {
+        "max": 666.0,
+        "mean": 433.2589928057554
+      },
+      "sealer": {
+        "max": 32.0,
+        "mean": 6.661870503597123
+      }
+    }
+  },
+  "delay_ms": {
+    "all": {
+      "count": 37100,
+      "max": 1221143,
+      "mean": 406920.32684636116,
+      "min": 431,
+      "p50": 329164,
+      "p90": 1018447,
+      "p99": 1205411,
+      "p999": 1221137
+    },
+    "note": "受理の累積と封印の累積の FIFO 突き合わせによる近似",
+    "saturation": null,
+    "steady": null,
+    "unsealed": 767310
+  },
+  "drain": {
+    "drain_end_unix_ms": 1789908632159,
+    "drain_start_unix_ms": 1789907729999,
+    "drained": false,
+    "waited_s": 902
+  },
+  "pending": {
+    "end_of_saturation": 401744,
+    "end_of_steady": 774243,
+    "max": 786910
+  },
+  "saturation": {
+    "accepted": 370869,
+    "concurrency": 128,
+    "requests": 370869,
+    "service_us": {
+      "count": 370869,
+      "max": 859951,
+      "mean": 31088.06658685412,
+      "min": 691,
+      "p50": 11115,
+      "p90": 87219,
+      "p99": 146763,
+      "p999": 397764
+    },
+    "status_counts": {
+      "201": 370869
+    },
+    "throughput_rps": 4107.565526579809
+  },
+  "seals": {
+    "during_drain": {
+      "ballots": {
+        "count": 19600
+      },
+      "blocks": {
+        "count": 196
+      },
+      "total_blocks": 196
+    },
+    "during_load": {
+      "ballots": {
+        "count": 17500
+      },
+      "blocks": {
+        "count": 175
+      },
+      "total_blocks": 175
+    },
+    "took_ms": {
+      "count": 371,
+      "max": 11073,
+      "mean": 2122.9568733153637,
+      "min": 78,
+      "p50": 2459,
+      "p90": 3729,
+      "p99": 6729,
+      "p999": 11073
+    },
+    "took_ms_count_trigger": {
+      "count": 371,
+      "max": 11073,
+      "mean": 2122.9568733153637,
+      "min": 78,
+      "p50": 2459,
+      "p90": 3729,
+      "p99": 6729,
+      "p999": 11073
+    },
+    "total_blocks": 371
+  },
+  "steady": {
+    "accepted": 369540,
+    "from_schedule_us": {
+      "count": 369540,
+      "max": 4143942,
+      "mean": 231264.16464252857,
+      "min": 807,
+      "p50": 1810,
+      "p90": 700175,
+      "p99": 3625431,
+      "p999": 4027539
+    },
+    "requests": 369540,
+    "service_us": {
+      "count": 369540,
+      "max": 783675,
+      "mean": 20778.455420252205,
+      "min": 781,
+      "p50": 1705,
+      "p90": 74805,
+      "p99": 200681,
+      "p999": 418121
+    },
+    "status_counts": {
+      "201": 369540
+    },
+    "target_rate": 2053.0,
+    "throughput_rps": 2052.1312984937513
+  }
+}

@@ -1,0 +1,148 @@
+# 全設定項目と、その既定値（すべての項目をここに書く。これが設定の「スキーマ」でもある）。
+#
+# 読み込みの優先順位（後のものが勝つ）:
+#   1. このファイル（config/default.toml。バイナリに埋め込まれる。編集したら再ビルドする）
+#   2. config/<app.env>.toml（dev.toml / production.toml。test は不要）
+#   3. config/local.toml（自分の環境だけの上書き。git 管理外）
+#   4. secrets/ ディレクトリ（秘密情報。1 ファイル 1 値。git 管理外）
+#   5. 環境変数 APP__<セクション>__<項目>（例: APP__SEAL__MAX_BALLOTS=5）
+#
+# 秘密情報（session.secret / sealer.signing_seed / admin.token）は、この設定ファイルには書けない（書くと起動時にエラー）。
+#   環境変数 APP__SESSION__SECRET / APP__SEALER__SIGNING_SEED / APP__ADMIN__TOKEN、または
+#   secrets/session_secret / secrets/sealer_signing_seed / secrets/admin_token（ファイルの中身が値）で渡す。
+#
+# 実効値の確認: cargo run -p app-config -- show
+# 設定の場所は、環境変数 APP_CONFIG_DIR（既定 config）と APP_SECRETS_DIR（既定 secrets）で変えられる。
+
+[app]
+# 実行環境。dev | production | test。config/<env>.toml を読む（production は config/production.toml が必須）。
+# 決め方: 環境変数 APP__APP__ENV > config/local.toml > この既定値。
+env = "dev"
+# 保存先。memory = api プロセスのメモリ（再起動で消える。sealer は api 内蔵）/ db = Cassandra・ScyllaDB（sealer は別プロセス）。
+mode = "memory"
+
+[api]
+# API サーバの待ち受けポート。
+port = 18080
+# リクエストのタイムアウト秒（1 以上）。選挙の締切の手続きの待ち時間
+# （election.state_cache_secs + この値）の計算にも使う。
+request_timeout_secs = 10
+
+[web]
+# 画面（trunk serve）のポート。/api は crates/web/Trunk.toml の proxy が api.port へ転送する
+# （Trunk.toml の値と一致させる。scripts/check_step9.sh が確認する）。
+port = 8080
+
+[db]
+# 使う DB。cassandra（ローカルの既定）| scylla。docker compose のプロファイルと接続先の選択に使う。
+backend = "cassandra"
+# 接続先ノード（host:port）。環境変数では、カンマ区切り（APP__DB__NODES=host1:9042,host2:9042）。
+nodes = ["127.0.0.1:9042"]
+# キースペース。先頭は英字、英数字と _ のみ、48 文字以内。docs/schema.cql を、この名前で投入しておく。
+keyspace = "vote"
+
+[seal]
+# 未封印の票がこの件数に達したら封印する（1 以上）。
+max_ballots = 100
+# 直前の封印からこの秒数が経ち、未封印が 1 件以上なら封印する（1 以上）。アンカーの判定の間隔も同じ
+# （直前のアンカー以降にどのシャードの先頭ブロックも変わっていなければ、アンカーは作らない）。
+max_interval_secs = 600
+
+[sealer]
+# 独立した sealer の識別名（リースの owner）。プロセスごとに一意にする。空なら起動ごとにランダムに決める。
+id = ""
+# リースの TTL（3 以上）。更新は TTL の 1/3 ごと。クラッシュした sealer の担当は、この秒数の後に引き継がれる。
+lease_ttl_secs = 30
+# signing_seed（ブロックの署名鍵の種）は秘密情報。APP__SEALER__SIGNING_SEED か secrets/sealer_signing_seed で渡す
+# （64 桁の hex。全 sealer で同じ値にする）。
+
+[shard]
+# シャード数（1 以上）。票は hash(ballot_id) mod count で振り分ける。api と全 sealer で同じ値にする
+# （食い違うと DB が接続を拒否する）。
+count = 1
+
+[auth]
+# 認証方式。stub = 入力した ID をそのまま投票者 ID にする（開発用。名簿は seed の voters.csv）/
+# db = 事前登録したログイン ID とパスワードで認証する（app.mode = "db" が必要。登録は credgen。名簿は DB の voter_roll）。
+mode = "stub"
+
+[auth.argon2]
+# パスワードのハッシュ（Argon2id）のパラメータ。credgen が登録するときと、api が照合するときに使う
+# （照合は、DB に保存したハッシュに含まれるパラメータで行う。存在しない ID のダミーの照合は、この値を使う）。
+# メモリ使用量（KiB。8 × parallelism 以上）。
+memory_kib = 19456
+# 反復回数（1 以上）。
+iterations = 2
+# 並列度（1 以上）。
+parallelism = 1
+
+[session]
+# セッションの有効秒数（1 以上）。
+ttl_secs = 3600
+# secret（セッショントークンの HMAC 署名鍵）は秘密情報。APP__SESSION__SECRET か secrets/session_secret で渡す
+# （16 バイト以上。全 api インスタンスで同じ値にする）。
+
+[credentials]
+# credgen が、発行した資格情報（平文のパスワード）を CSV に出力するか。郵送するための唯一の機会（DB にはハッシュしか
+# 残らないので、平文は二度と取り出せない）。false のときは、警告を出し、--confirm-no-output を付けない限り登録しない。
+output_file_enabled = false
+# 出力先（列: login_id, password, 都道府県, 選挙区）。ファイルの権限は 0600。すでにあれば上書きしない。git 管理外の場所にする。
+output_path = "secrets/credentials.csv"
+# 発行するパスワードの長さ（8〜128）。見間違えやすい文字（0/O・1/I/l）は使わない。
+password_length = 16
+# 発行するログイン ID の長さ（8〜32）。パスワードと同じ文字から作る。
+login_id_length = 10
+
+[election]
+# 選挙データのあるディレクトリ。選挙ごとに seed/<election_id>/ の下に、election.toml・districts.csv・
+# candidates/<選挙の種類>.csv・voters.csv を置く（README の「選挙データ」を参照）。
+seed_dir = "seed"
+# 読み込む選挙の ID（seed_dir の下のディレクトリ名。小文字の英数字・_・-、32 文字以内）。
+election_id = "2026-general"
+# 投票の受付期間（RFC 3339 形式で秒まで。タイムゾーンのオフセットが必須。例: 2026-10-01T09:00:00+09:00）。
+# 空なら、選挙状態は scheduled で止まり、electionctl / scripts/election.sh で手動で開始・終了する
+# （原則17・18。ADR 0019）。開始が終了より後の値は起動時にエラーにする。
+voting_opens_at = ""
+# 投票の締切。次の 3 つに使う:
+#   - api: 状態が open で、かつ 開始時刻 <= 現在時刻 < 終了時刻 のときだけ投票を受け付ける（原則18）。
+#   - verifier tally（scripts/tally.sh）: 選挙状態が closed になるまで、--allow-interim を付けない限り集計しない（中間集計の漏洩を防ぐ）。
+#   - chain.reveal_ballots = "after_close": 締切以後だけ、ブロックの詳細で票の中身を公開する。
+voting_closes_at = ""
+# 画面に表示するタイムゾーン。Asia/Tokyo | UTC（固定オフセットの一覧。IANA のタイムゾーン DB には依存しない）。
+display_timezone = "Asia/Tokyo"
+# 選挙状態の短期キャッシュの秒数（0 以上）。締切の手続きの待ち時間
+# （この値 + api.request_timeout_secs）の計算に使う（原則17）。
+state_cache_secs = 5
+
+[chain]
+# チェーンの API（ブロックの詳細）が票（ballot_id・contest_id・candidate_id）を公開するタイミング。
+# always = 常に / after_close = election.voting_closes_at 以後だけ（election.voting_closes_at が必要）。
+# after_close の締切前は、ヘッダー（ハッシュ・Merkle 根・票数・署名など）だけを返す。このとき、票からハッシュを再計算する
+# verifier の検証・集計も、締切後にしかできない。
+reveal_ballots = "always"
+
+[admin]
+# 管理用リスナーの待ち受け先（host:port）。公開用のポート（api.port）とは別のポートで、
+# ロードバランサーには登録しない前提（原則: 公開用のポートに管理用のエンドポイントを置かない）。
+bind = "127.0.0.1:18081"
+# 管理用エンドポイントのトークン（秘密情報）は、この設定ファイルには書けない。
+# 環境変数 APP__ADMIN__TOKEN か secrets/admin_token で渡す（scripts/election.sh が使う）。
+
+[labels]
+# 画面の文言。画面（web）はビルド時に受け取る: eval "$(cargo run -q -p app-config -- web-env)" してから trunk を実行する。
+# ヘッダに表示するサイト名。
+site_title = "投票システム（プロトタイプ）"
+# 投票完了画面に表示する文言。これだけを表示する（受理されたことだけを示す。封印・検証の結果は含めない）。
+done_message = "投票を受け付けました"
+# ログイン画面の見出し。
+login_heading = "ログイン"
+# 投票用紙 1 枚の呼び名。画面・API のエラーメッセージ・集計結果の表示に使う（例: 「投票用紙が見つかりません」）。
+ballot_item = "投票用紙"
+# 進捗の表示。{total} は投票用紙の枚数、{current} は今の投票用紙が何枚目か（両方を含めること）。
+progress = "{total}枚中{current}枚目"
+# 開始前に投票しようとしたときのメッセージ（原則18）。
+voting_not_started_message = "投票の受付はまだ開始していません"
+# 締切の手続き中（closing）に投票しようとしたときのメッセージ。
+voting_closing_message = "投票の受付を締め切っています。しばらくお待ちください"
+# 終了後に投票しようとしたときのメッセージ。
+voting_closed_message = "投票の受付は終了しました"

@@ -1,0 +1,18 @@
+[package]
+name = "verifier"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+app-config = { path = "../app-config" }
+csv.workspace = true
+domain = { path = "../domain" }
+rand.workspace = true
+seed = { path = "../seed" }
+serde.workspace = true
+serde_json.workspace = true
+shared-types = { path = "../shared-types" }
+thiserror.workspace = true
+ureq.workspace = true

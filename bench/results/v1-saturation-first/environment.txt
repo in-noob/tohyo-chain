@@ -1,0 +1,10 @@
+date: 2026-09-20T12:29:17Z
+uname: Linux 6.6.135-09383-g1140e4f27e24 aarch64
+nproc: 7
+mem: 13.7 GB
+cpu: 0xd81
+docker: Docker version 29.8.1, build 4a63305
+db_backend: cassandra
+cassandra_heap: 4G / 1G
+settings: SEAL_MAX_BALLOTS=100 SEAL_MAX_INTERVAL_SECS=600 SEALER_LEASE_TTL_SECS=30
+git: no commits

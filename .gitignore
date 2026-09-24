@@ -1,0 +1,19 @@
+# Rust ビルド成果物
+/target/
+**/*.rs.bk
+
+# 秘密情報（session_secret / sealer_signing_seed / admin_token / credentials.csv）
+/secrets/
+.env
+.env.*
+
+# 実行時の生成物（開票結果など）
+/out/
+
+# 実環境の設定（コミットするのは *.example.toml だけ）
+config/production.toml
+config/local.toml
+*.local.toml
+
+# ログ
+*.log

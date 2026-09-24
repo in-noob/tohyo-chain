@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>投票システム（プロトタイプ）</title>
+    <!--
+      テーマ（ライト / ダーク）を、WASM の読み込みより前に決める（読み込みの間に、一瞬違う配色が表示されるのを防ぐ）。
+      スタイルシートより前に置くこと。規則は web/src/theme.rs と同じ: localStorage の "theme"（light / dark / system。
+      無い・不正なら system）と prefers-color-scheme から、<html data-theme="light|dark"> を決める。system のときは、
+      OS の設定の変更にも追従する。localStorage が使えなくても、画面は壊れない（system として扱う）。
+    -->
+    <script>
+      (function () {
+        var KEY = "theme";
+        var ATTR = "data-theme";
+        var root = document.documentElement;
+        var media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+        function stored() {
+          try {
+            var value = window.localStorage.getItem(KEY);
+            return value === "light" || value === "dark" ? value : "system";
+          } catch (e) {
+            return "system";
+          }
+        }
+        function apply() {
+          var mode = stored();
+          root.setAttribute(ATTR, mode === "system" ? (media && media.matches ? "dark" : "light") : mode);
+        }
+        apply();
+        if (media) {
+          var onChange = function () { if (stored() === "system") { apply(); } };
+          if (media.addEventListener) { media.addEventListener("change", onChange); }
+          else if (media.addListener) { media.addListener(onChange); }
+        }
+      })();
+    </script>
+    <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="rust" data-bin="web" />
+  </head>
+  <body></body>
+</html>

@@ -1,0 +1,19 @@
+[package]
+name = "app-config"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 設定の読み込みと検証（config/*.toml、secrets/、環境変数 APP__…）。api / sealer / verifier / bench / スクリプトはすべてここから読む。
+# 設定を確認する CLI も兼ねる: `cargo run -p app-config -- show`。
+[lib]
+name = "app_config"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-config"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+toml.workspace = true

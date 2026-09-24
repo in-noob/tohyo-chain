@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+async-trait = "0.1.92"
+csv = "1.4.0"
+axum = "0.8.9"
+base64 = "0.23.1"
+console_error_panic_hook = "0.1.7"
+gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
+leptos = { version = "0.8.20", features = ["csr"] }
+leptos_router = "0.8.15"
+# テーマの切り替え（localStorage・prefers-color-scheme・<html> の属性）に使う。leptos の間接依存として、すでに同じ版が使われている。
+web-sys = { version = "0.3.105", features = ["Storage", "MediaQueryList", "Document", "Element"] }
+ed25519-dalek = "3.0.0"
+hmac = "0.13.0"
+proptest = "1.11.0"
+rand = "0.10.2"
+scylla = "1.9.0"
+sha2 = "0.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+toml = "1.1.6"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.4.2", default-features = false, features = ["json"] }
+
+# wasm の配布サイズを抑える（trunk build --release が使う）。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+# 性能計測用（scripts/bench.sh）。release は wasm のサイズ最適化（opt-level = "z"）なので、
+# サーバ側の計測には速度最適化のこのプロファイルを使う。
+[profile.perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16

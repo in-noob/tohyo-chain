@@ -1,0 +1,13 @@
+# 開発用（app.env = "dev"。config/default.toml との差分だけを書く）。
+# 手元で画面を操作するときに、票がすぐ封印されるよう、封印の間隔を短くする。
+# ここに秘密情報は書けない（scripts/dev_up.sh が、開発用の固定値を環境変数で渡す）。
+
+[seal]
+max_interval_secs = 10
+
+[credentials]
+# scripts/dev_up.sh cassandra（認証 db）が、名簿の有権者の ID とパスワードを登録するとき、平文を CSV に出力する
+# （出力先は、default.toml の credentials.output_path = secrets/credentials.csv。git 管理外・権限 0600）。
+# auth.mode は、ここに書かない: dev.toml は memory モードでも読まれ、memory と db 認証の組み合わせは、設定の検証で拒否されるため
+# （dev_up.sh が、--auth または cassandra モードの既定で、環境変数 APP__AUTH__MODE として渡す）。
+output_file_enabled = true

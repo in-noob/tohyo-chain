@@ -1,0 +1,11 @@
+# scripts/dev_up.sh が、設定（web.port / api.port）から生成したファイル（手で編集しない。crates/web/Trunk.toml と同じ内容）。
+[build]
+target = "/home/blab12nobuyuki/hello/crates/web/index.html"
+dist = "/home/blab12nobuyuki/hello/crates/web/dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+[[proxy]]
+backend = "http://localhost:18080/api/"

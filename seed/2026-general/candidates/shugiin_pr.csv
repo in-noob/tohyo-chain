@@ -1,0 +1,10 @@
+candidate_id,district_id,name,party,profile
+shugiin_pr.tokyo.c1,shugiin_pr.tokyo,未来党（政党名）,未来党,比例代表 東京ブロックの候補者（ダミーの略歴）
+shugiin_pr.tokyo.c2,shugiin_pr.tokyo,みらい共和（政党名）,みらい共和,比例代表 東京ブロックの候補者（ダミーの略歴）
+shugiin_pr.tokyo.c3,shugiin_pr.tokyo,緑の会（政党名）,緑の会,比例代表 東京ブロックの候補者（ダミーの略歴）
+shugiin_pr.kinki.c1,shugiin_pr.kinki,未来党（政党名）,未来党,比例代表 近畿ブロックの候補者（ダミーの略歴）
+shugiin_pr.kinki.c2,shugiin_pr.kinki,みらい共和（政党名）,みらい共和,比例代表 近畿ブロックの候補者（ダミーの略歴）
+shugiin_pr.kinki.c3,shugiin_pr.kinki,緑の会（政党名）,緑の会,比例代表 近畿ブロックの候補者（ダミーの略歴）
+shugiin_pr.chugoku.c1,shugiin_pr.chugoku,未来党（政党名）,未来党,比例代表 中国ブロックの候補者（ダミーの略歴）
+shugiin_pr.chugoku.c2,shugiin_pr.chugoku,みらい共和（政党名）,みらい共和,比例代表 中国ブロックの候補者（ダミーの略歴）
+shugiin_pr.chugoku.c3,shugiin_pr.chugoku,緑の会（政党名）,緑の会,比例代表 中国ブロックの候補者（ダミーの略歴）

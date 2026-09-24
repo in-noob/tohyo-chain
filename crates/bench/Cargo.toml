@@ -1,0 +1,20 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 性能計測ツール（負荷生成・DB 直接の計測・結果の集計）。使い方は docs/benchmark.md と scripts/bench.sh。
+
+[dependencies]
+anyhow.workspace = true
+app-config = { path = "../app-config" }
+application = { path = "../application" }
+domain = { path = "../domain" }
+infra-scylla = { path = "../infra-scylla" }
+rand.workspace = true
+scylla.workspace = true
+seed = { path = "../seed" }
+serde_json.workspace = true
+tokio.workspace = true
+ureq.workspace = true

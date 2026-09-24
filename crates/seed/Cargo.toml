@@ -1,0 +1,16 @@
+[package]
+name = "seed"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 選挙マスタ（seed/<election_id>/ の election.toml・districts.csv・candidates/*.csv）と、有権者と選挙区の対応
+# （voters.csv）の読み込みと検証。ファイル名・行・原因つきで、不正なデータを読み込み時に検出する。
+# api（メモリ・DB の両モード）・bench・seedgen が使う。IO はここだけ（domain は IO に依存しない）。
+
+[dependencies]
+csv.workspace = true
+domain = { path = "../domain" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

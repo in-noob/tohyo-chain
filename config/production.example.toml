@@ -1,0 +1,36 @@
+# 本番用の設定の例。config/production.toml にコピーして使う（app.env = "production"）。
+# config/production.toml には秘密情報を書けないので、git 管理してよい（ホスト名などの環境ごとの値だけを書く）。
+#
+# ここに秘密情報は書けない。次のどちらかで渡す:
+#   - 環境変数 APP__SESSION__SECRET / APP__SEALER__SIGNING_SEED
+#   - secrets/session_secret / secrets/sealer_signing_seed（ファイルの中身が値。権限は 0600 にする）
+# 本番では、開発用の固定値（scripts/dev_up.sh のもの）を絶対に使わないこと。
+
+[app]
+mode = "db"
+
+[api]
+# web.port（既定 8080）と重ならないこと。
+port = 18080
+
+[db]
+backend = "scylla"
+nodes = ["scylla-1.example.internal:9042", "scylla-2.example.internal:9042"]
+keyspace = "vote"
+
+[seal]
+max_ballots = 100
+max_interval_secs = 600
+
+[sealer]
+lease_ttl_secs = 30
+
+[shard]
+# api と全 sealer で同じ値にする。あとから変えられない（DB が食い違いを拒否する）。
+count = 8
+
+[session]
+ttl_secs = 3600
+
+[election]
+seed_dir = "seed"
