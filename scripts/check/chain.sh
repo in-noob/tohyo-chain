@@ -9,7 +9,10 @@
 #   7. ブロックチェーンのビューア API（ページ送り・Cache-Control・reveal_ballots）
 #   8. 封印ルール（原則9。dev の設定 interval=10 秒・min=10）: 9 票は 20 秒待っても封印されない → 10 票目で
 #      すぐに封印 → 5 票 → close --now → trigger=close で 5 件のブロック
-# 4・5・6 は DB（Cassandra/ScyllaDB）を使う。専用のキースペースを使い、共用の vote には触れない。
+#   9. 再投票（DB。ADR 0022）: A → B → 白票 → 上限を超えると拒否 → 同時に 2 つの再投票は 1 件だけ成功（LWT）→
+#      締切前のビューア・API で candidate と supersedes の中身が見えない → 締切の手続きで revote_key を破棄（締切後は
+#      存在しない）→ verify OK → tally は白票の 1 票だけ・変更の内訳 → ビューアに「#<前の票> を置き換え（A→B）」
+# 4・5・6・9 は DB（Cassandra/ScyllaDB）を使う。専用のキースペースを使い、共用の vote には触れない。
 # 環境変数（APP__DB__BACKEND / DB_PORT / KEEP_KEYSPACE / STOP_DB）は scripts/lib/common.sh を参照。
 set -euo pipefail
 
@@ -1022,7 +1025,8 @@ check_tally() (
         [[ "$total" == "$want" && "$voted" == "$want" ]] || fail "選挙の種類別 ${key}: 合計 ${total} 投票済み ${voted}（期待 ${want}）"
     done < <(tail -n +2 "$DIR/types.csv")
     echo "都道府県別（${#EXP_PREF[@]} 行）・選挙の種類別（${#EXP_TYPE[@]} 種類）: 期待値と一致 OK"
-    [[ "$(tail -n +2 "$DIR/reconciliation.csv" | awk -F, '$4 != 0 || $5 != "true" || $2 != $3 { n++ } END { print n + 0 }')" == 0 ]] \
+    # 列: contest_id, 投票済み記録, 封印済み, うち再投票, 未封印, 一致（再投票の無い選挙なので、うち再投票は 0）。
+    [[ "$(tail -n +2 "$DIR/reconciliation.csv" | awk -F, '$4 != 0 || $5 != 0 || $6 != "true" || $2 != $3 { n++ } END { print n + 0 }')" == 0 ]] \
         || fail "reconciliation.csv に、不一致・未封印が残っています"
     grep -q '"interim": false' "$DIR/tally.json" || fail "tally.json の interim が false ではありません"
     grep -q '"duplicate_ballots": 0' "$DIR/tally.json" || fail "tally.json に突合の結果（重複 0）がありません"
@@ -1033,13 +1037,15 @@ check_tally() (
     [[ -n "$row" ]] || fail "改ざんできる（票のある）ブロックがありません"
     read -r t_shard t_height <<<"$row"
     tuple="$(ks_cql "SELECT ballots FROM ${KS}.blocks WHERE shard = ${t_shard} AND height = ${t_height}" 2>/dev/null \
-        | grep -oE "\(0x[0-9a-f]+, '[^']+', '[^']+'\)" | head -1)"
+        | grep -oE "\(0x[0-9a-f]+, '[^']+', '[^']+', 0x\)" | head -1 || true)"
+    # 見つからないとき（grep が失敗）も、set -e で無言のまま落ちずに、理由を表示する。
     [[ -n "$tuple" ]] || fail "改ざん対象の票を取得できません"
     t_id="$(sed -E "s/^\(0x([0-9a-f]+), .*/\1/" <<<"$tuple")"
-    t_contest="$(sed -E "s/^\(0x[0-9a-f]+, '([^']+)', '([^']+)'\)$/\1/" <<<"$tuple")"
-    t_cand="$(sed -E "s/^\(0x[0-9a-f]+, '([^']+)', '([^']+)'\)$/\2/" <<<"$tuple")"
+    # 票の tuple は (ballot_id, contest_id, candidate_id, revote)。再投票の無い選挙なので revote は空（0x）。
+    t_contest="$(sed -E "s/^\(0x[0-9a-f]+, '([^']+)', '([^']+)', 0x\)$/\1/" <<<"$tuple")"
+    t_cand="$(sed -E "s/^\(0x[0-9a-f]+, '([^']+)', '([^']+)', 0x\)$/\2/" <<<"$tuple")"
     if [[ "$t_cand" == *.c1 ]]; then new_cand="${t_cand%.c1}.c2"; else new_cand="${t_cand%.c*}.c1"; fi
-    ks_cql "UPDATE ${KS}.blocks SET ballots[0] = (0x${t_id}, '${t_contest}', '${new_cand}') WHERE shard = ${t_shard} AND height = ${t_height}" >/dev/null 2>&1 \
+    ks_cql "UPDATE ${KS}.blocks SET ballots[0] = (0x${t_id}, '${t_contest}', '${new_cand}', 0x) WHERE shard = ${t_shard} AND height = ${t_height}" >/dev/null 2>&1 \
         || fail "ブロックを改ざんできませんでした"
     before="$(out_dirs)"
     sleep 1
@@ -1306,6 +1312,216 @@ ${shown}"
     echo "OK: chain#8 封印ルール（原則9）"
 )
 
+# ===========================================================================
+# 9. 再投票（DB。ADR 0022）
+# ===========================================================================
+check_revote_db() (
+    set -euo pipefail
+    PORT="${CHECK_API_PORT:-18809}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18909}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="chain9-check-admin-token-0123456789abcdef"
+    export BASE
+
+    TMP="$(mktemp -d)"
+    OUT="$TMP/out"
+    API_LOG="$TMP/api.log"
+    SEALER_LOG="$TMP/sealer.log"
+    # 再投票の鍵は secrets/revote_key にだけ置く（環境変数では渡せない）。api と sealer が同じディレクトリを見る
+    # （同じホストの secrets/）。sealer が、締切の手続きの中でファイルごと破棄する。
+    SECRETS="$TMP/secrets"
+    KEY="$SECRETS/revote_key"
+    mkdir -p "$SECRETS"
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$KEY"
+    chmod 600 "$KEY"
+    KEY_VALUE="$(cat "$KEY")"
+    export APP_SECRETS_DIR="$SECRETS"
+
+    export APP__APP__MODE=db
+    export APP__DB__NODES="127.0.0.1:${DB_PORT}"
+    export APP__SHARD__COUNT=2
+    # 件数による封印を、締切の前に起こす（締切前のブロックで、票が伏せられていることを見る）。
+    export APP__SEAL__MAX_BALLOTS=3
+    export APP__SEAL__INTERVAL_SECS=600
+    export APP__SEALER__LEASE_TTL_SECS=6
+    export APP__SEALER__SIGNING_SEED="0909090909090909090909090909090909090909090909090909090909090909"
+    export APP__SESSION__SECRET="chain9-check-secret-0123456789abcdef"
+    export APP__API__PORT="$PORT"
+    export APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}"
+    export APP__ADMIN__TOKEN="$ADMIN_TOKEN"
+    export APP__VOTE__ALLOW_REVOTE=true
+    export APP__VOTE__MAX_REVOTES=2
+    # 票の中身（candidate・supersedes・slot）は、締切（voting_closes_at）以後だけ公開する（原則14）。
+    export APP__CHAIN__REVEAL_BALLOTS=after_close
+    export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
+    export APP__ELECTION__STATE_CACHE_SECS=1
+    export APP__API__REQUEST_TIMEOUT_SECS=3
+    export RUST_LOG="info,tower_http=warn"
+
+    ks_init chain9
+
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        hard_stop sealer
+        rm -rf "$TMP"
+        ks_drop
+        db_stop
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        for f in "$API_LOG" "$SEALER_LOG"; do
+            if [[ -s "$f" ]]; then
+                echo "--- $(basename "$f")（末尾）---" >&2
+                tail -n 12 "$f" >&2
+            fi
+        done
+        exit 1
+    }
+    count_rows() { ks_cql "SELECT count(*) FROM ${KS}.$1" 2>/dev/null | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1; }
+    admin_status() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null || true; }
+    phase_is() { [[ "$(admin_status)" == *"\"phase\":\"$1\""* ]]; }
+    # vote_as N CANDIDATE [SEEN]: voter-N が 1 番目の投票用紙に投票する（SEEN があれば、見た票の数を添えた再投票）。
+    vote_as() {
+        local token district body
+        token="$(login "voter-$1")"
+        [[ -n "$token" ]] || fail "voter-$1 がログインできません"
+        district="$(seed_district "$1" 1)"
+        body="{\"candidate_id\":\"$2\"}"
+        [[ -n "${3:-}" ]] && body="{\"candidate_id\":\"$2\",\"revote\":$3}"
+        request POST "/api/v1/contests/${SEED_ID}/${district}/vote" "$token" "$body"
+    }
+    run_verifier() {
+        RC=0
+        V_OUT="$(./target/debug/verifier "$@" 2>&1)" || RC=$?
+    }
+
+    echo "== 1. 前提と準備（vote.allow_revote=true・上限 2 回・reveal_ballots=after_close）"
+    db_ensure
+    ks_create skip
+    VOTERS=10
+    seed_generate "$TMP/seed" "$VOTERS"
+    # 締切は、起動してから 60 秒後（投票・締切前の確認は、その前に終わる）。
+    CLOSES_AT_UNIX=$(($(date +%s) + 60))
+    export APP__ELECTION__VOTING_CLOSES_AT="$(date -u -d "@${CLOSES_AT_UNIX}" +%Y-%m-%dT%H:%M:%S+00:00)"
+    spawn sealer "$SEALER_LOG" env APP__SEALER__ID=chain9-sealer ./target/debug/sealer
+    spawn api "$API_LOG" ./target/debug/api
+    wait_healthz "$BASE" 20 api || fail "api が応答しません"
+    for shard in 0 1; do
+        wait_until 40000 bash -c "[[ \"\$(curl -s -o /dev/null -w '%{http_code}' ${BASE}/api/v1/chains/${shard}/head)\" == 200 ]]" \
+            || fail "sealer がシャード ${shard} のチェーンを用意しません"
+    done
+    wait_election_open "$BASE" 15 || fail "自動で open になりませんでした"
+    echo "専用キースペース: ${KS}、有権者 ${VOTERS} 人、締切 ${APP__ELECTION__VOTING_CLOSES_AT}"
+
+    echo "== 2. A → B → 白票。上限（2 回）を超えると拒否する"
+    d1="$(seed_district 1 1)"
+    vote_as 1 "${d1}.c1"
+    expect_status 201 "voter-1 の初回の投票（A）"
+    vote_as 1 "${d1}.c2" 1
+    expect_status 201 "voter-1 の再投票（B）"
+    vote_as 1 blank 2
+    expect_status 201 "voter-1 の再投票（白票）"
+    vote_as 1 "${d1}.c3" 3
+    expect_status 409 "上限を超えた再投票"
+    [[ "$BODY" == *'"error":"revote_limit_reached"'* ]] || fail "上限の拒否が revote_limit_reached ではありません: ${BODY}"
+    echo "A → B → 白票: 201・4 回目は 409 revote_limit_reached: OK"
+
+    echo "== 3. 同時に 2 つの再投票を送ると、1 件だけ成功する（participation の LWT: UPDATE ... SET seq = 2 IF seq = 1）"
+    d2="$(seed_district 2 1)"
+    vote_as 2 "${d2}.c1"
+    expect_status 201 "voter-2 の初回の投票"
+    token2="$(login voter-2)"
+    # wait は、PID を指定する（引数なしの wait は、spawn で起動した api も待ってしまう）。
+    RACE_PIDS=()
+    for c in 2 3; do
+        curl -sS -o "$TMP/race-$c.json" -w '%{http_code}' -X POST "${BASE}/api/v1/contests/${SEED_ID}/${d2}/vote" \
+            -H "Authorization: Bearer ${token2}" -H 'Content-Type: application/json' \
+            -d "{\"candidate_id\":\"${d2}.c${c}\",\"revote\":1}" >"$TMP/race-$c.code" &
+        RACE_PIDS+=("$!")
+    done
+    wait "${RACE_PIDS[@]}"
+    # curl -w の出力は改行で終わらないので、1 行ずつにしてから並べる。
+    codes="$(for c in 2 3; do cat "$TMP/race-$c.code"; echo; done | sort | tr '\n' ' ')"
+    [[ "$codes" == "201 409 " ]] || fail "同時の再投票の結果が 201 と 409 ではありません: ${codes}"
+    cat "$TMP"/race-*.json | grep -q '"error":"revote_conflict"' || fail "負けた再投票が revote_conflict ではありません"
+    for n in $(seq 3 "$VOTERS"); do
+        vote_as "$n" "$(seed_district "$n" 1).c1"
+        expect_status 201 "voter-${n} の投票"
+    done
+    [[ "$(count_rows participation)" == "$VOTERS" && "$(count_rows slot_state)" == "$VOTERS" ]] \
+        || fail "participation・slot_state が ${VOTERS} 行ではありません（$(count_rows participation)・$(count_rows slot_state)）"
+    seqs="$(ks_cql "SELECT seq FROM ${KS}.participation" 2>/dev/null | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | sort -n | tr '\n' ' ')"
+    [[ "$seqs" == "1 1 1 1 1 1 1 1 2 3 " ]] || fail "participation の seq が想定と違います: ${seqs}"
+    echo "同時の再投票: 201 が 1 件・409 revote_conflict が 1 件。participation・slot_state は ${VOTERS} 行、seq は 3・2・1…: OK"
+
+    echo "== 4. 締切前: ビューア・API で、candidate・supersedes・slot の中身が見えない。verify もできない"
+    wait_until 20000 bash -c "[[ \"\$(curl -s ${BASE}/api/v1/chains/0/head)\" != *'\"height\":0'* || \"\$(curl -s ${BASE}/api/v1/chains/1/head)\" != *'\"height\":0'* ]]" \
+        || fail "件数による封印が起きません"
+    hidden=0
+    for shard in 0 1; do
+        request GET "/api/v1/chains/${shard}/blocks/1"
+        [[ "$STATUS" == 200 ]] || continue
+        [[ "$BODY" == *'"ballots_revealed":false'* ]] || fail "締切前のブロックで、票が公開されています: ${BODY}"
+        for secret in candidate supersedes slot replaces blank; do
+            [[ "$BODY" != *"$secret"* ]] || fail "締切前のブロックに ${secret} が見えます: ${BODY}"
+        done
+        hidden=$((hidden + 1))
+    done
+    [[ "$hidden" -ge 1 ]] || fail "締切前のブロックを確認できませんでした"
+    request GET /api/v1/audit/counts
+    [[ "$BODY" != *'"cast"'* ]] || fail "締切前の突合の集計に、再投票を含む票の数（cast）が見えます: ${BODY}"
+    run_verifier verify --api "$BASE"
+    [[ "$RC" == 4 ]] || fail "締切前の verify が終了コード 4 ではありません（${RC}）: ${V_OUT}"
+    [[ -s "$KEY" ]] || fail "締切の前に、revote_key が無くなっています"
+    echo "締切前: 票を伏せたブロック ${hidden} 件に candidate・supersedes・slot が無い・cast も返さない・verify は 4: OK"
+
+    echo "== 5. 締切（voting_closes_at）→ 締切の手続きの中で、sealer が revote_key を破棄する"
+    wait_until 120000 phase_is closed || fail "締切の後、closed になりません: $(admin_status)"
+    [[ ! -e "$KEY" ]] || fail "締切後も revote_key が存在します"
+    [[ "$(admin_status)" == *'"event":"revote_key_destroyed"'* ]] || fail "election_audit に鍵の破棄がありません: $(admin_status)"
+    [[ "$(ks_cql "SELECT event FROM ${KS}.election_audit" 2>/dev/null | grep -c revote_key_destroyed)" == 1 ]] \
+        || fail "election_audit の revote_key_destroyed が 1 行ではありません"
+    # 鍵の値は、ログにも出さない（DB には、そもそも書く経路が無い: slot_state のキーは HMAC の結果）。
+    for f in "$API_LOG" "$SEALER_LOG"; do
+        if grep -aq "$KEY_VALUE" "$f"; then fail "$(basename "$f") に revote_key の値が出ています"; fi
+    done
+    echo "締切後: revote_key のファイルが無い・election_audit に revote_key_destroyed（1 行）: OK"
+
+    echo "== 6. 締切後: verify OK・tally は最後の票だけ・変更の内訳・ビューアに「#<前の票> を置き換え（A→B）」"
+    run_verifier verify --api "$BASE"
+    [[ "$RC" == 0 ]] || fail "締切後の verify が失敗しました（${RC}）: ${V_OUT}"
+    [[ "$V_OUT" == *"再投票のつながり: slot ${VOTERS} 個・再投票 3 件（上限 2 回）OK"* ]] || fail "verify が再投票のつながりを確認していません: ${V_OUT}"
+    RC=0
+    T_OUT="$(./scripts/tally.sh --out "$OUT" 2>&1)" || RC=$?
+    [[ "$RC" == 0 ]] || fail "締切後の tally が失敗しました（${RC}）: ${T_OUT}"
+    DIR="$(find "$OUT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
+    total="$(tail -n +2 "$DIR/districts.csv" | awk -F, '{ s += $8 } END { print s + 0 }')"
+    blank="$(tail -n +2 "$DIR/districts.csv" | awk -F, '{ s += $7 } END { print s + 0 }')"
+    [[ "$total" == "$VOTERS" && "$blank" == 1 ]] || fail "tally の合計 ${total}・白票 ${blank}（期待 ${VOTERS}・1）"
+    grep -q "${d1}.c1,.*,${d1}.c2,.*,1$" "$DIR/revotes.csv" || fail "revotes.csv に A→B がありません: $(cat "$DIR/revotes.csv")"
+    grep -q "${d1}.c2,.*,blank,白票,1$" "$DIR/revotes.csv" || fail "revotes.csv に B→白票 がありません: $(cat "$DIR/revotes.csv")"
+    [[ "$(tail -n +2 "$DIR/revotes.csv" | awk -F, '{ s += $7 } END { print s + 0 }')" == 3 ]] || fail "変更の内訳の合計が 3 件ではありません"
+    # 最後の票（seq 3）のブロックを探して、前の票へのリンクを確かめる。
+    found=""
+    for shard in 0 1; do
+        top="$(curl -s "${BASE}/api/v1/chains/${shard}/head" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')"
+        for h in $(seq 1 "${top:-0}"); do
+            request GET "/api/v1/chains/${shard}/blocks/${h}"
+            if [[ "$BODY" == *'"seq":3'* ]]; then found="$BODY"; break 2; fi
+        done
+    done
+    [[ -n "$found" ]] || fail "seq 3 の票が、どのブロックにもありません"
+    [[ "$found" == *'"replaces":{'* && "$found" == *"\"candidate_id\":\"${d1}.c2\""* ]] || fail "seq 3 の票に、前の票（B）へのリンクがありません: ${found}"
+    request POST "/api/v1/contests/${SEED_ID}/${d1}/vote" "$(login voter-1)" "{\"candidate_id\":\"${d1}.c1\",\"revote\":3}"
+    expect_status 403 "締切後の再投票"
+    echo "verify OK・tally は最後の票だけ（合計 ${total}・白票 ${blank}）・revotes.csv の内訳 3 件・ビューアの置き換えのリンク・締切後は 403: OK"
+
+    echo "OK: chain#9 再投票（DB_BACKEND=${DB_BACKEND}）"
+)
+
 check_demo
 check_inprocess_sealer
 check_no_append_without_change
@@ -1314,5 +1530,6 @@ check_multi_sealer
 check_tally
 check_viewer_api
 check_seal_rules
+check_revote_db
 
 echo "OK: check/chain.sh"

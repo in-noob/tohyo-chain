@@ -72,9 +72,11 @@ pub struct Config {
     pub admin_bind: String,
     /// 管理用エンドポイントのトークン（秘密情報）。未設定なら管理用リスナーは起動しない。
     pub admin_token: Option<Secret<String>>,
-    /// 選挙のルール（`vote.allow_blank`）。この api が open に遷移させる（memory モードの内蔵スケジューラ・
-    /// `open --now`）ときに固定する値で、固定した後は、選挙状態に保存した値を使う（原則19）。
+    /// 選挙のルール（`vote.allow_blank` / `vote.allow_revote` / `vote.max_revotes`）。この api が open に遷移させる
+    /// （memory モードの内蔵スケジューラ・`open --now`）ときに固定する値で、固定した後は、選挙状態に保存した値を使う（原則19）。
     pub rules: ElectionRules,
+    /// 再投票の鍵のファイル（`<secrets>/revote_key`。ADR 0022）。`None` なら鍵なし（テスト用の読み込み）。
+    pub revote_key_path: Option<PathBuf>,
 }
 
 // 秘密情報がログに出ないよう、Debug では伏せる。
@@ -102,6 +104,7 @@ impl fmt::Debug for Config {
             .field("display_timezone", &self.display_timezone)
             .field("admin_bind", &self.admin_bind)
             .field("rules", &self.rules)
+            .field("revote_key_path", &self.revote_key_path)
             .field(
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
@@ -115,7 +118,9 @@ impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let loaded = app_config::load()?;
         loaded.ensure_supported()?;
-        Self::from_app(&loaded.config)
+        let mut config = Self::from_app(&loaded.config)?;
+        config.revote_key_path = loaded.revote_key_path();
+        Ok(config)
     }
 
     /// 読み込み済みの設定から、api の設定を作る。
@@ -150,6 +155,7 @@ impl Config {
                 voting_closing_message: app.labels.voting_closing_message.clone(),
                 voting_closed_message: app.labels.voting_closed_message.clone(),
                 blank_name: app.labels.blank_name.clone(),
+                revote_limit_reached: app.labels.revote_limit_reached.clone(),
             },
             session_secret,
             session_ttl_secs: app.session.ttl_secs,
@@ -196,7 +202,10 @@ impl Config {
             admin_token: app.admin.token.clone(),
             rules: ElectionRules {
                 allow_blank: app.vote.allow_blank,
+                allow_revote: app.vote.allow_revote,
+                max_revotes: app.vote.max_revotes,
             },
+            revote_key_path: None,
         })
     }
 }
@@ -226,14 +235,46 @@ mod tests {
         assert_eq!(c.seal_policy, SealPolicy::default());
         assert_eq!(c.sealer_signing_seed, None);
         assert_eq!(c.reveal, RevealPolicy::Always);
-        assert_eq!(c.rules, ElectionRules { allow_blank: true });
+        assert_eq!(
+            c.rules,
+            ElectionRules {
+                allow_blank: true,
+                ..ElectionRules::default()
+            }
+        );
         assert_eq!(c.labels.blank_name, "白票");
+    }
+
+    #[test]
+    fn revote_rules_are_read_from_the_config() {
+        let c = config(&[
+            SECRET,
+            ("vote.allow_revote", "true"),
+            ("vote.max_revotes", "2"),
+        ])
+        .expect("valid");
+        assert_eq!(
+            c.rules,
+            ElectionRules {
+                allow_blank: true,
+                allow_revote: true,
+                max_revotes: 2,
+            }
+        );
+        // テスト用の読み込みには secrets/ が無いので、鍵のファイルも無い。
+        assert_eq!(c.revote_key_path, None);
     }
 
     #[test]
     fn allow_blank_is_read_from_the_config() {
         let c = config(&[SECRET, ("vote.allow_blank", "false")]).expect("valid");
-        assert_eq!(c.rules, ElectionRules { allow_blank: false });
+        assert_eq!(
+            c.rules,
+            ElectionRules {
+                allow_blank: false,
+                ..ElectionRules::default()
+            }
+        );
     }
 
     #[test]

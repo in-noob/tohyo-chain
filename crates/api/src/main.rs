@@ -48,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
             built.state.election_state.clone(),
             config.election_grace,
             config.rules,
+            // 締切の手続きの中で、再投票の鍵をファイルごと破棄する（api のメモリ上の写しも同時に消える）。
+            built.state.revote_keys.clone(),
         )
     });
 

@@ -72,6 +72,43 @@ pub struct BallotRow {
     pub candidate: String,
     /// 白票か（画面は、候補者と見分けられるよう、別の書式で表示する）。
     pub blank: bool,
+    /// 再投票の票なら、置き換えた前の票へのリンク（締切後だけ。API が票を返すときだけ付けるため）。
+    pub replaces: Option<ReplacesLink>,
+}
+
+/// 「#<前の票> を置き換え（A→B）」のリンク（ADR 0022）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacesLink {
+    pub label: String,
+    /// 前の票の行へのリンク（同じシャードの、前の票があるブロックの詳細。`#ballot-<ballot_id>` の行）。
+    pub path: String,
+}
+
+/// 票の行のアンカー（`id` 属性）。前の票へのリンクの飛び先。
+pub fn ballot_anchor(ballot_id: &str) -> String {
+    format!("ballot-{ballot_id}")
+}
+
+/// 前の票への置き換えのリンク。`B`（この票の投票先）は、政党を付けない表示名（白票は `blank_name`）。
+fn replaces_link(shard: u16, b: &BallotDto, blank_name: &str) -> Option<ReplacesLink> {
+    let prev = b.replaces.as_ref()?;
+    let name = |blank: bool, name: &Option<String>, id: &str| {
+        if blank {
+            blank_name.to_string()
+        } else {
+            name.clone().unwrap_or_else(|| id.to_string())
+        }
+    };
+    let from = name(prev.blank, &prev.candidate_name, &prev.candidate_id);
+    let to = name(b.blank, &b.candidate_name, &b.candidate_id);
+    Some(ReplacesLink {
+        label: format!("#{} を置き換え（{from}→{to}）", short_hash(&prev.ballot_id)),
+        path: format!(
+            "{}#{}",
+            block_path(shard, prev.height),
+            ballot_anchor(&prev.ballot_id)
+        ),
+    })
 }
 
 fn district_label(b: &BallotDto) -> String {
@@ -92,8 +129,8 @@ fn choice_label(b: &BallotDto, blank_name: &str) -> String {
     }
 }
 
-/// `blank_name` は、白票の呼び名（設定 `labels.blank_name`）。
-pub fn ballot_rows(ballots: &[BallotDto], blank_name: &str) -> Vec<BallotRow> {
+/// `shard` は、このブロックのシャード（前の票へのリンク先）。`blank_name` は、白票の呼び名（設定 `labels.blank_name`）。
+pub fn ballot_rows(shard: u16, ballots: &[BallotDto], blank_name: &str) -> Vec<BallotRow> {
     ballots
         .iter()
         .enumerate()
@@ -103,6 +140,7 @@ pub fn ballot_rows(ballots: &[BallotDto], blank_name: &str) -> Vec<BallotRow> {
             district: district_label(b),
             candidate: choice_label(b, blank_name),
             blank: b.blank,
+            replaces: replaces_link(shard, b, blank_name),
         })
         .collect()
 }
@@ -226,6 +264,10 @@ mod tests {
             district_name: with_names.then(|| "東京1区".to_string()),
             candidate_name: with_names.then(|| "甲".to_string()),
             party: with_names.then(|| "党".to_string()),
+            slot: None,
+            seq: None,
+            supersedes: None,
+            replaces: None,
         }
     }
 
@@ -291,7 +333,7 @@ mod tests {
 
     #[test]
     fn ballot_rows_use_display_names_and_fall_back_to_ids() {
-        let rows = ballot_rows(&[ballot(true), ballot(false)], "白票");
+        let rows = ballot_rows(0, &[ballot(true), ballot(false)], "白票");
         assert_eq!(rows[0].index, 1);
         assert_eq!(rows[0].district, "東京1区");
         assert_eq!(rows[0].candidate, "甲（党）");
@@ -301,14 +343,14 @@ mod tests {
         // 政党が空なら、氏名だけ。
         let mut b = ballot(true);
         b.party = Some(String::new());
-        assert_eq!(ballot_rows(&[b], "白票")[0].candidate, "甲");
-        assert!(ballot_rows(&[], "白票").is_empty());
+        assert_eq!(ballot_rows(0, &[b], "白票")[0].candidate, "甲");
+        assert!(ballot_rows(0, &[], "白票").is_empty());
         assert!(!rows[0].blank);
     }
 
     #[test]
     fn a_blank_ballot_is_shown_with_the_blank_name_not_as_a_candidate() {
-        let rows = ballot_rows(&[blank_ballot()], "白票");
+        let rows = ballot_rows(0, &[blank_ballot()], "白票");
         assert_eq!(rows[0].candidate, "白票");
         assert!(rows[0].blank);
         assert_eq!(rows[0].district, "東京1区");
@@ -400,5 +442,28 @@ mod tests {
         assert!(failure_message(ApiFailure::Network).contains("通信"));
         assert!(failure_message(ApiFailure::Unavailable).contains("利用できません"));
         assert!(!failure_message(ApiFailure::Unexpected(418)).is_empty());
+    }
+
+    #[test]
+    fn a_revote_links_to_the_ballot_it_replaced_with_a_to_b() {
+        let mut b = blank_ballot();
+        b.seq = Some(2);
+        b.replaces = Some(shared_types::ReplacedBallotDto {
+            ballot_id: "0123456789abcdef".repeat(2),
+            height: 4,
+            candidate_id: "smd.13.01.c1".to_string(),
+            blank: false,
+            candidate_name: Some("甲".to_string()),
+        });
+        let rows = ballot_rows(2, &[b, ballot(true)], "白票");
+        let link = rows[0].replaces.as_ref().expect("link");
+        assert_eq!(link.label, "#01234567…89abcdef を置き換え（甲→白票）");
+        assert_eq!(
+            link.path,
+            format!("/chain/2/blocks/4#ballot-{}", "0123456789abcdef".repeat(2))
+        );
+        // 置き換えていない票（初回の投票）には、リンクを付けない。
+        assert_eq!(rows[1].replaces, None);
+        assert_eq!(ballot_anchor("ab"), "ballot-ab");
     }
 }

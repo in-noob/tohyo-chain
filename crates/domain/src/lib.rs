@@ -11,6 +11,7 @@ pub mod election_state;
 pub mod encoding;
 pub mod ids;
 pub mod merkle;
+pub mod revote;
 pub mod seal_policy;
 pub mod shard;
 pub mod signature;
@@ -29,13 +30,15 @@ pub use election_state::{
     ElectionPhase, ElectionRules, Period, VoteGate, automatic_transition, vote_gate,
     voting_started_at,
 };
+pub use encoding::ballot_hash;
 pub use ids::{
     BLANK_CANDIDATE_ID, CandidateCode, CandidateId, ContestId, DistrictId, ElectionId,
     ElectionTypeCode, IdError,
 };
 pub use merkle::{InclusionProof, Side, inclusion_proof, merkle_root, verify_inclusion};
+pub use revote::{PlacedBallot, RevoteAnalysis, RevoteError, analyze_revotes};
 pub use seal_policy::{PolicyError, SealDecision, SealPolicy, decide, decide_close, window_start};
-pub use shard::{ShardId, shard_for};
+pub use shard::{ShardId, shard_for, shard_for_slot};
 pub use signature::{Ed25519Signer, Ed25519Verifier, SignatureError, Signer, Verifier};
-pub use types::{Ballot, BallotId, Block, BlockHeader, Hash32, SignatureBytes};
+pub use types::{Ballot, BallotId, Block, BlockHeader, Hash32, RevoteLink, SignatureBytes, Slot};
 pub use voter::{VoterId, VoterIdError};

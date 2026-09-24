@@ -19,11 +19,14 @@ pub use error::{ConfigError, Issue, Origin};
 pub use load::{DEFAULT_TOML, ENV_PREFIX, Loaded, SECRET_KEYS, Sources, env_name, load, load_from};
 pub use model::{
     Admin, Api, App, AppConfig, Argon2, Auth, AuthMode, Chain, Credentials, Db, DbBackend,
-    DisplayTimezone, Election, Env, Labels, MAX_KEYSPACE_LEN, MIN_LEASE_TTL_SECS,
-    MIN_SESSION_SECRET_LEN, Mode, RevealBallots, Seal, Sealer, Session, Shard, Timestamp, Web,
-    check_keyspace,
+    DisplayTimezone, Election, Env, Labels, MAX_KEYSPACE_LEN, MAX_REVOTES_LIMIT,
+    MIN_LEASE_TTL_SECS, MIN_SESSION_SECRET_LEN, Mode, RevealBallots, Seal, Sealer, Session, Shard,
+    Timestamp, Web, check_keyspace,
 };
 pub use secret::{MASK, Secret};
+
+/// `secrets/` の下の、再投票の鍵のファイル名（`application::REVOTE_KEY_FILE` と同じ）。
+pub const REVOTE_KEY_FILE: &str = "revote_key";
 /// RFC 3339 の日時（秒まで、タイムゾーンのオフセット必須）の解釈。管理用 API（`scripts/election.sh
 /// schedule`）が、開始・終了時刻を解釈するのに使う（原則17）。
 pub use time::parse_rfc3339;
@@ -36,6 +39,15 @@ impl Loaded {
         // （原則17・18。ADR 0019）。現時点で「未実装」として弾く項目はない。
         let _ = &self.config;
         Ok(())
+    }
+
+    /// 再投票の鍵のファイル（`<secrets_dir>/revote_key`。ADR 0022）。鍵は設定項目ではなく、このファイルにだけ置く
+    /// （締切の手続きでファイルごと破棄するため、環境変数では渡せない）。secrets のディレクトリが無い（テスト用の
+    /// 読み込み）なら `None`。
+    pub fn revote_key_path(&self) -> Option<std::path::PathBuf> {
+        self.secrets_dir
+            .as_ref()
+            .map(|dir| dir.join(REVOTE_KEY_FILE))
     }
 
     /// 項目の出所。

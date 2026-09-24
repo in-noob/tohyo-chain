@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use domain::{
     Anchor, Ballot, BallotId, Block, ContestId, DistrictId, Election, ElectionPhase, ElectionRules,
-    Period, ShardId, VoterId,
+    Hash32, Period, ShardId, Slot, VoterId,
 };
 
 /// ログイン時に受け取る資格情報。
@@ -77,18 +77,44 @@ pub trait VoterRoll: Send + Sync {
 pub enum CastError {
     #[error("投票済みです")]
     AlreadyVoted,
+    /// 再投票の条件付き書き込み（`seq = n` のときだけ `n + 1` にする）に負けた。同時に送られた別の再投票が先に
+    /// 受理されたか、前提にした `seq` が古かった。何も保存していない。
+    #[error("同時に送られた別の再投票と競合しました")]
+    RevoteConflict,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// 投票者が投票済みの投票用紙 1 枚（participation の 1 行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VotedContest {
+    pub contest: ContestId,
+    /// この投票用紙に受理された票の数（初回の投票 + 再投票の回数。participation の `seq`。
+    /// 再投票を認めない選挙では 1）。票の中身は含まない。
+    pub ballots: u32,
+}
+
+/// slot ごとの再投票の状態（`slot_state`。キーは voter_id ではなく slot）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotState {
+    /// 最後に受理した票の `seq`。
+    pub seq: u32,
+    /// 最後に受理した票のハッシュ（次の再投票の `supersedes`）。
+    pub last_ballot_hash: Hash32,
 }
 
 /// 投票用紙ごとの集計（監査用。投票者や票の中身は含まない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContestCounts {
     pub contest: ContestId,
-    /// 投票済みの記録（participation）の件数。
+    /// 投票済みの記録（participation）の件数（= 投票した有権者の数。再投票しても増えない）。
     pub participation: u64,
+    /// 受理した票の数（participation の `seq` の合計 = 初回の投票 + 再投票）。
+    pub cast: u64,
     /// まだ封印されていない（プールにある）票の件数。
     pub pending: u64,
+    /// 未封印の票のうち、有権者の最初の票（slot を持たない票か、`seq = 1` の票）の件数。
+    pub pending_initial: u64,
 }
 
 /// 投票の保存先。
@@ -98,16 +124,35 @@ pub struct ContestCounts {
 /// - ballot_pool: シャードごとの未封印の票。投票者を特定する情報を持たない。
 ///
 /// 両者を結ぶキーを作ってはならない。
+///
+/// 再投票を認める選挙（ADR 0022）では、さらに次を持つ。
+/// - participation の `seq`: その投票用紙に受理した票の数。再投票は、`seq = n` のときだけ `n + 1` にする条件付き書き込み。
+/// - slot_state: slot → (最後の `seq`, 最後の票のハッシュ)。キーは voter_id ではなく slot（participation と結ぶキーを持たない）。
 #[async_trait]
 pub trait VoteStore: Send + Sync {
-    /// 二重投票の判定・participation への記録・ballot_pool への追加を**不可分に**行う。
+    /// 初回の投票: 二重投票の判定・participation への記録・ballot_pool への追加を**不可分に**行う。
     /// 既に投票済みなら何も保存せず `AlreadyVoted` を返す。
     ///
-    /// 投票先の投票用紙は `ballot.contest_id`。
+    /// 投票先の投票用紙は `ballot.contest_id`。`ballot.revote` があれば（再投票を認める選挙）、participation の `seq` を 1 にし、
+    /// slot_state に (1, 票のハッシュ) を記録する。無ければ slot を記録しない。
     async fn cast(&self, voter: &VoterId, shard: ShardId, ballot: Ballot) -> Result<(), CastError>;
 
-    /// 投票者が投票済みの投票用紙。
-    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<ContestId>, StoreError>;
+    /// 再投票: participation の `seq` を、`prev_seq` のときだけ `prev_seq + 1` にし（条件付き書き込み。同時に送られても
+    /// 1 件だけが成功する）、slot_state を更新して、票を ballot_pool に追加する。`seq` が `prev_seq` でなければ、何も保存せず
+    /// `RevoteConflict`。`ballot.revote` は `seq = prev_seq + 1` のつながりを持つこと。
+    async fn revote(
+        &self,
+        voter: &VoterId,
+        shard: ShardId,
+        ballot: Ballot,
+        prev_seq: u32,
+    ) -> Result<(), CastError>;
+
+    /// 投票者が投票済みの投票用紙と、それぞれの受理した票の数。
+    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<VotedContest>, StoreError>;
+
+    /// slot の再投票の状態。まだ記録が無ければ `None`。
+    async fn slot_state(&self, slot: &Slot) -> Result<Option<SlotState>, StoreError>;
 
     /// シャードごとの未封印の票の件数（添字がシャード番号）。件数のみで、票の中身は返さない。
     async fn pending_by_shard(&self) -> Result<Vec<usize>, StoreError>;
@@ -241,6 +286,33 @@ pub trait BallotIdSource: Send + Sync {
     fn next_ballot_id(&self) -> BallotId;
 }
 
+/// 選挙状態の変更ログの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditEvent {
+    /// 状態の遷移（`from` → `to`）。
+    Transition,
+    /// 締切の手続きの中で、再投票の鍵（`revote_key`）を破棄した（ADR 0022）。`from` と `to` は、そのときの状態。
+    RevoteKeyDestroyed,
+}
+
+impl AuditEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transition => "transition",
+            Self::RevoteKeyDestroyed => "revote_key_destroyed",
+        }
+    }
+
+    /// 保存された文字列から。空（この列を足す前の行）は遷移。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "" | "transition" => Some(Self::Transition),
+            "revote_key_destroyed" => Some(Self::RevoteKeyDestroyed),
+            _ => None,
+        }
+    }
+}
+
 /// 選挙状態の変更ログ（原則17: 変更のたびに、日時・変更前・変更後・実行した主体を記録する）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionAuditEntry {
@@ -249,6 +321,8 @@ pub struct ElectionAuditEntry {
     pub to: ElectionPhase,
     /// 実行した主体（例: `sealer:<sealer.id>`、`admin:<トークンの下 8 桁>`）。
     pub actor: String,
+    /// 記録の種類（遷移か、鍵の破棄か）。
+    pub event: AuditEvent,
 }
 
 /// 選挙状態のスナップショット。
@@ -297,6 +371,15 @@ pub trait ElectionStateStore: Send + Sync {
         actor: &str,
         at_unix_secs: i64,
     ) -> Result<bool, StoreError>;
+
+    /// 遷移ではない出来事（再投票の鍵の破棄など）を、`election_audit` に 1 行記録する。`phase` は、そのときの状態。
+    async fn record_event(
+        &self,
+        event: AuditEvent,
+        phase: ElectionPhase,
+        actor: &str,
+        at_unix_secs: i64,
+    ) -> Result<(), StoreError>;
 
     /// 変更の新しい順に、最大 `limit` 件。
     async fn recent_audit(&self, limit: usize) -> Result<Vec<ElectionAuditEntry>, StoreError>;

@@ -9,8 +9,12 @@
 //!
 //! 秘密投票の観点で、ここが保持する候補者 ID は「投票を送信し終えるまで」の一時的な状態
 //! （[`VotePhase`]）だけで、送信が終わると必ず捨てる。
+//!
+//! **再投票（ADR 0022）**: 再投票を認める選挙で、すべての投票用紙に投票済みで、投票期間内なら、完了画面に
+//! 「投票をやり直す」を出す。やり直しの一覧は、投票済みの投票用紙を**固定の順番**で並べ、上限に達したものは選べない
+//! （理由を表示する）。前回の投票内容（投票先）は、API も返さないので、画面にも出さない。
 
-use shared_types::{BLANK_CANDIDATE_ID, BallotStatusDto, CandidateDto};
+use shared_types::{BLANK_CANDIDATE_ID, BallotStatusDto, CandidateDto, RevoteStatusDto};
 
 use crate::error::ApiFailure;
 
@@ -31,6 +35,10 @@ pub enum Route {
     Ballot(String),
     /// 投票完了画面。投票用紙も候補者も URL に含めない。
     Done,
+    /// 投票のやり直し: 投票済みの投票用紙の一覧（固定の順番）から 1 枚を選ぶ。
+    Revote,
+    /// 投票のやり直し: 選んだ投票用紙の投票画面。`contest_id` だけを持つ（前回の投票先は持たない）。
+    RevoteBallot(String),
 }
 
 impl Route {
@@ -41,6 +49,8 @@ impl Route {
             // `contest_id` は `{election_id}/{district_id}`（`/` を含む）なので、そのままパスの 2 セグメントになる。
             Self::Ballot(contest_id) => format!("/ballots/{contest_id}"),
             Self::Done => "/done".to_string(),
+            Self::Revote => "/revote".to_string(),
+            Self::RevoteBallot(contest_id) => format!("/revote/{contest_id}"),
         }
     }
 }
@@ -135,9 +145,18 @@ pub fn ballot_states(ballots: &[BallotStatusDto]) -> Vec<BallotState> {
 pub fn mark_voted(ballots: &[BallotStatusDto], contest_id: &str) -> Vec<BallotStatusDto> {
     ballots
         .iter()
-        .map(|b| BallotStatusDto {
-            voted: b.voted || b.contest_id == contest_id,
-            ..b.clone()
+        .map(|b| {
+            let target = b.contest_id == contest_id;
+            BallotStatusDto {
+                voted: b.voted || target,
+                // 初回の投票で、受理済みの票は 1（やり直しの API に、この数を添える）。
+                ballots_cast: if target {
+                    b.ballots_cast.max(1)
+                } else {
+                    b.ballots_cast
+                },
+                ..b.clone()
+            }
         })
         .collect()
 }
@@ -185,6 +204,8 @@ pub struct GuardContext<'a> {
     pub ballots: Option<&'a [BallotStatusDto]>,
     /// たった今投票を受理された投票用紙（完了画面の表示条件）。候補者は含まない。
     pub last_voted: Option<&'a str>,
+    /// 再投票の条件（再投票を認める選挙だけ。未取得・認めない選挙なら `None`）。
+    pub revote: Option<&'a RevoteStatusDto>,
 }
 
 /// `route` を表示してよいか。リダイレクトが必要なら行き先を返す。
@@ -206,6 +227,117 @@ pub fn guard(ctx: &GuardContext<'_>, route: &Route) -> Option<Route> {
                 .then(|| entry_route(ballots)),
         },
         Route::Done => ctx.last_voted.is_none().then(entry),
+        // やり直しは、すべての投票用紙に投票し終えてから（まだ投票していないものがあれば、そちらへ）。
+        Route::Revote => match ctx.ballots {
+            Some(ballots) if !all_voted(ballots) => Some(entry_route(ballots)),
+            _ => None,
+        },
+        Route::RevoteBallot(contest_id) => match (ctx.ballots, ctx.revote) {
+            (Some(ballots), _) if !all_voted(ballots) => Some(entry_route(ballots)),
+            // 投票済みで、上限に達していない投票用紙だけ。それ以外は、やり直しの一覧へ戻す。
+            (Some(ballots), Some(revote)) => {
+                let selectable = ballots
+                    .iter()
+                    .find(|b| &b.contest_id == contest_id)
+                    .is_some_and(|b| b.voted && revotes_left(b, revote.max_revotes) > 0);
+                (!selectable || !revote.open).then_some(Route::Revote)
+            }
+            _ => None,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 投票のやり直し（再投票。ADR 0022）
+// ---------------------------------------------------------------------------
+
+/// 完了画面に「投票をやり直す」を出すか: 再投票を認める選挙で、今受け付けていて（投票期間内）、すべての投票用紙に
+/// 投票済み。
+pub fn can_revote(ballots: &[BallotStatusDto], revote: Option<&RevoteStatusDto>) -> bool {
+    !ballots.is_empty() && all_voted(ballots) && revote.is_some_and(|r| r.open)
+}
+
+/// 投票用紙 `ballot` を、あと何回やり直せるか（1 票目を含めて `max_revotes + 1` 票まで）。未投票なら 0。
+pub fn revotes_left(ballot: &BallotStatusDto, max_revotes: u32) -> u32 {
+    if !ballot.voted {
+        return 0;
+    }
+    max_revotes
+        .saturating_add(1)
+        .saturating_sub(ballot.ballots_cast.max(1))
+}
+
+/// 上限に達した理由の文言。`template` は設定 `labels.revote_limit_reached`（`{max}` を上限回数に置き換える）。
+pub fn format_revote_limit(template: &str, max_revotes: u32) -> String {
+    template.replace("{max}", &max_revotes.to_string())
+}
+
+/// やり直しの一覧の 1 行（投票済みの投票用紙）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevoteItem {
+    pub contest_id: String,
+    pub name: String,
+    pub type_name: String,
+    /// あと何回やり直せるか。
+    pub left: u32,
+    /// 選べない理由（上限に達した）。選べるなら `None`。
+    pub blocked: Option<String>,
+}
+
+/// やり直しの一覧: 投票済みの投票用紙を、表示順（固定）のまま並べる。上限に達したものは、理由つきで選べなくする。
+pub fn revote_items(
+    ballots: &[BallotStatusDto],
+    max_revotes: u32,
+    limit_template: &str,
+) -> Vec<RevoteItem> {
+    ballots
+        .iter()
+        .filter(|b| b.voted)
+        .map(|b| {
+            let left = revotes_left(b, max_revotes);
+            RevoteItem {
+                contest_id: b.contest_id.clone(),
+                name: b.name.clone(),
+                type_name: b.type_name.clone(),
+                left,
+                blocked: (left == 0).then(|| format_revote_limit(limit_template, max_revotes)),
+            }
+        })
+        .collect()
+}
+
+/// やり直しを受理した後の一覧（その投票用紙の受理済みの票の数を 1 増やす）。元の一覧は変えない。
+pub fn mark_revoted(ballots: &[BallotStatusDto], contest_id: &str) -> Vec<BallotStatusDto> {
+    ballots
+        .iter()
+        .map(|b| BallotStatusDto {
+            ballots_cast: if b.contest_id == contest_id {
+                b.ballots_cast.saturating_add(1)
+            } else {
+                b.ballots_cast
+            },
+            ..b.clone()
+        })
+        .collect()
+}
+
+/// やり直しの API に渡す、画面が見た受理済みの票の数（同時に 2 つ送っても、1 件だけが受理される）。
+pub fn revote_expected(ballots: &[BallotStatusDto], contest_id: &str) -> Option<u32> {
+    ballots
+        .iter()
+        .find(|b| b.contest_id == contest_id && b.voted)
+        .map(|b| b.ballots_cast.max(1))
+}
+
+/// 確認画面の注意書き。やり直しを認めない選挙では「取り消し・やり直しはできません」。認める選挙では、この投票の後に
+/// あと何回やり直せるか（`left_after`）。
+pub fn confirm_hint(revote: Option<&RevoteStatusDto>, left_after: u32) -> String {
+    match revote {
+        None => "投票の取り消し・やり直しはできません。".to_string(),
+        Some(_) if left_after == 0 => {
+            "この投票の後は、やり直しできません（上限に達します）。".to_string()
+        }
+        Some(_) => format!("投票期間内なら、この後あと {left_after} 回やり直せます。"),
     }
 }
 
@@ -390,6 +522,12 @@ pub enum VoteOutcome {
     NotEligible,
     /// 422: 候補者が受け付けられなかった。
     InvalidCandidate,
+    /// 409 `revote_conflict`: 同時に送られた別のやり直しが先に受理された（画面の票の数が古い）。
+    RevoteConflict,
+    /// 409 `revote_limit_reached`: やり直しの上限に達している。
+    RevoteLimitReached,
+    /// 409 `revote_not_allowed` / `not_voted`: やり直せない（再投票を認めない選挙・まだ投票していない）。
+    RevoteUnavailable,
     /// 通信エラー・5xx など。
     Unavailable,
 }
@@ -398,6 +536,9 @@ pub fn vote_outcome(result: Result<(), ApiFailure>) -> VoteOutcome {
     match result {
         Ok(()) => VoteOutcome::Accepted,
         Err(ApiFailure::AlreadyVoted) => VoteOutcome::AlreadyVoted,
+        Err(ApiFailure::RevoteConflict) => VoteOutcome::RevoteConflict,
+        Err(ApiFailure::RevoteLimitReached) => VoteOutcome::RevoteLimitReached,
+        Err(ApiFailure::RevoteUnavailable) => VoteOutcome::RevoteUnavailable,
         Err(ApiFailure::Unauthorized) => VoteOutcome::SessionExpired,
         Err(ApiFailure::NotFound) => VoteOutcome::BallotGone,
         Err(ApiFailure::NotEligible) => VoteOutcome::NotEligible,
@@ -423,6 +564,10 @@ pub fn apply_outcome(phase: VotePhase, outcome: VoteOutcome) -> (VotePhase, Opti
         VoteOutcome::AlreadyVoted | VoteOutcome::BallotGone | VoteOutcome::NotEligible => {
             (reset, Some(Route::Progress))
         }
+        // やり直しの失敗: 一覧を取り直して、やり直しの一覧へ戻る（票の数・受け付けているかが変わっている）。
+        VoteOutcome::RevoteConflict
+        | VoteOutcome::RevoteLimitReached
+        | VoteOutcome::RevoteUnavailable => (reset, Some(Route::Revote)),
         VoteOutcome::SessionExpired => (reset, Some(Route::Login)),
         VoteOutcome::InvalidCandidate => (
             VotePhase::Failed {
@@ -452,6 +597,15 @@ pub fn outcome_notice(outcome: VoteOutcome, ballot_item: &str) -> Option<String>
         VoteOutcome::NotEligible => Some(format!(
             "この{ballot_item}は、あなたの投票対象ではありません。"
         )),
+        VoteOutcome::RevoteConflict => Some(
+            "別の画面からのやり直しが先に受け付けられました。一覧を確認してください。".to_string(),
+        ),
+        VoteOutcome::RevoteLimitReached => Some(format!(
+            "この{ballot_item}は、やり直しの上限に達しています。"
+        )),
+        VoteOutcome::RevoteUnavailable => {
+            Some(format!("この{ballot_item}は、やり直しできません。"))
+        }
         VoteOutcome::Accepted | VoteOutcome::InvalidCandidate | VoteOutcome::Unavailable => None,
     }
 }
@@ -523,6 +677,7 @@ mod tests {
             type_name: "種類".to_string(),
             method: VotingMethod::SingleChoice,
             voted,
+            ballots_cast: u32::from(voted),
         }
     }
 
@@ -759,6 +914,7 @@ mod tests {
             logged_in,
             ballots,
             last_voted,
+            revote: None,
         }
     }
 
@@ -1150,5 +1306,152 @@ mod tests {
     fn login_failure_messages() {
         assert!(login_failure_message(ApiFailure::Unauthorized).contains("ログイン ID"));
         assert!(login_failure_message(ApiFailure::Network).contains("接続"));
+    }
+
+    // --- 投票のやり直し（ADR 0022）---
+
+    fn revote(max_revotes: u32, open: bool) -> RevoteStatusDto {
+        RevoteStatusDto { max_revotes, open }
+    }
+
+    fn cast(mut b: Vec<BallotStatusDto>, counts: &[u32]) -> Vec<BallotStatusDto> {
+        for (ballot, n) in b.iter_mut().zip(counts) {
+            ballot.ballots_cast = *n;
+        }
+        b
+    }
+
+    #[test]
+    fn revote_routes_never_contain_candidates() {
+        assert_eq!(Route::Revote.path(), "/revote");
+        assert_eq!(
+            Route::RevoteBallot(id("a.1")).path(),
+            "/revote/2026-general/a.1"
+        );
+    }
+
+    #[test]
+    fn the_revote_button_needs_all_ballots_voted_an_open_period_and_revotes_allowed() {
+        let done = list(&[("a.1", true), ("a.2", true)]);
+        assert!(can_revote(&done, Some(&revote(5, true))));
+        assert!(!can_revote(&done, Some(&revote(5, false))), "期間外");
+        assert!(!can_revote(&done, None), "再投票を認めない選挙");
+        let not_yet = list(&[("a.1", true), ("a.2", false)]);
+        assert!(!can_revote(&not_yet, Some(&revote(5, true))));
+        assert!(!can_revote(&[], Some(&revote(5, true))));
+    }
+
+    #[test]
+    fn the_revote_list_keeps_the_fixed_order_and_blocks_ballots_at_the_limit() {
+        let b = cast(
+            list(&[("a.1", true), ("a.2", true), ("a.3", true)]),
+            &[1, 3, 2],
+        );
+        let items = revote_items(&b, 2, "やり直しの上限（{max}回）に達しています");
+        let ids: Vec<&str> = items.iter().map(|i| i.contest_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["2026-general/a.1", "2026-general/a.2", "2026-general/a.3"]
+        );
+        assert_eq!(
+            items.iter().map(|i| i.left).collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert_eq!(items[0].blocked, None);
+        assert_eq!(
+            items[1].blocked.as_deref(),
+            Some("やり直しの上限（2回）に達しています")
+        );
+        // 未投票のものは、やり直しの一覧に出さない。
+        let partly = list(&[("a.1", true), ("a.2", false)]);
+        assert_eq!(revote_items(&partly, 2, "{max}").len(), 1);
+    }
+
+    #[test]
+    fn revote_pages_open_only_for_voted_ballots_below_the_limit_while_open() {
+        let b = cast(list(&[("a.1", true), ("a.2", true)]), &[1, 3]);
+        let status = revote(2, true);
+        let g = GuardContext {
+            logged_in: true,
+            ballots: Some(&b),
+            last_voted: None,
+            revote: Some(&status),
+        };
+        assert_eq!(guard(&g, &Route::Revote), None);
+        assert_eq!(guard(&g, &Route::RevoteBallot(id("a.1"))), None);
+        // 上限に達したもの・存在しないものは、一覧へ戻す。
+        assert_eq!(
+            guard(&g, &Route::RevoteBallot(id("a.2"))),
+            Some(Route::Revote)
+        );
+        assert_eq!(
+            guard(&g, &Route::RevoteBallot(id("zz"))),
+            Some(Route::Revote)
+        );
+        // 期間外は、どれも選べない。
+        let closed = revote(2, false);
+        let g_closed = GuardContext {
+            revote: Some(&closed),
+            ..g
+        };
+        assert_eq!(
+            guard(&g_closed, &Route::RevoteBallot(id("a.1"))),
+            Some(Route::Revote)
+        );
+        // まだ投票していないものがあれば、先にそちらへ。
+        let not_yet = list(&[("a.1", true), ("a.2", false)]);
+        let g2 = GuardContext {
+            ballots: Some(&not_yet),
+            ..g
+        };
+        assert_eq!(guard(&g2, &Route::Revote), Some(Route::Ballot(id("a.2"))));
+        // 未ログインは、ログイン画面へ。
+        let out = GuardContext {
+            logged_in: false,
+            ..g
+        };
+        assert_eq!(guard(&out, &Route::Revote), Some(Route::Login));
+    }
+
+    #[test]
+    fn a_revote_sends_the_seen_count_and_bumps_it_after_acceptance() {
+        let b = cast(list(&[("a.1", true), ("a.2", true)]), &[1, 2]);
+        assert_eq!(revote_expected(&b, &id("a.2")), Some(2));
+        assert_eq!(revote_expected(&b, &id("zz")), None);
+        let after = mark_revoted(&b, &id("a.2"));
+        assert_eq!(
+            after.iter().map(|x| x.ballots_cast).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(b[1].ballots_cast, 2, "元の一覧は変えない");
+    }
+
+    #[test]
+    fn the_confirm_hint_depends_on_whether_revotes_are_allowed() {
+        assert!(confirm_hint(None, 0).contains("やり直しはできません"));
+        assert!(confirm_hint(Some(&revote(5, true)), 4).contains("あと 4 回"));
+        assert!(confirm_hint(Some(&revote(5, true)), 0).contains("上限"));
+    }
+
+    #[test]
+    fn revote_failures_return_to_the_revote_list_with_a_notice() {
+        for outcome in [
+            VoteOutcome::RevoteConflict,
+            VoteOutcome::RevoteLimitReached,
+            VoteOutcome::RevoteUnavailable,
+        ] {
+            let phase = VotePhase::Submitting {
+                candidate_id: cand(1),
+            };
+            assert_eq!(
+                apply_outcome(phase, outcome),
+                (VotePhase::default(), Some(Route::Revote))
+            );
+            assert!(outcome_notice(outcome, "投票用紙").is_some());
+        }
+        assert_eq!(
+            vote_outcome(Err(ApiFailure::RevoteConflict)),
+            VoteOutcome::RevoteConflict
+        );
     }
 }

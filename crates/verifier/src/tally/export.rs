@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::Serialize;
 
-use super::compute::{DistrictTally, GroupTotal, Tally};
+use super::compute::{DistrictTally, GroupTotal, RevoteReport, Tally};
 use super::gate::Phase;
 use super::render::rank;
 use super::{Meta, Reconciliation};
@@ -33,6 +33,9 @@ struct Document<'a> {
     types: &'a [GroupTotal],
     total: GroupTotal,
     reconciliation: &'a Reconciliation,
+    /// 再投票の件数と変更の内訳（締切後の集計だけ。中間集計・再投票の無い選挙では省く）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revotes: Option<&'a RevoteReport>,
 }
 
 fn create_new(path: &Path) -> anyhow::Result<File> {
@@ -86,12 +89,13 @@ fn group_csv(
     Ok(())
 }
 
-/// `base/{日時}/` を作り、CSV 5 つと JSON を書く。作ったディレクトリを返す。
+/// `base/{日時}/` を作り、CSV 5 つ（締切後の再投票の内訳があれば 6 つ）と JSON を書く。作ったディレクトリを返す。
 pub fn write_all(
     base: &Path,
     tally: &Tally,
     recon: &Reconciliation,
     meta: &Meta<'_>,
+    revotes: Option<&RevoteReport>,
 ) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(base).with_context(|| format!("{} を作成できません", base.display()))?;
     let dir = base.join(utc_compact(meta.generated_at_unix));
@@ -174,17 +178,62 @@ pub fn write_all(
     )?;
 
     let mut w = csv_file(&dir, "reconciliation.csv")?;
-    w.write_record(["contest_id", "投票済み記録", "封印済み", "未封印", "一致"])?;
+    w.write_record([
+        "contest_id",
+        "投票済み記録",
+        "封印済み",
+        "うち再投票",
+        "未封印",
+        "一致",
+    ])?;
     for r in &recon.contests {
         w.write_record([
             r.contest_id.clone(),
             r.participation.to_string(),
             r.sealed.to_string(),
+            r.sealed_revotes.to_string(),
             r.pending.to_string(),
             r.consistent.to_string(),
         ])?;
     }
     w.flush()?;
+
+    // 再投票の変更の内訳（A→B の件数表）。白票の表示名は、設定の呼び名。
+    if let Some(report) = revotes {
+        let mut w = csv_file(&dir, "revotes.csv")?;
+        w.write_record([
+            "contest_id",
+            "選挙区",
+            "変更前_candidate_id",
+            "変更前",
+            "変更後_candidate_id",
+            "変更後",
+            "件数",
+        ])?;
+        let name = |id: &str, name: &Option<String>| {
+            name.clone().unwrap_or_else(|| {
+                if id == domain::BLANK_CANDIDATE_ID {
+                    meta.blank_name.to_string()
+                } else {
+                    id.to_string()
+                }
+            })
+        };
+        for c in &report.contests {
+            for change in &c.changes {
+                w.write_record([
+                    c.contest_id.clone(),
+                    c.name.clone(),
+                    change.from_candidate_id.clone(),
+                    name(&change.from_candidate_id, &change.from_name),
+                    change.to_candidate_id.clone(),
+                    name(&change.to_candidate_id, &change.to_name),
+                    change.count.to_string(),
+                ])?;
+            }
+        }
+        w.flush()?;
+    }
 
     let document = Document {
         election_id: &tally.election_id,
@@ -200,6 +249,7 @@ pub fn write_all(
         types: &tally.types,
         total: tally.grand_total(),
         reconciliation: recon,
+        revotes,
     };
     let json = create_new(&dir.join("tally.json"))?;
     serde_json::to_writer_pretty(json, &document).context("tally.json を書けません")?;

@@ -157,6 +157,13 @@ dev_default_secret APP__SEALER__SIGNING_SEED sealer_signing_seed "$DEV_SIGNING_S
 dev_default_secret APP__ADMIN__TOKEN admin_token "$DEV_ADMIN_TOKEN"
 # 設定が不正なら、何も起動する前に、ここで（どのファイルのどの項目がなぜ不正か）を表示して終了する。
 "$CFG_BIN" validate >/dev/null || fail "設定が不正です（上のメッセージを参照。実効値は: cargo run -p app-config -- show）"
+# 再投票の鍵（vote.allow_revote = true のときだけ。ADR 0022）は、固定値にしない: secrets/revote_key にだけ置き、締切の手続きで
+# ファイルごと破棄されるので、無ければ、その都度、乱数で作る（権限 0600。git 管理外）。
+if [[ "$(cfg_get vote.allow_revote)" == true && ! -f "${APP_SECRETS_DIR:-secrets}/revote_key" ]]; then
+    mkdir -p "${APP_SECRETS_DIR:-secrets}"
+    (umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"${APP_SECRETS_DIR:-secrets}/revote_key")
+    echo "再投票の鍵を ${APP_SECRETS_DIR:-secrets}/revote_key に作りました（締切の手続きで破棄されます）"
+fi
 API_PORT_CFG="$(cfg_get api.port)"
 WEB_PORT="$(cfg_get web.port)"
 if [[ -f "$PIDS_FILE" ]]; then

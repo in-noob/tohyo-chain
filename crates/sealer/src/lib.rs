@@ -6,12 +6,14 @@
 mod clock;
 pub mod config;
 mod coordinator;
+mod revote_key;
 mod runner;
 mod schedule;
 mod sealer;
 
 pub use clock::{ManualClock, MonotonicClock, SystemMonotonic};
 pub use coordinator::{ANCHOR_LEASE, Coordinator, LeaseConfig, StepOutcome};
+pub use revote_key::{KeyDestroyError, destroy_revote_key};
 pub use runner::{DEFAULT_TICK, SealerHandle, spawn, spawn_coordinator};
 pub use schedule::AnchorSchedule;
 pub use sealer::{FinalAnchor, LeaseGuard, SealEvent, Sealer, SealerError, TickOutcome, Trigger};

@@ -65,14 +65,24 @@ async fn memory_scheduler_advances_through_the_full_lifecycle() {
         Duration::from_secs(600),
         store.clone(),
         Duration::from_secs(1), // 締切の手続きの猶予。
-        ElectionRules { allow_blank: false },
+        ElectionRules {
+            allow_blank: false,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
 
     // 開始時刻に達しているので、次の tick で open になる。open にしたプロセスの設定のルールが固定される（原則19）。
     tokio::time::sleep(Duration::from_millis(50)).await;
     let opened = store.get().await.expect("state");
     assert_eq!(opened.phase, ElectionPhase::Open);
-    assert_eq!(opened.rules, Some(ElectionRules { allow_blank: false }));
+    assert_eq!(
+        opened.rules,
+        Some(ElectionRules {
+            allow_blank: false,
+            ..ElectionRules::default()
+        })
+    );
 
     // 終了時刻に進める → closing。
     wall.set(1_010);
@@ -150,6 +160,7 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
             ballot_id: BallotId::from_random_bytes(id),
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
             candidate_id: CandidateId::parse("shugiin_smd.13.01.c1").expect("valid"),
+            revote: None,
         }
     };
 
@@ -159,7 +170,11 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
         Duration::from_secs(600),
         store.clone(),
         Duration::from_secs(1),
-        ElectionRules { allow_blank: true },
+        ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
     tokio::time::sleep(Duration::from_millis(50)).await; // scheduled -> open
 
@@ -199,4 +214,73 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
     );
 
     handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_closing_procedure_destroys_the_revote_key_and_records_it_once() {
+    let shard_count = NonZeroU16::new(1).expect("non-zero");
+    let store = Arc::new(InMemoryStore::new(shard_count));
+    let mono = Arc::new(ManualClock::new());
+    let wall = Arc::new(ManualWall::new(1_000));
+    let mut sealer = Sealer::new(
+        store.clone(),
+        Arc::new(Ed25519Signer::from_seed(&[5u8; 32])),
+        wall.clone(),
+        mono.clone(),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
+        shard_count,
+    );
+    sealer.init().await.expect("init");
+    store
+        .ensure_initialized(Period {
+            opens_at: Some(1_000),
+            closes_at: Some(1_010),
+        })
+        .await
+        .expect("init");
+    let dir = std::env::temp_dir().join(format!("election-revote-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join(application::REVOTE_KEY_FILE);
+    std::fs::write(&path, "cd".repeat(32)).expect("write");
+    let vault = Arc::new(application::RevoteKeyVault::load(&path).expect("load"));
+
+    let rules = ElectionRules {
+        allow_revote: true,
+        ..ElectionRules::default()
+    };
+    let handle = sealer::spawn(
+        sealer,
+        Duration::from_millis(10),
+        Duration::from_secs(600),
+        store.clone(),
+        Duration::from_secs(1),
+        rules,
+        vault.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await; // open
+    assert_eq!(store.get().await.expect("state").rules, Some(rules));
+    wall.set(1_010); // closing
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(vault.has_key() && path.exists(), "猶予の間は、鍵を残す");
+    mono.advance(Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        store.get().await.expect("state").phase,
+        ElectionPhase::Closed
+    );
+    // ファイルもメモリ上の写し（api と共有）も消えている。
+    assert!(!path.exists());
+    assert!(!vault.has_key());
+    let audit = store.recent_audit(10).await.expect("audit");
+    let destroyed: Vec<_> = audit
+        .iter()
+        .filter(|e| e.event == application::AuditEvent::RevoteKeyDestroyed)
+        .collect();
+    assert_eq!(destroyed.len(), 1, "{audit:?}");
+    assert_eq!(destroyed[0].actor, "sealer:memory");
+    // 鍵の破棄は、closed への遷移より前。
+    assert_eq!(audit[0].to, ElectionPhase::Closed);
+    assert_eq!(audit[1].event, application::AuditEvent::RevoteKeyDestroyed);
+    handle.shutdown().await.expect("shutdown");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }

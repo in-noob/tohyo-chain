@@ -55,14 +55,14 @@ pub fn LoginPage() -> impl IntoView {
             let result = match api::login(&id, secret.as_deref(), number.as_deref()).await {
                 Ok(login) => api::ballot_status(&login.token)
                     .await
-                    .map(|status| (login.token, status.ballots)),
+                    .map(|status| (login.token, status)),
                 Err(failure) => Err(failure),
             };
             match result {
-                Ok((token, ballots)) => {
+                Ok((token, status)) => {
                     // 投票する順番は固定: 先頭の未投票の投票用紙へ自動で進む（すべて済み・無ければ進捗の画面）。
-                    let target = flow::entry_route(&ballots);
-                    state.ballots.set(Some(ballots));
+                    let target = flow::entry_route(&status.ballots);
+                    state.set_status(status);
                     state.token.set(Some(token));
                     navigate(&target.path(), replace());
                 }

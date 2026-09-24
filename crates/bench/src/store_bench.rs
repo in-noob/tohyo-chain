@@ -99,6 +99,7 @@ async fn measure(args: &StoreArgs, keyspace: &str) -> anyhow::Result<()> {
                         ballot_id,
                         contest_id: item.contest.clone(),
                         candidate_id: item.candidate.clone(),
+                        revote: None,
                     };
                     let shard = shard_for(&ballot_id, shards);
                     let started = Instant::now();

@@ -17,6 +17,16 @@ pub enum ApiError {
     Unauthorized,
     NotFound,
     AlreadyVoted,
+    /// 再投票を認めない選挙で、再投票が指定された（ADR 0022）。
+    RevoteNotAllowed,
+    /// 再投票の上限（`max` 回）に達している。
+    RevoteLimitReached {
+        max: u32,
+    },
+    /// 同時に送られた別の再投票が先に受理された。
+    RevoteConflict,
+    /// まだ投票していない投票用紙に、再投票が指定された。
+    NotVotedYet,
     InvalidCandidate,
     /// 白票を受け付けない選挙（open の時点で固定した `vote.allow_blank` が偽）で、白票が指定された。
     BlankNotAllowed,
@@ -39,6 +49,10 @@ impl ApiError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::AlreadyVoted => (StatusCode::CONFLICT, "already_voted"),
+            Self::RevoteNotAllowed => (StatusCode::CONFLICT, "revote_not_allowed"),
+            Self::RevoteLimitReached { .. } => (StatusCode::CONFLICT, "revote_limit_reached"),
+            Self::RevoteConflict => (StatusCode::CONFLICT, "revote_conflict"),
+            Self::NotVotedYet => (StatusCode::CONFLICT, "not_voted"),
             Self::InvalidCandidate => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_candidate"),
             Self::BlankNotAllowed => (StatusCode::UNPROCESSABLE_ENTITY, "blank_not_allowed"),
             Self::NotEligible => (StatusCode::FORBIDDEN, "not_eligible"),
@@ -60,6 +74,16 @@ impl ApiError {
             }
             Self::NotFound => format!("{ballot_item}が見つかりません。"),
             Self::AlreadyVoted => format!("この{ballot_item}には投票済みです。"),
+            Self::RevoteNotAllowed => {
+                format!("この選挙では、{ballot_item}の投票をやり直せません。")
+            }
+            Self::RevoteLimitReached { max } => labels
+                .revote_limit_reached
+                .replace("{max}", &max.to_string()),
+            Self::RevoteConflict => {
+                "同時に送られた別のやり直しと重なりました。画面を開き直してください。".to_string()
+            }
+            Self::NotVotedYet => format!("この{ballot_item}には、まだ投票していません。"),
             Self::InvalidCandidate => format!("指定した候補者は、この{ballot_item}にいません。"),
             Self::BlankNotAllowed => format!("この選挙では、{}は選べません。", labels.blank_name),
             Self::NotEligible => format!("この{ballot_item}は、あなたの投票対象ではありません。"),
@@ -112,6 +136,18 @@ pub async fn add_error_messages(
     response
 }
 
+impl ApiError {
+    /// 投票・再投票の失敗。上限のメッセージには、固定した選挙のルールの `max_revotes` を使う。
+    pub(crate) fn from_service(e: ServiceError, rules: domain::ElectionRules) -> Self {
+        match e {
+            ServiceError::RevoteLimitReached => Self::RevoteLimitReached {
+                max: rules.max_revotes,
+            },
+            other => other.into(),
+        }
+    }
+}
+
 impl From<ServiceError> for ApiError {
     fn from(e: ServiceError) -> Self {
         match e {
@@ -119,9 +155,19 @@ impl From<ServiceError> for ApiError {
             ServiceError::InvalidCandidate => Self::InvalidCandidate,
             ServiceError::BlankNotAllowed => Self::BlankNotAllowed,
             ServiceError::AlreadyVoted => Self::AlreadyVoted,
+            ServiceError::RevoteNotAllowed => Self::RevoteNotAllowed,
+            ServiceError::RevoteLimitReached => Self::RevoteLimitReached { max: 0 },
+            ServiceError::RevoteConflict => Self::RevoteConflict,
+            ServiceError::NotVotedYet => Self::NotVotedYet,
             ServiceError::NotEligible => Self::NotEligible,
             ServiceError::Unavailable => {
                 tracing::error!("サービスが利用できません");
+                Self::Unavailable
+            }
+            ServiceError::RevoteKeyUnavailable => {
+                tracing::error!(
+                    "再投票の鍵（secrets/revote_key）がありません。再投票を認める選挙の投票を受け付けられません"
+                );
                 Self::Unavailable
             }
         }

@@ -11,6 +11,9 @@
 #   9. 性能計測ツール一式（scripts/bench.sh と crates/bench）
 #  10. 白票: 白票で投票 → 封印 → tally の白票の数が一致する。vote.allow_blank=false では API が拒否する
 #      （open の時点での固定は cargo test の必須テスト。画面の確認は web.sh#4）
+#  11. 再投票（memory。ADR 0022）: A → B → 白票 → tally では白票の 1 票だけ → verify OK → 上限を超えると拒否 →
+#      同時に 2 つの再投票は 1 件だけ成功 → 締切後は revote_key が存在しない → vote.allow_revote=false では 2 回目が 409
+#      （DB（LWT）・締切前の非公開は chain.sh#9）
 # 設定は、手元の config/local.toml などの影響を受けないよう分離する（scripts/lib/common.sh）。
 set -euo pipefail
 
@@ -709,10 +712,196 @@ check_blank() (
     echo "OK: core#10 白票"
 )
 
+# ===========================================================================
+# 11. 再投票（vote.allow_revote。memory。ADR 0022）
+# ===========================================================================
+check_revote() (
+    set -euo pipefail
+    cfg_init
+    PORT="${CHECK_API_PORT:-18834}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18934}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="core11-check-admin-token-0123456789abcdef"
+    export BASE
+    TMP="$(mktemp -d)"
+    LOG="$TMP/api.log"
+    OUT="$TMP/tally"
+    # 再投票の鍵は secrets/revote_key にだけ置く（環境変数では渡せない）。この確認専用の secrets ディレクトリを使う。
+    SECRETS="$TMP/secrets"
+    KEY="$SECRETS/revote_key"
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        rm -rf "$TMP"
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        if [[ -s "$LOG" ]]; then
+            echo "--- api log（末尾）---" >&2
+            tail -n 20 "$LOG" >&2
+        fi
+        exit 1
+    }
+
+    echo "== 11-1. 再投票の単体テスト（必須ケース）"
+    # 消す・改名すると失敗する。
+    REQUIRED=(
+        "domain encoding::tests::revote_links_are_appended_with_a_tag_fixed_width_and_big_endian"
+        "domain revote::tests::only_the_last_version_of_each_slot_is_counted"
+        "domain revote::tests::gaps_duplicates_and_the_limit_are_detected"
+        "application revote::tests::slot_is_hmac_sha256_over_length_prefixed_ids"
+        "application voting::tests::a_revote_links_to_the_last_ballot_and_respects_the_limit"
+        "infra-memory store::tests::revotes_bump_the_seq_only_from_the_expected_value_and_track_the_slot"
+        "api a_then_b_then_blank_counts_only_the_last_ballot_and_the_limit_applies"
+        "api of_two_simultaneous_revotes_exactly_one_is_accepted"
+        "api before_the_close_neither_candidates_nor_links_of_revotes_are_visible"
+        "sealer the_closing_procedure_destroys_the_revote_key_and_records_it_once"
+        "verifier verify::tests::only_the_last_ballot_of_each_slot_is_counted_and_changes_are_listed"
+        "verifier verify::tests::participation_is_reconciled_with_the_number_of_slots_not_ballots"
+    )
+    for entry in "${REQUIRED[@]}"; do
+        read -r crate name <<<"$entry"
+        out="$(cargo test -q -p "$crate" -- --exact "$name" 2>&1)" || { echo "$out" >&2; fail "${crate}: ${name} が失敗しました"; }
+        grep -Eq '^test result: ok\. 1 passed' <<<"$out" || { echo "$out" >&2; fail "${crate}: 必須テスト ${name} がありません"; }
+    done
+    echo "必須テスト ${#REQUIRED[@]} 件: OK"
+
+    # start_api [NAME=VALUE...]: memory モードで起動し、開始時刻を過去にして open にする。
+    start_api() {
+        cargo build -q -p api
+        spawn api "$LOG" env APP_SECRETS_DIR="$SECRETS" APP__API__PORT="$PORT" APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}" \
+            APP__ADMIN__TOKEN="$ADMIN_TOKEN" APP__SESSION__SECRET="core11-check-secret-0123456789abcdef" \
+            APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00" APP__ELECTION__STATE_CACHE_SECS=0 \
+            APP__API__REQUEST_TIMEOUT_SECS=2 "$@" ./target/debug/api
+        wait_healthz "$BASE" 20 api || fail "api が応答しません"
+        wait_election_open "$BASE" 10 || fail "自動で open になりませんでした"
+    }
+    # vote_as N CANDIDATE [SEEN]: voter-N が 1 番目の投票用紙に投票する（SEEN があれば、画面が見た票の数を添えた再投票）。
+    vote_as() {
+        local token district body
+        token="$(login "voter-$1")"
+        [[ -n "$token" ]] || fail "voter-$1 がログインできません"
+        district="$(seed_district "$1" 1)"
+        body="{\"candidate_id\":\"$2\"}"
+        [[ -n "${3:-}" ]] && body="{\"candidate_id\":\"$2\",\"revote\":$3}"
+        request POST "/api/v1/contests/${SEED_ID}/${district}/vote" "$token" "$body"
+    }
+    admin_status() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null || true; }
+    phase_is() { [[ "$(admin_status)" == *"\"phase\":\"$1\""* ]]; }
+
+    VOTERS=8
+    seed_generate "$TMP/seed" "$VOTERS"
+    cargo build -q -p verifier
+    mkdir -p "$SECRETS"
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$KEY"
+    chmod 600 "$KEY"
+
+    echo "== 11-2. vote.allow_revote=true（上限 2 回）: A → B → 白票。上限を超えると拒否。前回の投票内容は返さない"
+    start_api APP__VOTE__ALLOW_REVOTE=true APP__VOTE__MAX_REVOTES=2
+    d1="$(seed_district 1 1)"
+    vote_as 1 "${d1}.c1"
+    expect_status 201 "voter-1 の初回の投票（A）"
+    vote_as 1 "${d1}.c2"
+    expect_status 409 "再投票を明示しない 2 回目"
+    [[ "$BODY" == *'"error":"already_voted"'* ]] || fail "再投票を明示しない 2 回目が already_voted ではありません: ${BODY}"
+    vote_as 1 "${d1}.c2" 1
+    expect_status 201 "voter-1 の再投票（B）"
+    vote_as 1 blank 2
+    expect_status 201 "voter-1 の再投票（白票）"
+    vote_as 1 "${d1}.c3" 3
+    expect_status 409 "上限を超えた再投票"
+    [[ "$BODY" == *'"error":"revote_limit_reached"'* && "$BODY" == *'やり直しの上限（2回）に達しています'* ]] \
+        || fail "上限の拒否の理由がありません: ${BODY}"
+    request GET /api/v1/ballot-status "$(login voter-1)"
+    expect_status 200 "voter-1 の状況"
+    [[ "$BODY" == *'"ballots_cast":3'* && "$BODY" == *'"revote":{"max_revotes":2,"open":true}'* ]] \
+        || fail "状況に、受理した票の数・再投票の条件がありません: ${BODY}"
+    [[ "$BODY" != *"${d1}.c"* && "$BODY" != *'blank'* ]] || fail "状況に、前回の投票内容が出ています: ${BODY}"
+    echo "A → B → 白票（201）・明示しない 2 回目は 409 already_voted・上限を超えると 409 revote_limit_reached・内容は返さない: OK"
+
+    echo "== 11-3. 同時に 2 つの再投票を送ると、1 件だけ成功する"
+    d2="$(seed_district 2 1)"
+    vote_as 2 "${d2}.c1"
+    expect_status 201 "voter-2 の初回の投票"
+    token2="$(login voter-2)"
+    # wait は、PID を指定する（引数なしの wait は、spawn で起動した api も待ってしまう）。
+    RACE_PIDS=()
+    for c in 2 3; do
+        curl -sS -o "$TMP/race-$c.json" -w '%{http_code}' -X POST "${BASE}/api/v1/contests/${SEED_ID}/${d2}/vote" \
+            -H "Authorization: Bearer ${token2}" -H 'Content-Type: application/json' \
+            -d "{\"candidate_id\":\"${d2}.c${c}\",\"revote\":1}" >"$TMP/race-$c.code" &
+        RACE_PIDS+=("$!")
+    done
+    wait "${RACE_PIDS[@]}"
+    # curl -w の出力は改行で終わらないので、1 行ずつにしてから並べる。
+    codes="$(for c in 2 3; do cat "$TMP/race-$c.code"; echo; done | sort | tr '\n' ' ')"
+    [[ "$codes" == "201 409 " ]] || fail "同時の再投票の結果が 201 と 409 ではありません: ${codes}"
+    cat "$TMP"/race-*.json | grep -q '"error":"revote_conflict"' || fail "負けた再投票が revote_conflict ではありません"
+    echo "同時の再投票: 201 が 1 件・409 revote_conflict が 1 件: OK"
+    for n in $(seq 3 "$VOTERS"); do
+        vote_as "$n" "$(seed_district "$n" 1).c1"
+        expect_status 201 "voter-${n} の投票"
+    done
+
+    echo "== 11-4. 締切（close --now）→ 締切の手続きの中で revote_key を破棄する → tally は最後の票だけを数える"
+    [[ -s "$KEY" ]] || fail "締切の前に、revote_key が無くなっています"
+    # 鍵の値は、ログに出さない。
+    if grep -aq "$(cat "$KEY")" "$LOG"; then fail "api のログに revote_key の値が出ています"; fi
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election/close")"
+    [[ "$code" == 200 ]] || fail "close --now が 200 ではありません（${code}）"
+    wait_until 20000 phase_is closed || fail "closed になりません: $(admin_status)"
+    [[ ! -e "$KEY" ]] || fail "締切後も revote_key が存在します"
+    [[ "$(admin_status)" == *'"event":"revote_key_destroyed"'* ]] || fail "election_audit に、鍵の破棄が記録されていません: $(admin_status)"
+    grep -aq '再投票の鍵（revote_key）を破棄しました' "$LOG" || fail "鍵の破棄のログがありません"
+    echo "締切後: revote_key のファイルが無い・election_audit に revote_key_destroyed: OK"
+    verify_out="$(./target/debug/verifier verify --api "$BASE" 2>&1)" || { echo "$verify_out" >&2; fail "verify が失敗しました"; }
+    [[ "$verify_out" == *"再投票のつながり: slot ${VOTERS} 個・再投票 3 件（上限 2 回）OK"* ]] \
+        || { echo "$verify_out" >&2; fail "verify が再投票のつながりを確認していません"; }
+    tally_out="$(APP__API__PORT="$PORT" ./target/debug/verifier tally --out "$OUT" 2>&1)" || { echo "$tally_out" >&2; fail "tally が失敗しました"; }
+    DIR="$(find "$OUT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
+    total="$(tail -n +2 "$DIR/districts.csv" | awk -F, '{ s += $8 } END { print s + 0 }')"
+    blank="$(tail -n +2 "$DIR/districts.csv" | awk -F, '{ s += $7 } END { print s + 0 }')"
+    [[ "$total" == "$VOTERS" && "$blank" == 1 ]] || fail "tally の合計 ${total}・白票 ${blank}（期待 ${VOTERS}・1。最後の票だけを数える）"
+    IFS=, read -r valid blank1 total1 voted1 < <(awk -F, -v d="$d1" '$2 == d { print $6 "," $7 "," $8 "," $9 }' "$DIR/districts.csv")
+    [[ "$blank1" == 1 && "$total1" == "$voted1" && $((valid + blank1)) == "$total1" ]] \
+        || fail "voter-1 の選挙区 ${d1}: 有効票=${valid} 白票=${blank1} 合計=${total1} 投票済み=${voted1}（白票 1・合計 = 投票済み）"
+    [[ -s "$DIR/revotes.csv" ]] || fail "revotes.csv（変更の内訳）がありません"
+    grep -q "${d1}.c1,.*,${d1}.c2,.*,1$" "$DIR/revotes.csv" || fail "revotes.csv に A→B がありません: $(cat "$DIR/revotes.csv")"
+    grep -q "${d1}.c2,.*,blank,白票,1$" "$DIR/revotes.csv" || fail "revotes.csv に B→白票 がありません: $(cat "$DIR/revotes.csv")"
+    [[ "$tally_out" == *"再投票の件数: 3 件"* ]] || { echo "$tally_out" >&2; fail "tally に再投票の件数がありません"; }
+    echo "verify OK（slot ${VOTERS} 個・再投票 3 件）・tally は最後の票だけ（白票 1）・revotes.csv に A→B・B→白票: OK"
+    graceful_stop api
+
+    echo "== 11-5. vote.allow_revote=false（既定）: 2 回目の投票は 409。slot を記録しない"
+    start_api
+    vote_as 1 "${d1}.c1"
+    expect_status 201 "初回の投票"
+    vote_as 1 "${d1}.c2"
+    expect_status 409 "allow_revote=false の 2 回目"
+    [[ "$BODY" == *'"error":"already_voted"'* ]] || fail "2 回目が already_voted ではありません: ${BODY}"
+    vote_as 1 "${d1}.c2" 1
+    expect_status 409 "allow_revote=false の再投票"
+    [[ "$BODY" == *'"error":"revote_not_allowed"'* ]] || fail "再投票が revote_not_allowed ではありません: ${BODY}"
+    request GET /api/v1/ballot-status "$(login voter-1)"
+    [[ "$BODY" != *'"revote"'* ]] || fail "再投票を認めない選挙の状況に、再投票の条件があります: ${BODY}"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election/close")"
+    wait_until 20000 phase_is closed || fail "closed になりません: $(admin_status)"
+    request GET /api/v1/chains/0/blocks/1
+    expect_status 200 "封印したブロック"
+    [[ "$BODY" != *'"slot"'* && "$BODY" != *'"seq"'* ]] || fail "再投票を認めない選挙の票に slot があります: ${BODY}"
+    graceful_stop api
+    echo "allow_revote=false: 2 回目は 409 already_voted・再投票は 409 revote_not_allowed・slot を記録しない: OK"
+
+    echo "OK: core#11 再投票"
+)
+
 check_healthz
 check_seal_policy
 check_config
 check_bench_tool
 check_blank
+check_revote
 
 echo "OK: check/core.sh"

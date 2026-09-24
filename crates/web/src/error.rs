@@ -11,6 +11,12 @@ pub enum ApiFailure {
     NotFound,
     /// 409: その投票用紙には投票済み。
     AlreadyVoted,
+    /// 409 `revote_conflict`: 同時に送られた別のやり直しが先に受理された。
+    RevoteConflict,
+    /// 409 `revote_limit_reached`: やり直しの上限に達している。
+    RevoteLimitReached,
+    /// 409 `revote_not_allowed` / `not_voted`: やり直せない。
+    RevoteUnavailable,
     /// 422: 選んだ候補者がその投票用紙にいない。
     InvalidCandidate,
     /// 5xx: サーバ側の一時的な障害。
@@ -24,6 +30,17 @@ pub enum ApiFailure {
 /// エラーの文言の先頭に「⚠」を付ける。エラーを、文字の色（赤系）だけで表さないため。
 pub fn alert_text(message: &str) -> String {
     format!("⚠ {message}")
+}
+
+/// HTTP ステータスと、エラー応答の `error`（機械可読なコード）を失敗種別に写す。409 は、コードで区別する
+/// （投票済み・やり直しの競合・上限・やり直せない）。成功（2xx）は `None`。
+pub fn classify_error(status: u16, code: Option<&str>) -> Option<ApiFailure> {
+    match (status, code) {
+        (409, Some("revote_conflict")) => Some(ApiFailure::RevoteConflict),
+        (409, Some("revote_limit_reached")) => Some(ApiFailure::RevoteLimitReached),
+        (409, Some("revote_not_allowed" | "not_voted")) => Some(ApiFailure::RevoteUnavailable),
+        _ => classify_status(status),
+    }
 }
 
 /// HTTP ステータスを失敗種別に写す。成功（2xx）は `None`。
@@ -66,6 +83,30 @@ mod tests {
         for status in [500, 503, 599] {
             assert_eq!(classify_status(status), Some(ApiFailure::Unavailable));
         }
+    }
+
+    #[test]
+    fn conflicts_are_told_apart_by_the_error_code() {
+        assert_eq!(
+            classify_error(409, Some("revote_conflict")),
+            Some(ApiFailure::RevoteConflict)
+        );
+        assert_eq!(
+            classify_error(409, Some("revote_limit_reached")),
+            Some(ApiFailure::RevoteLimitReached)
+        );
+        for code in ["revote_not_allowed", "not_voted"] {
+            assert_eq!(
+                classify_error(409, Some(code)),
+                Some(ApiFailure::RevoteUnavailable)
+            );
+        }
+        assert_eq!(
+            classify_error(409, Some("already_voted")),
+            Some(ApiFailure::AlreadyVoted)
+        );
+        assert_eq!(classify_error(409, None), Some(ApiFailure::AlreadyVoted));
+        assert_eq!(classify_error(201, None), None);
     }
 
     #[test]

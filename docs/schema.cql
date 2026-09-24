@@ -21,32 +21,55 @@ CREATE KEYSPACE IF NOT EXISTS {{KEYSPACE}}
 -- ballot_id・候補者・時刻・到着順は持たない。
 -- attempt: リクエストごとの乱数。LWT がタイムアウトして結果が不明なときの再試行で、
 -- 既存の行が「自分の先の試行が適用されたもの」かを判別するために使う（票とは結び付かない）。
+-- seq: この投票用紙に受理した票の数（再投票を認める選挙だけ。初回の投票で 1。認めない選挙では NULL）。
+--   再投票は LWT の比較更新（UPDATE ... SET seq = n+1 IF seq = n）で、同時に送られても 1 件だけ成功させる（ADR 0022）。
+--   slot・票のハッシュは持たない（それらは slot_state。participation と slot_state を結ぶキーは無い）。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.participation (
   voter_id   text,
   contest_id text,
   attempt    blob,
+  seq        int,
   PRIMARY KEY ((voter_id), contest_id)
+);
+
+-- 再投票の状態（ADR 0022。再投票を認める選挙だけ使う）。キーは voter_id ではなく、再投票の仮名
+-- slot = HMAC-SHA256(revote_key, election_id || voter_id || contest_id)（revote_key は secrets/ にだけ置き、締切の手続きで破棄する）。
+-- seq: 最後に受理した票の seq。last_ballot_hash: その票のハッシュ（次の再投票の supersedes）。
+-- 書き込み時刻は「分の先頭 + seq」（USING TIMESTAMP）: participation の LWT とマイクロ秒で突き合わせられないように。
+CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.slot_state (
+  slot             blob,
+  seq              int,
+  last_ballot_hash blob,
+  PRIMARY KEY (slot)
 );
 
 -- 未封印の票。投票者を特定する列を持たない。
 -- received_minute: 受理した時刻を「分」に丸めた値（UNIX 分。原則3）。並びは分の古い順、
---   同じ分の中は ballot_id の順（到着順の粒度は分）。
+--   同じ分の中は seq の順、次に ballot_id の順（到着順の粒度は分）。
+-- seq: 再投票のつながりの seq（slot の無い票は 0）。同じ slot の次の版は、前の版より後に並ぶので、件数による封印
+--   （先頭から max_ballots 件）でも、次の版が前の版より先に封印されない（ADR 0022）。
+-- revote: 再投票のつながり（slot・seq・supersedes）の正規化バイト列（domain::encoding::encode_revote。無ければ NULL）。
 -- 書き込み時刻（WRITETIME）も分に丸めて指定する（USING TIMESTAMP）。participation の行と
 -- マイクロ秒の書き込み時刻で突き合わせられないようにするため。
 -- ballot_id: UUIDv4 の 16 バイト。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.ballot_pool (
   shard           int,
   received_minute bigint,
+  seq             int,
   ballot_id       blob,
   contest_id      text,
   candidate_id    text,
-  PRIMARY KEY ((shard), received_minute, ballot_id)
-) WITH CLUSTERING ORDER BY (received_minute ASC, ballot_id ASC);
+  revote          blob,
+  PRIMARY KEY ((shard), received_minute, seq, ballot_id)
+) WITH CLUSTERING ORDER BY (received_minute ASC, seq ASC, ballot_id ASC);
 
 -- 封印済みブロック（公開データ）。書き込みは INSERT ... IF NOT EXISTS。
--- ballots: ballot_id のハッシュ昇順に並んだ票 (ballot_id, contest_id, candidate_id)。
+-- ballots: ballot_id のハッシュ昇順に並んだ票 (ballot_id, contest_id, candidate_id, revote)。
 -- contest_id / candidate_id は文字列の ID（例: `2026-general/shugiin_smd.13.01` / `shugiin_smd.13.01.c3`。
--- 形式は domain::ids）。ブロックの形式の版 2（旧版は int）。
+-- 形式は domain::ids）。revote は再投票のつながりの正規化バイト列（無ければ空の 0x。cqlsh が tuple の中の NULL の blob を
+-- 表示できないため）。ブロックの形式の版 3（ADR 0022）。
+-- 再投票に対応する前のスキーマ（3 要素の tuple・ballot_pool に seq が無い）は、ALTER TABLE では直せないので、
+-- scripts/db_reset.sh --all で作り直す（api / sealer は接続時に検出して、手順つきで起動を拒否する）。
 -- 最新のブロックを LIMIT 1 で引けるよう、height の降順で持つ。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.blocks (
   shard            int,
@@ -58,7 +81,7 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.blocks (
   sealed_at_minute bigint,
   block_hash       blob,
   signature        blob,
-  ballots          list<frozen<tuple<blob, text, text>>>,
+  ballots          list<frozen<tuple<blob, text, text, blob>>>,
   PRIMARY KEY ((shard), height)
 ) WITH CLUSTERING ORDER BY (height DESC);
 
@@ -135,10 +158,8 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.cluster_config (
 -- opens_at / closes_at は UNIX 秒（NULL なら無期限・未指定）。opened_at は open に遷移した時刻
 -- （封印の経過時間の起点 = 投票開始時刻に使う。原則9。scheduled の間は NULL）。closing_started_at は
 -- closing に遷移した時刻（締切の手続きの待ち時間の起点。closing 以外では NULL）。
--- allow_blank は、open に遷移した時点で固定した選挙のルール（白票の可否。設定 vote.allow_blank。原則19）。
--- open への遷移と同じ LWT で書き、以降は変えない（scheduled の間は NULL）。
--- この列を追加する前に作ったキースペースは、ALTER TABLE <keyspace>.election_state ADD allow_blank boolean; を
--- 一度だけ実行するか、scripts/db_reset.sh --all で作り直す（CREATE TABLE IF NOT EXISTS は、既存の表に列を足さない）。
+-- allow_blank / allow_revote / max_revotes は、open に遷移した時点で固定した選挙のルール（白票の可否・再投票の可否と
+-- 上限。設定 vote.*。原則19）。open への遷移と同じ LWT で書き、以降は変えない（scheduled の間は NULL）。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_state (
   scope              text,
   phase              text,
@@ -147,11 +168,15 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_state (
   opened_at          bigint,
   closing_started_at bigint,
   allow_blank        boolean,
+  allow_revote       boolean,
+  max_revotes        int,
   PRIMARY KEY (scope)
 );
 
 -- 選挙状態の変更ログ（原則17: 変更のたびに、日時・変更前・変更後・実行した主体を記録する）。
 -- id は、同じ秒に複数回変更されても行が競合しないための乱数（票とは無関係）。
+-- event: 記録の種類。transition（状態の遷移）/ revote_key_destroyed（締切の手続きの中で revote_key を破棄した。
+--   from_phase = to_phase = そのときの状態。ADR 0022）。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_audit (
   scope        text,
   at_unix_secs bigint,
@@ -159,5 +184,6 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_audit (
   from_phase   text,
   to_phase     text,
   actor        text,
+  event        text,
   PRIMARY KEY ((scope), at_unix_secs, id)
 ) WITH CLUSTERING ORDER BY (at_unix_secs DESC, id DESC);

@@ -13,12 +13,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application::{ElectionStateSnapshot, ElectionStateStore, LeaseStore, StoreError};
+use application::{
+    ElectionStateSnapshot, ElectionStateStore, LeaseStore, RevoteKeyVault, StoreError,
+};
 use domain::{
     Anchor, ElectionPhase, ElectionRules, ShardId, automatic_transition, voting_started_at,
 };
 
 use crate::clock::MonotonicClock;
+use crate::revote_key::destroy_revote_key;
 use crate::schedule::AnchorSchedule;
 use crate::sealer::{FinalAnchor, SealEvent, Sealer, SealerError};
 
@@ -75,6 +78,8 @@ pub struct Coordinator {
     rules: ElectionRules,
     /// closing を検知してからの、締切の手続きの期限（単調時計）。アンカー担当のときだけ使う。
     closing_deadline: Option<Duration>,
+    /// 締切の手続きの中で破棄する、再投票の鍵（ADR 0022）。既定は鍵なし（[`Coordinator::with_revote_keys`]）。
+    revote_keys: Arc<RevoteKeyVault>,
 }
 
 impl Coordinator {
@@ -110,7 +115,14 @@ impl Coordinator {
             election_grace,
             rules,
             closing_deadline: None,
+            revote_keys: Arc::new(RevoteKeyVault::none()),
         }
+    }
+
+    /// 締切の手続きの中で破棄する、再投票の鍵の置き場所（`secrets/revote_key`）。
+    pub fn with_revote_keys(mut self, revote_keys: Arc<RevoteKeyVault>) -> Self {
+        self.revote_keys = revote_keys;
+        self
     }
 
     /// 今保持しているシャード（昇順）。
@@ -397,6 +409,22 @@ impl Coordinator {
                     .closing_deadline
                     .get_or_insert_with(|| now + self.election_grace);
                 if now < deadline {
+                    return;
+                }
+                // 投票の受け付けが止まった（待ち時間が過ぎた）ので、再投票の鍵を破棄する（ADR 0022）。
+                // 失敗したら closed に進めない（次の周期で再試行）。
+                let frozen = ElectionRules::effective(snapshot.rules, self.rules);
+                if let Err(e) = destroy_revote_key(
+                    &self.revote_keys,
+                    self.election.as_ref(),
+                    frozen,
+                    ElectionPhase::Closing,
+                    &actor,
+                    wall_now,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "再投票の鍵の破棄に失敗しました");
                     return;
                 }
                 match self.sealer.total_pending().await {

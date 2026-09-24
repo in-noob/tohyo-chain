@@ -3,8 +3,8 @@
 #
 #   scripts/db_reset.sh [--votes|--all] [--yes]
 #
-#   --votes（既定）  投票済み記録（participation）・票のプール（ballot_pool）・ブロック（blocks）・アンカー（anchors）・
-#                    リース（sealer_lease）を削除する。選挙の定義（cluster_config・signer_keys）と、認証情報
+#   --votes（既定）  投票済み記録（participation）・再投票の状態（slot_state）・票のプール（ballot_pool）・ブロック（blocks）・
+#                    アンカー（anchors）・リース（sealer_lease）を削除する。選挙の定義（cluster_config・signer_keys）と、認証情報
 #                    （credentials・voter_roll・voter_registry）は残す。
 #   --all            キースペースを削除して、docs/schema.cql から作り直す（認証情報も消える）。
 #   --yes            確認を省略する。
@@ -101,7 +101,7 @@ table_count() {
     echo "${out:-なし}"
 }
 
-VOTE_TABLES=(participation ballot_pool blocks anchors sealer_lease)
+VOTE_TABLES=(participation slot_state ballot_pool blocks anchors sealer_lease)
 # election_state / election_audit（原則17）は投票データではなく選挙の状態なので、--votes では残す
 # （closed のまま票だけ消しても、再投票はできない。状態を scheduled からやり直すには --all を使う）。
 KEEP_TABLES=(credentials voter_roll voter_registry cluster_config signer_keys election_state election_audit)

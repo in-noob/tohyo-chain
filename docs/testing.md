@@ -5,11 +5,11 @@
 
 ```
 scripts/lib/common.sh      共通関数（設定 / DB / 専用キースペース / 選挙データ / 起動・停止・待ち合わせ / アサーション）
-scripts/check/core.sh      起動・設定・封印ポリシーの単体テスト・性能計測ツール・白票（API・封印・集計）
-scripts/check/chain.sh     ハッシュチェーン（封印・DB永続化・複数sealer・「更新がなければ追加しない」・集計・ビューア）
+scripts/check/core.sh      起動・設定・封印ポリシーの単体テスト・性能計測ツール・白票・再投票（API・封印・集計。memory）
+scripts/check/chain.sh     ハッシュチェーン（封印・DB永続化・複数sealer・「更新がなければ追加しない」・集計・ビューア・再投票（DB））
 scripts/check/election.sh  投票フローと選挙データ（投票・名簿・大規模データ・壊れたデータの検出・投票順）・選挙状態の遷移
 scripts/check/auth.sh      ID・パスワードの事前登録（credgen）・DB 認証・DB のリセット
-scripts/check/web.sh       画面（flow・wasm ビルド・デザイントークン・ダークモード・白票の選択肢）
+scripts/check/web.sh       画面（flow・wasm ビルド・デザイントークン・ダークモード・白票の選択肢・投票のやり直し）
 scripts/check/docs.sh      呼び名・環境変数名の一貫性、スクリプトの構文（コード・設定・ドキュメントの照合）
 scripts/check_all.sh       6 つのスイートを順番に実行し、成功・失敗と所要時間の表を表示する
 ```
@@ -191,6 +191,24 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 削除した確認: `verifier` の単体テスト `a_vote_for_someone_outside_the_contest_is_a_blank_ballot`（「投票用紙の候補者ではない票を
 白票として数える」。白票の意味が変わり、そのような票は集計を中止するようになった。代わりに
 `a_vote_for_someone_outside_the_contest_stops_the_tally`）。
+
+## 追記: 再投票（ADR 0022）
+
+投票期間中の再投票（`vote.allow_revote` / `vote.max_revotes`。slot・seq・supersedes と、締切での `revote_key` の破棄）に合わせて、
+次を追加した。
+
+| 項目 | 新 |
+|---|---|
+| 再投票の単体テスト（必須 12 件: 版 3 の正規化エンコード・slot ごとの最後の票・欠番/重複/上限の検出・slot の HMAC の既知ベクタ・seq とつながり・memory ストアの比較更新・api の統合テスト 3 件（A→B→白票・同時の再投票・締切前の非公開）・締切の手続きでの鍵の破棄・verifier の集計と突合） | core.sh#11 |
+| memory モード: A → B → 白票（201）・再投票を明示しない 2 回目は 409 `already_voted`・上限を超えると 409 `revote_limit_reached`・状況に前回の投票内容が出ない・同時の再投票は 201 と 409 `revote_conflict`・`close --now` → 締切後は `secrets/revote_key` が存在しない（`election_audit` に `revote_key_destroyed`）・鍵の値がログに出ない・verify OK・tally は最後の票だけ（白票 1）と `revotes.csv` の A→B・B→白票・`vote.allow_revote=false` では 2 回目が 409 で slot を記録しない | core.sh#11 |
+| DB（Cassandra）: A → B → 白票・上限・同時の再投票（participation の LWT）・participation と slot_state の行数と seq・締切前（`reveal_ballots=after_close`）のブロックに candidate / supersedes / slot が無く、`cast` も返さず、verify は 4 → 締切（時刻）→ sealer が鍵を破棄（ファイルが無い・監査ログに 1 行）・鍵の値がログに出ない → verify OK・tally は最後の票だけ・変更の内訳 3 件・ビューアの置き換えのリンク・締切後の再投票は 403 | chain.sh#9（新規） |
+| 画面: 完了画面の「投票をやり直す」（全部投票済み・期間内だけ）・固定の順番の一覧・上限の投票用紙は選べず理由を表示・確認画面の `labels.revote_confirm`・見た票の数を添えて送る・409 のコードの区別・ビューアのリンク（`web::flow` / `web::error` / `web::chain` の必須テスト 7 件と、画面のコードが設定の文言と flow の判定を使い、候補者の情報を出さないこと） | web.sh#5（新規） |
+| `db_reset.sh --votes` の対象に `slot_state` を追加 | auth.sh#1 |
+
+画面をブラウザで操作する確認は、ほかの画面と同じく手動（`docs/manual_check_step5.md` の「投票のやり直し」）。
+
+変更した確認: chain.sh#6 の改ざん（cqlsh の出力から票の tuple を取り出して書き換える）を、票の tuple の 4 つ目の要素（`revote`。
+再投票の無い選挙では `null`）に合わせた。`reconciliation.csv` の列に「うち再投票」を足したので、列番号を合わせた。
 
 ## 再編前後の所要時間
 

@@ -195,7 +195,10 @@ impl World {
             // 締切のフラッシュは no-op）。原則17 のテストは、別途 `store.ensure_initialized` を呼ぶ。
             self.store.clone(),
             election_grace,
-            ElectionRules { allow_blank: true },
+            ElectionRules {
+                allow_blank: true,
+                ..ElectionRules::default()
+            },
         )
     }
 
@@ -212,6 +215,7 @@ impl World {
                 contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
                 candidate_id: CandidateId::parse(&format!("shugiin_smd.13.01.c{}", 1 + i % 4))
                     .expect("valid"),
+                revote: None,
             };
             let voter = VoterId::new(&format!("voter-{shard}-{i}")).expect("valid");
             self.store
@@ -795,9 +799,18 @@ fn the_anchor_lease_name_is_stable() {
 #[tokio::test]
 async fn election_lifecycle_is_driven_by_the_anchor_holder_and_flushed_by_both() {
     let w = world(2);
+    // 再投票の鍵（ADR 0022）。両方の sealer が同じファイルを指す（同じホストの secrets/）。
+    let key_dir =
+        std::env::temp_dir().join(format!("coordinator-revote-key-{}", std::process::id()));
+    std::fs::create_dir_all(&key_dir).expect("dir");
+    let key_path = key_dir.join(application::REVOTE_KEY_FILE);
+    std::fs::write(&key_path, "ab".repeat(32)).expect("write key");
+    let vault = || Arc::new(application::RevoteKeyVault::load(&key_path).expect("load key"));
     let (mut a, mut b) = (
-        w.coordinator_with_grace("sealer-a", S(600), S(2)),
-        w.coordinator_with_grace("sealer-b", S(600), S(2)),
+        w.coordinator_with_grace("sealer-a", S(600), S(2))
+            .with_revote_keys(vault()),
+        w.coordinator_with_grace("sealer-b", S(600), S(2))
+            .with_revote_keys(vault()),
     );
     for _ in 0..2 {
         a.step().await;
@@ -866,6 +879,10 @@ async fn election_lifecycle_is_driven_by_the_anchor_holder_and_flushed_by_both()
         ElectionPhase::Closing,
         "猶予が経つ前に closed になってはいけません"
     );
+    assert!(
+        key_path.exists(),
+        "猶予が経つ前（受け付け中の投票があり得る）は、鍵を消さない"
+    );
 
     w.advance(S(2));
     holder.step().await;
@@ -873,9 +890,22 @@ async fn election_lifecycle_is_driven_by_the_anchor_holder_and_flushed_by_both()
         w.store.get().await.expect("state").phase,
         ElectionPhase::Closed
     );
+    // 締切の手続きの中で、鍵をファイルごと破棄し、1 回だけ記録した。
+    assert!(!key_path.exists(), "締切後は revote_key が存在しない");
+    other.step().await;
+    holder.step().await;
 
     let audit = w.store.recent_audit(10).await.expect("audit");
-    assert_eq!(audit.len(), 3, "{audit:?}");
+    assert_eq!(audit.len(), 4, "{audit:?}");
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|e| e.event == application::AuditEvent::RevoteKeyDestroyed)
+            .map(|e| (e.from, e.to))
+            .collect::<Vec<_>>(),
+        vec![(ElectionPhase::Closing, ElectionPhase::Closing)]
+    );
+    std::fs::remove_dir_all(&key_dir).expect("cleanup");
     assert!(
         audit.iter().all(|e| e.actor.starts_with("sealer:")),
         "{audit:?}"

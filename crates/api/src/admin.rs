@@ -98,6 +98,8 @@ struct AuditEntryDto {
     from: String,
     to: String,
     actor: String,
+    /// `transition`（状態の遷移）/ `revote_key_destroyed`（締切の手続きの中で、再投票の鍵を破棄した。ADR 0022）。
+    event: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +154,7 @@ async fn election_status(
             from: e.from.as_str().to_string(),
             to: e.to.as_str().to_string(),
             actor: e.actor,
+            event: e.event.as_str().to_string(),
         })
         .collect();
     Ok(ElectionStatus {

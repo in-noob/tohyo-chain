@@ -58,9 +58,9 @@ mod tests {
     #[test]
     fn statements_are_split_and_fully_qualified() {
         let stmts = statements("ks_x");
-        // キースペース 1 + テーブル 12（participation, ballot_pool, blocks, sealer_lease, anchors, signer_keys,
-        // credentials, voter_roll, voter_registry, cluster_config, election_state, election_audit）
-        assert_eq!(stmts.len(), 13, "{stmts:#?}");
+        // キースペース 1 + テーブル 13（participation, slot_state, ballot_pool, blocks, sealer_lease, anchors,
+        // signer_keys, credentials, voter_roll, voter_registry, cluster_config, election_state, election_audit）
+        assert_eq!(stmts.len(), 14, "{stmts:#?}");
         assert!(stmts[0].starts_with("CREATE KEYSPACE IF NOT EXISTS ks_x"));
         for stmt in &stmts[1..] {
             assert!(

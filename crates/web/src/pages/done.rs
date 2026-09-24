@@ -14,6 +14,9 @@ use crate::flow::{self, Continue, Route as Page};
 /// 封印後の改ざん検証の結果とは無関係で、「封印済み」「検証済み」を意味しない。
 /// 秘密投票のため、候補者名・ballot_id・投票用紙の名前などは一切表示しない。
 /// ボタンは次の操作のための案内であり、投票内容を示さない。
+///
+/// 再投票を認める選挙で、すべての投票用紙に投票済みで、投票期間内なら、「投票をやり直す」（`labels.revote_button`）も
+/// 出す（ADR 0022。`flow::can_revote`）。
 #[component]
 pub fn DonePage() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -30,6 +33,20 @@ pub fn DonePage() -> impl IntoView {
         |next| flow::continue_label(next, crate::labels::ballot_item()),
     );
 
+    // やり直し: すべて投票済みで、再投票を受け付けているときだけ。
+    let revote = state.ballots.with_untracked(|ballots| {
+        ballots.as_deref().is_some_and(|list| {
+            state
+                .revote
+                .with_untracked(|r| flow::can_revote(list, r.as_ref()))
+        })
+    });
+    let navigate_revote = navigate.clone();
+    let on_revote = move |_| {
+        state.last_voted.set(None);
+        navigate_revote(&Page::Revote.path(), replace());
+    };
+
     let on_continue = move |_| {
         state.last_voted.set(None);
         match &next {
@@ -45,7 +62,12 @@ pub fn DonePage() -> impl IntoView {
     view! {
         <section class="done">
             <h1 class="done-message" role="status">{crate::labels::done_message()}</h1>
-            <button on:click=on_continue>{label}</button>
+            <div class="actions">
+                {revote.then(|| view! {
+                    <button class="secondary" on:click=on_revote>{crate::labels::revote_button()}</button>
+                })}
+                <button on:click=on_continue>{label}</button>
+            </div>
         </section>
     }
 }

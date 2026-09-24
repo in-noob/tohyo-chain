@@ -55,14 +55,39 @@ impl fmt::Display for ElectionPhase {
 /// 選挙のルール（原則19）。open に遷移する時点で、遷移させたプロセスの設定の値を選挙状態に保存し（固定し）、
 /// それ以降は変更しない（設定ファイルを書き換えて再起動しても、保存した値を使う）。
 ///
-/// 今あるのは白票の可否（設定 `vote.allow_blank`）だけ。再投票の可否・上限、封印ルールの固定は未実装。
+/// 今あるのは白票の可否（設定 `vote.allow_blank`）と、再投票の可否・上限（`vote.allow_revote` / `vote.max_revotes`）。
+/// 封印ルールの固定は未実装。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElectionRules {
     /// 白票（どの候補者にも投票しない）を受け付けるか。
     pub allow_blank: bool,
+    /// 投票期間中の再投票（同じ投票用紙に投票し直すこと）を認めるか。偽なら、2 回目の投票は拒否し、票に slot を記録しない。
+    pub allow_revote: bool,
+    /// 再投票の上限回数（初回の投票を含めない）。1 つの slot の票は、最大 `max_revotes + 1` 件。
+    pub max_revotes: u32,
+}
+
+/// 既定値は、`config/default.toml` の `vote.*` と同じ。
+impl Default for ElectionRules {
+    fn default() -> Self {
+        Self {
+            allow_blank: true,
+            allow_revote: false,
+            max_revotes: 5,
+        }
+    }
 }
 
 impl ElectionRules {
+    /// 1 つの slot に許される票の最大の `seq`（再投票を認めないなら 1）。
+    pub fn max_seq(&self) -> u32 {
+        if self.allow_revote {
+            self.max_revotes.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
     /// 実際に使うルール: open の時点で固定した値（`frozen`）があればそれ、無ければ（open の前、または
     /// ルールを記録する前の版で open にした選挙なら）このプロセスの設定の値（`configured`）。
     pub fn effective(frozen: Option<Self>, configured: Self) -> Self {
@@ -150,14 +175,40 @@ mod tests {
 
     #[test]
     fn frozen_rules_win_over_the_configured_ones() {
-        let on = ElectionRules { allow_blank: true };
-        let off = ElectionRules { allow_blank: false };
+        let on = ElectionRules {
+            allow_blank: true,
+            allow_revote: true,
+            max_revotes: 3,
+        };
+        let off = ElectionRules {
+            allow_blank: false,
+            ..ElectionRules::default()
+        };
         // open の前（固定前）は設定の値。
         assert_eq!(ElectionRules::effective(None, off), off);
         assert_eq!(ElectionRules::effective(None, on), on);
         // 固定した後は、設定を変えても固定した値。
         assert_eq!(ElectionRules::effective(Some(on), off), on);
         assert_eq!(ElectionRules::effective(Some(off), on), off);
+    }
+
+    #[test]
+    fn the_maximum_seq_counts_the_first_vote_and_is_one_without_revotes() {
+        let rules = ElectionRules {
+            allow_revote: true,
+            max_revotes: 5,
+            ..ElectionRules::default()
+        };
+        assert_eq!(rules.max_seq(), 6);
+        assert_eq!(ElectionRules::default().max_seq(), 1);
+        assert_eq!(
+            ElectionRules {
+                max_revotes: u32::MAX,
+                ..rules
+            }
+            .max_seq(),
+            u32::MAX
+        );
     }
 
     #[test]

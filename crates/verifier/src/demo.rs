@@ -41,6 +41,7 @@ fn dummy_ballots(total: usize) -> Vec<Ballot> {
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
             candidate_id: CandidateId::parse(&format!("shugiin_smd.13.01.c{}", i % 5 + 1))
                 .expect("valid"),
+            revote: None,
         })
         .collect()
 }

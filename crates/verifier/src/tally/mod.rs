@@ -32,6 +32,8 @@ pub struct ReconRow {
     pub contest_id: String,
     pub participation: u64,
     pub sealed: u64,
+    /// 封印済みの再投票の票（`seq > 1`）の数。`sealed - sealed_revotes` が、封印済みの slot の数。
+    pub sealed_revotes: u64,
     pub pending: u64,
     pub consistent: bool,
 }
@@ -60,6 +62,7 @@ impl Reconciliation {
                     contest_id: r.contest_id.clone(),
                     participation: r.participation,
                     sealed: r.sealed,
+                    sealed_revotes: r.sealed_revotes,
                     pending: r.pending,
                     consistent: r.is_consistent(),
                 })

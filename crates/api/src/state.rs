@@ -8,10 +8,11 @@ use app_config::{AuthMode, DisplayTimezone, Secret};
 pub use application::SystemClock;
 use application::{
     Authenticator, ChainRead, Clock, DbAuthenticator, ElectionStateStore, RandomBallotIds,
-    SealStore, SessionSigner, StubAuthenticator, VoteStore, VoterRoll, VotingService,
+    RevoteKeyVault, SealStore, SessionSigner, StubAuthenticator, VoteStore, VoterRoll,
+    VotingService,
 };
 use domain::election::Election;
-use domain::{Ed25519Signer, ElectionRules};
+use domain::{Ed25519Signer, ElectionPhase, ElectionRules};
 use infra_memory::{InMemoryStore, StaticElectionRepository, StaticVoterRoll};
 use infra_scylla::{ScyllaConfig, ScyllaStore};
 use sealer::{MonotonicClock, Sealer};
@@ -41,7 +42,10 @@ pub struct AppState {
     pub election_state: Arc<dyn ElectionStateStore>,
     /// 選挙状態の短期キャッシュ（原則18: 投票の受け付けの判定に使う）。
     pub election_gate: ElectionGate,
-    /// このプロセスの設定の選挙のルール（`vote.allow_blank`）。open に遷移させるときに固定する値。
+    /// 再投票の鍵（`secrets/revote_key`。ADR 0022）。slot の計算に使い、closing 以降は捨てる。memory モードでは、
+    /// 内蔵のスケジューラが締切の手続きの中でファイルごと破棄する（同じものを渡す）。
+    pub revote_keys: Arc<RevoteKeyVault>,
+    /// このプロセスの設定の選挙のルール（`vote.*`）。open に遷移させるときに固定する値。
     /// 固定した後は、選挙状態に保存した値が優先する（[`AppState::rules`]。原則19）。
     pub configured_rules: ElectionRules,
     /// 画面に表示するタイムゾーン（`election.display_timezone`）。
@@ -69,6 +73,8 @@ pub struct ApiLabels {
     pub voting_closed_message: String,
     /// 白票の呼び名（`labels.blank_name`）。白票を受け付けない選挙で、白票が指定されたときのメッセージに使う。
     pub blank_name: String,
+    /// 再投票の上限に達したときのメッセージ（`labels.revote_limit_reached`。`{max}` は上限回数）。
+    pub revote_limit_reached: String,
 }
 
 impl AppState {
@@ -87,6 +93,7 @@ impl Default for ApiLabels {
                 .to_string(),
             voting_closed_message: "投票の受付は終了しました".to_string(),
             blank_name: "白票".to_string(),
+            revote_limit_reached: "やり直しの上限（{max}回）に達しています".to_string(),
         }
     }
 }
@@ -263,6 +270,23 @@ pub async fn build(
             ),
         };
 
+    // 再投票の鍵（ADR 0022）。再投票を認める選挙（固定前は設定の値）で、まだ締切の手続きに入っていなければ必須。
+    let revote_keys = Arc::new(match &config.revote_key_path {
+        Some(path) => RevoteKeyVault::load(path)
+            .with_context(|| format!("再投票の鍵 {} を読めません", path.display()))?,
+        None => RevoteKeyVault::none(),
+    });
+    let rules = ElectionRules::effective(election_snapshot.rules, config.rules);
+    if election_snapshot.phase >= ElectionPhase::Closing {
+        // 締切後は使わない（ファイルの破棄は、締切の手続きを行うプロセスの役目）。
+        revote_keys.forget();
+    } else if rules.allow_revote && !revote_keys.has_key() {
+        anyhow::bail!(
+            "vote.allow_revote=true には、再投票の鍵 secrets/revote_key（64 桁の hex。APP_SECRETS_DIR の下）が必要です\
+             （環境変数では渡せません。締切の手続きで、ファイルごと破棄するため）"
+        );
+    }
+
     let election = Arc::new(election);
     let voting = VotingService::new(
         Arc::new(StaticElectionRepository::new(Election::clone(&election))),
@@ -270,8 +294,10 @@ pub async fn build(
         votes,
         Arc::new(RandomBallotIds),
         config.shard_count,
+        revote_keys.clone(),
     );
-    let election_gate = ElectionGate::new(election_state.clone(), config.state_cache_secs);
+    let election_gate = ElectionGate::new(election_state.clone(), config.state_cache_secs)
+        .with_revote_keys(revote_keys.clone());
     let state = Arc::new(AppState {
         auth,
         sessions,
@@ -284,6 +310,7 @@ pub async fn build(
         labels: config.labels.clone(),
         election_state,
         election_gate,
+        revote_keys,
         configured_rules: config.rules,
         display_timezone: config.display_timezone,
         admin_token: config.admin_token.clone(),

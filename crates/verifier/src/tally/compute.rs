@@ -10,7 +10,7 @@ use domain::ids::prefecture_name;
 use domain::{CandidateCode, CandidateId, ContestId};
 use serde::Serialize;
 
-use crate::verify::{ContestRow, ShardReport};
+use crate::verify::{ContestRow, RevoteSummary, ShardReport};
 
 /// 集計できない理由（チェーンと選挙データの食い違い）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -85,24 +85,33 @@ pub struct Tally {
 
 /// 検証済みのシャードの票を、選挙マスタに従って集計する。
 ///
-/// `rows` は突合の行（participation の出所）。チェーンに、選挙マスタに無い投票用紙の票や、投票用紙の候補者でも
-/// 白票でもない票があれば `Err`（集計しない）。
+/// `rows` は突合の行（participation の出所）。`revotes` は、再投票のつながりの検証結果（再投票の票は、slot ごとに
+/// 最後の票だけを数える。ADR 0022）。チェーンに、選挙マスタに無い投票用紙の票や、投票用紙の候補者でも白票でもない票が
+/// あれば `Err`（集計しない）。
 pub fn compute(
     election: &Election,
     reports: &[&ShardReport],
     rows: &[ContestRow],
+    revotes: &RevoteSummary,
 ) -> Result<Tally, TallyError> {
     // シャードをまたいで、投票用紙・候補者ごとの票数を合算する（借用だけ。票のデータはコピーしない）。
+    // 再投票のつながりを持たない票（`votes`）と、slot ごとの最後の票（`finals`）。
     let mut votes: HashMap<&ContestId, BTreeMap<&CandidateId, u64>> = HashMap::new();
-    for report in reports {
-        for (contest, per_candidate) in &report.votes {
-            if election.contest(contest).is_none() {
-                return Err(TallyError::UnknownContest(contest.to_string()));
-            }
-            let merged = votes.entry(contest).or_default();
-            for (candidate, n) in per_candidate {
-                *merged.entry(candidate).or_default() += n;
-            }
+    let finals = revotes
+        .contests
+        .iter()
+        .map(|(contest, r)| (contest, &r.finals));
+    for (contest, per_candidate) in reports
+        .iter()
+        .flat_map(|report| report.votes.iter())
+        .chain(finals)
+    {
+        if election.contest(contest).is_none() {
+            return Err(TallyError::UnknownContest(contest.to_string()));
+        }
+        let merged = votes.entry(contest).or_default();
+        for (candidate, n) in per_candidate {
+            *merged.entry(candidate).or_default() += n;
         }
     }
     let participation: HashMap<&str, u64> = rows
@@ -240,6 +249,87 @@ fn type_totals(election: &Election, districts: &[DistrictTally]) -> Vec<GroupTot
     groups
 }
 
+/// 再投票の変更の内訳の 1 行（前の票の投票先 → 次の票の投票先）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RevoteChange {
+    pub from_candidate_id: String,
+    /// 表示名（白票は `None`。表示では、設定の白票の呼び名にする）。
+    pub from_name: Option<String>,
+    pub to_candidate_id: String,
+    pub to_name: Option<String>,
+    pub count: u64,
+}
+
+/// 投票用紙 1 枚の、再投票の件数と変更の内訳。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContestRevoteReport {
+    pub contest_id: String,
+    pub name: String,
+    pub type_name: String,
+    /// 再投票の件数（置き換えの数）。
+    pub revotes: u64,
+    /// 多い順（同数なら、変更前・変更後の ID の順）。
+    pub changes: Vec<RevoteChange>,
+}
+
+/// 再投票の件数と変更の内訳（締切後の集計だけで出力する）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RevoteReport {
+    /// slot の数（投票した有権者の数。重複を除く）。
+    pub slots: usize,
+    pub revotes: u64,
+    /// 再投票があった投票用紙だけ。表示順（選挙の種類の順、次に選挙区の順）。
+    pub contests: Vec<ContestRevoteReport>,
+}
+
+/// 再投票の検証結果に、選挙データの表示名を付ける。
+pub fn revote_report(election: &Election, summary: &RevoteSummary) -> RevoteReport {
+    let mut contests = Vec::new();
+    for contest in election.contests() {
+        let Some(r) = summary.contests.get(&contest.id).filter(|r| r.revotes > 0) else {
+            continue;
+        };
+        let name_of = |id: &CandidateId| match id {
+            CandidateId::Blank => None,
+            CandidateId::Candidate(code) => contest
+                .candidates
+                .iter()
+                .find(|c| &c.id == code)
+                .map(|c| c.name.clone()),
+        };
+        let mut changes: Vec<RevoteChange> = r
+            .changes
+            .iter()
+            .map(|((from, to), count)| RevoteChange {
+                from_candidate_id: from.to_string(),
+                from_name: name_of(from),
+                to_candidate_id: to.to_string(),
+                to_name: name_of(to),
+                count: *count,
+            })
+            .collect();
+        changes.sort_by_key(|c| std::cmp::Reverse(c.count));
+        let type_name = election
+            .election_type(&contest.district.election_type)
+            .map_or_else(
+                || contest.district.election_type.to_string(),
+                |t| t.name.clone(),
+            );
+        contests.push(ContestRevoteReport {
+            contest_id: contest.id.to_string(),
+            name: contest.district.name.clone(),
+            type_name,
+            revotes: r.revotes,
+            changes,
+        });
+    }
+    RevoteReport {
+        slots: summary.slots,
+        revotes: summary.revotes(),
+        contests,
+    }
+}
+
 impl Tally {
     /// 全体の合計（選挙区の合計を足したもの）。
     pub fn grand_total(&self) -> GroupTotal {
@@ -338,7 +428,9 @@ mod tests {
             ballots: 0,
             block_hashes: Vec::new(),
             contests,
+            revotes: BTreeMap::new(),
             votes: v,
+            linked: Vec::new(),
             ballot_ids: Vec::new(),
             public_key: [0; 32],
         }
@@ -349,7 +441,10 @@ mod tests {
             contest_id: format!("e1/{district}"),
             participation,
             sealed,
+            sealed_revotes: 0,
             pending: 0,
+            pending_initial: None,
+            cast: None,
         }
     }
 
@@ -360,7 +455,13 @@ mod tests {
             ("smd.13.01", "smd.13.01.c1", 2),
             ("smd.13.01", "smd.13.01.c3", 5),
         ]);
-        let t = compute(&e, &[&r], &[row("smd.13.01", 7, 7)]).expect("tally");
+        let t = compute(
+            &e,
+            &[&r],
+            &[row("smd.13.01", 7, 7)],
+            &RevoteSummary::default(),
+        )
+        .expect("tally");
         let d = &t.districts[0];
         let order: Vec<(&str, u64)> = d
             .candidates
@@ -380,7 +481,13 @@ mod tests {
             ("smd.13.02", "smd.13.02.c3", 3),
             ("smd.13.02", "smd.13.02.c1", 3),
         ]);
-        let t = compute(&e, &[&r], &[row("smd.13.02", 9, 9)]).expect("tally");
+        let t = compute(
+            &e,
+            &[&r],
+            &[row("smd.13.02", 9, 9)],
+            &RevoteSummary::default(),
+        )
+        .expect("tally");
         let names: Vec<&str> = t.districts[1]
             .candidates
             .iter()
@@ -394,7 +501,13 @@ mod tests {
         let e = election();
         let a = report(&[("smd.13.01", "smd.13.01.c1", 2)]);
         let b = report(&[("smd.13.01", "smd.13.01.c1", 3)]);
-        let t = compute(&e, &[&a, &b], &[row("smd.13.01", 5, 5)]).expect("tally");
+        let t = compute(
+            &e,
+            &[&a, &b],
+            &[row("smd.13.01", 5, 5)],
+            &RevoteSummary::default(),
+        )
+        .expect("tally");
         assert_eq!(t.districts[0].candidates[0].votes, 5);
     }
 
@@ -406,8 +519,13 @@ mod tests {
             ("smd.13.01", "blank", 4),
             ("smd.13.02", "smd.13.02.c2", 2),
         ]);
-        let t =
-            compute(&e, &[&r], &[row("smd.13.01", 5, 5), row("smd.13.02", 2, 2)]).expect("tally");
+        let t = compute(
+            &e,
+            &[&r],
+            &[row("smd.13.01", 5, 5), row("smd.13.02", 2, 2)],
+            &RevoteSummary::default(),
+        )
+        .expect("tally");
         let d = &t.districts[0];
         // 白票は候補者の一覧に入らない（得票数が最多でも、順位の対象にしない）。
         assert!(d.candidates.iter().all(|c| c.candidate_id != "blank"));
@@ -430,7 +548,12 @@ mod tests {
             ("smd.13.01", "smd.13.02.c1", 2),
         ]);
         assert_eq!(
-            compute(&e, &[&r], &[row("smd.13.01", 3, 3)]),
+            compute(
+                &e,
+                &[&r],
+                &[row("smd.13.01", 3, 3)],
+                &RevoteSummary::default()
+            ),
             Err(TallyError::ForeignCandidate {
                 contest: "e1/smd.13.01".to_string(),
                 candidate: "smd.13.02.c1".to_string(),
@@ -448,7 +571,7 @@ mod tests {
             BTreeMap::from([(CandidateId::parse("smd.99.99.c1").expect("c"), 1)]),
         );
         assert_eq!(
-            compute(&e, &[&r], &[]),
+            compute(&e, &[&r], &[], &RevoteSummary::default()),
             Err(TallyError::UnknownContest("e1/smd.99.99".to_string()))
         );
     }
@@ -456,7 +579,7 @@ mod tests {
     #[test]
     fn contests_without_any_vote_are_listed_with_zero() {
         let e = election();
-        let t = compute(&e, &[&report(&[])], &[]).expect("tally");
+        let t = compute(&e, &[&report(&[])], &[], &RevoteSummary::default()).expect("tally");
         assert_eq!(t.districts.len(), 3);
         assert!(t.districts.iter().all(|d| d.total == 0 && d.valid == 0));
         assert_eq!(t.grand_total().total, 0);
@@ -475,7 +598,7 @@ mod tests {
             row("smd.13.02", 3, 3),
             row("sangiin.31_32", 4, 4),
         ];
-        let t = compute(&e, &[&r], &rows).expect("tally");
+        let t = compute(&e, &[&r], &rows, &RevoteSummary::default()).expect("tally");
         let summary: Vec<(&str, bool, u64, u64)> = t
             .prefectures
             .iter()

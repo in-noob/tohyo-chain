@@ -325,3 +325,10 @@ table.ballots tr.blank td { font-style: italic; border-top-style: dashed; }
   .block-detail { grid-template-columns: 1fr; gap: var(--space-1); }
   .block-detail dd { margin-bottom: var(--space-3); }
 }
+
+/* 投票のやり直し（再投票。ADR 0022）。選べない投票用紙は、色だけでなく、無効のボタンと ⚠ つきの理由で示す。 */
+.revote-list li.blocked { color: var(--color-text-muted); border-style: dashed; }
+.revote-list .reason { flex-basis: 100%; color: var(--color-danger); font-size: var(--font-size-sm); font-weight: 600; }
+.confirm.revote { font-weight: 700; border-left: var(--border-width-strong) solid var(--color-accent); padding-left: var(--space-2); }
+/* ビューア: 再投票の票が置き換えた前の票へのリンク（締切後だけ）。 */
+table.ballots a.replaces { font-size: var(--font-size-xs); }

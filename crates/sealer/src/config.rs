@@ -30,8 +30,10 @@ pub struct SealerConfig {
     pub period: Period,
     /// 締切の手続きの待ち時間（`election.state_cache_secs + api.request_timeout_secs`）。
     pub election_grace: Duration,
-    /// open に遷移させるときに固定する選挙のルール（`vote.allow_blank`。原則19）。
+    /// open に遷移させるときに固定する選挙のルール（`vote.*`。原則19）。
     pub rules: ElectionRules,
+    /// 再投票の鍵のファイル（`<secrets>/revote_key`）。締切の手続きの中で破棄する（ADR 0022）。
+    pub revote_key_path: Option<std::path::PathBuf>,
 }
 
 // 署名鍵の種がログに出ないよう、Debug では伏せる。
@@ -46,6 +48,7 @@ impl std::fmt::Debug for SealerConfig {
             .field("sealer_id", &self.sealer_id)
             .field("lease_ttl", &self.lease_ttl)
             .field("rules", &self.rules)
+            .field("revote_key_path", &self.revote_key_path)
             .finish()
     }
 }
@@ -55,7 +58,9 @@ impl SealerConfig {
     pub fn load() -> anyhow::Result<Self> {
         let loaded = app_config::load()?;
         loaded.ensure_supported()?;
-        Self::from_app(&loaded.config)
+        let mut config = Self::from_app(&loaded.config)?;
+        config.revote_key_path = loaded.revote_key_path();
+        Ok(config)
     }
 
     /// 読み込み済みの設定から、sealer の設定を作る。
@@ -107,7 +112,10 @@ impl SealerConfig {
             ),
             rules: ElectionRules {
                 allow_blank: app.vote.allow_blank,
+                allow_revote: app.vote.allow_revote,
+                max_revotes: app.vote.max_revotes,
             },
+            revote_key_path: None,
         })
     }
 }
@@ -134,7 +142,13 @@ mod tests {
         assert_eq!(c.lease_ttl, Duration::from_secs(30));
         assert_eq!(c.signing_seed, [7u8; 32]);
         assert!(c.sealer_id.starts_with("sealer-"), "{}", c.sealer_id);
-        assert_eq!(c.rules, ElectionRules { allow_blank: true });
+        assert_eq!(
+            c.rules,
+            ElectionRules {
+                allow_blank: true,
+                ..ElectionRules::default()
+            }
+        );
     }
 
     #[test]
@@ -157,7 +171,13 @@ mod tests {
         assert_eq!(c.lease_ttl, Duration::from_secs(6));
         assert_eq!(c.nodes.len(), 2);
         assert_eq!(c.keyspace, "vote_test");
-        assert_eq!(c.rules, ElectionRules { allow_blank: false });
+        assert_eq!(
+            c.rules,
+            ElectionRules {
+                allow_blank: false,
+                ..ElectionRules::default()
+            }
+        );
     }
 
     #[test]

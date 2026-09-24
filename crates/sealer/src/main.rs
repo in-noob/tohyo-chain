@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use application::{ElectionStateStore, LeaseStore, SealStore, SystemClock};
+use application::{ElectionStateStore, LeaseStore, RevoteKeyVault, SealStore, SystemClock};
 use domain::Ed25519Signer;
 use infra_scylla::{ScyllaConfig, ScyllaStore};
 use sealer::config::SealerConfig;
@@ -79,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // 再投票の鍵（secrets/revote_key）。締切の手続きの中で、ファイルごと破棄する（ADR 0022）。sealer は slot を計算しない。
+    let revote_keys = Arc::new(match &config.revote_key_path {
+        Some(path) => RevoteKeyVault::load(path).context("secrets/revote_key を読めません")?,
+        None => RevoteKeyVault::none(),
+    });
     let coordinator = Coordinator::new(
         sealer,
         store.clone() as Arc<dyn LeaseStore>,
@@ -92,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
         store as Arc<dyn ElectionStateStore>,
         config.election_grace,
         config.rules,
-    );
+    )
+    .with_revote_keys(revote_keys);
     tracing::info!(
         sealer_id = %config.sealer_id,
         shards = config.shard_count.get(),

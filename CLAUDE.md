@@ -50,6 +50,14 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    再投票のために使う仮名 slot = HMAC(revote_key, election_id||voter_id||contest_id) だけは、
    票と一緒に記録してよい。revote_key は secrets/ で管理し、締切の手続きの中で破棄する。
    前回の投票内容は画面にも API にも返さない。
+   実装（ADR 0022）: vote.allow_revote（既定 false）/ vote.max_revotes（既定 5）。true のときだけ、票に slot・seq（その slot の
+   何番目か）・supersedes（1 つ前の票のハッシュ = domain::ballot_hash）を付け、シャードは hash(slot)（domain::shard_for_slot）で決める。
+   false のときは slot を記録しない（2 回目の投票は 409）。slot の HMAC は各 ID に 2 バイトの長さ接頭辞を付ける（application::RevoteKey）。
+   revote_key は secrets/revote_key（64 桁の hex）にだけ置く（環境変数では渡せない。ログ・DB に出さない。無ければ api は起動しない）。
+   participation は seq（受理した票の数）を持ち、再投票は LWT の比較更新（UPDATE … SET seq = n+1 IF seq = n。n は画面が見た
+   ballots_cast で、API の revote に入れる）。slot_state(slot → seq, last_ballot_hash) はキーが slot（voter_id ではない）。
+   締切の手続きの中で、sealer（memory モードは api 内蔵のスケジューラ）が鍵をファイルごと破棄し、election_audit に
+   revote_key_destroyed を記録する（破棄できなければ closed に進めない）。scripts/check/core.sh#11・chain.sh#9 が確認する。
 2. ballot_id は UUIDv4。UUIDv7 など時刻を含むIDは使用禁止。
 3. 時刻は分単位に丸めて保存する。ブロック内の票は ballot_id のハッシュ順に並べる。
 4. ブロックのハッシュ計算は固定長ビッグエンディアンのバイナリ正規化で行う
@@ -57,6 +65,8 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    ブロックの形式の版 2 から、票の contest_id / candidate_id（文字列 ID）は、2 バイトの固定幅の
    長さ接頭辞つき（ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id。ADR 0013）。
    白票の票は、candidate_id に予約値 "blank" をそのまま入れる（形式の版は変えない。ADR 0021）。
+   版 3 から、再投票のつながりを持つ票だけ、後ろに 0x01 ‖ slot(32) ‖ seq(4)（初回）または
+   0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32) を足す（つながりの無い票は版 2 と同じバイト列。ADR 0022）。
 5. 分離: crates/web は crates/shared-types 以外のワークスペースクレートに依存しない。
    crates/domain は IO・async ランタイム・DBクレートに依存しない。
 6. api はステートレス。セッションは HMAC 署名トークン。サーバメモリに状態を持たない
@@ -99,7 +109,8 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     設定の labels から読む。コード内部の型名や API のパスは contest のまま残す。
     投票用紙 1 枚の呼び名は labels.ballot_item（既定「投票用紙」）、進捗の表示は labels.progress
     （既定「{total}枚中{current}枚目」）。白票は、選択肢が labels.blank_option、確認画面が labels.blank_confirm、
-    集計・ビューア・API のエラーでの呼び名が labels.blank_name（原則20）。画面・API のエラー・集計に、旧来の呼び名（contest を片仮名にした語）は
+    集計・ビューア・API のエラーでの呼び名が labels.blank_name（原則20）。再投票は、完了画面のボタンが labels.revote_button、
+    確認画面が labels.revote_confirm、上限の理由（画面・API のエラー）が labels.revote_limit_reached（{max} は上限回数）。画面・API のエラー・集計に、旧来の呼び名（contest を片仮名にした語）は
     使わない（crates/・config/・seed/・scripts/・README・CLAUDE.md を scripts/check/docs.sh が確認する）。
 13. ID は変更されない文字列コードにする。区割り変更など、将来変わり得る意味を ID に埋め込まない。
     都道府県は JIS X 0401 の2桁コード（01〜47）を使う。
@@ -117,14 +128,19 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     （chain.reveal_ballots で制御する）。
     実装（ADR 0017）: ブロックチェーンのビューア（画面 /chain 以下・API /api/v1/chains・/anchors。ログイン不要）。
     reveal_ballots=after_close（要 election.voting_closes_at）の締切前は、ブロックの詳細に票の中身（ballot_id・
-    contest_id・candidate_id）を返さず、ヘッダーの情報だけを返す（ballots_revealed=false）。締切の判定は api の時計。
+    contest_id・candidate_id・再投票の slot / seq / supersedes）を返さず、ヘッダーの情報だけを返す（ballots_revealed=false）。
+    突合の集計（/api/v1/audit/counts）の cast（再投票を含む票の数）と pending_initial も、締切前は返さない。
+    締切後は、再投票の票に「#<前の票> を置き換え（A→B）」のリンクを出す（ADR 0022）。締切の判定は api の時計。
     Cache-Control: public, max-age=31536000, immutable は、内容が確定した応答だけに付ける（票を返す詳細・before_height が
     先頭 + 1 以下の一覧）。締切前の（票を伏せた）詳細は no-store（締切後に中身が変わるので、immutable にすると CDN が
     票なしの版を保持する）。エラーも no-store。票が非公開の間は、verifier の検証・集計もできない（終了コード 4）。
     scripts/check/chain.sh が確認する（ブラウザでの確認は docs/manual_check_step14.md）。
-    集計は verifier tally（scripts/tally.sh。ADR 0016）: 集計の前に、チェーン全体の検証と投票済み記録との突合を必ず
+    集計は verifier tally（scripts/tally.sh。ADR 0016）: 集計の前に、チェーン全体の検証（再投票のつながり: slot ごとに seq が
+    1 から連続・supersedes が 1 つ前の票のハッシュ・seq が max_revotes+1 以下・allow_revote=false なのに seq>1 の票がない。ADR 0022）と
+    投票済み記録との突合（participation = チェーン内の slot の数（重複を除く）+ 未封印の最初の票）を必ず
     行い、失敗したら集計しない（終了コード 3。投票用紙の候補者でも白票でもない票がチェーンにあるときも 3。白票は候補者とは別に数え、
-    表では候補者の後の別の行、CSV では白票の列に出す。ADR 0021）。未封印の票が残っていたら、件数を表示して中止する（4。残りの票は締切の
+    表では候補者の後の別の行、CSV では白票の列に出す。ADR 0021。再投票は slot ごとに最後の票だけを数え、締切後の集計だけ、
+    再投票の件数と変更の内訳（A→B の件数表。revotes.csv）も出す。ADR 0022）。未封印の票が残っていたら、件数を表示して中止する（4。残りの票は締切の
     手続き（closing）の中でだけ封印されるので、closed を待ってから再実行）。選挙状態が closed より前は --allow-interim が
     なければ集計しない（4。原則18。--allow-interim は app.env=dev のときだけ）。出力は、表と out/tally/{日時（UTC）}/ の CSV・JSON（scripts/check/chain.sh が確認する）。
 15. パスワードは Argon2id でハッシュ化して保存する。平文はログにもDBにも残さない。
@@ -159,6 +175,7 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     closing→closed の締切の手続き）は、アンカーのリースを持つ sealer が行う（memory モードでは api 内蔵の
     スケジューラ）。closing を検知したら、担当（アンカーのリースの有無を問わない）ごとに、持っているシャードを
     直ちにフラッシュする。締切の手続きの待ち時間は election.state_cache_secs + api.request_timeout_secs。
+    待ち時間の後に、再投票の鍵（secrets/revote_key）を破棄し、election_audit に revote_key_destroyed を記録する（ADR 0022）。
     管理用リスナー（admin.bind。既定 127.0.0.1:18081）は公開用のポート（api.port）とは別で、トークン
     （admin.token。秘密情報）が無ければ起動しない。open --now / close --now は 1 段の遷移だけを行い、
     締切の手続き自体は常に上記の自動の仕組みが行う。
@@ -171,11 +188,13 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     選挙状態が closed のときだけ実行できる（app.env=dev のときだけ --allow-interim を許可）。
 19. 選挙のルール（再投票の可否、再投票の上限、封印ルール）は、open に移った時点で固定し、
     それ以降は変更できない。
-    実装（ADR 0021）: 固定しているのは白票の可否（vote.allow_blank）だけ。domain::ElectionRules を、open への遷移と同じ
-    条件付き書き込み（DB は election_state.allow_blank の LWT、memory はプロセス内）で保存し（ElectionStateStore::transition の
+    実装（ADR 0021・0022）: 固定しているのは白票の可否（vote.allow_blank）と、再投票の可否・上限（vote.allow_revote /
+    vote.max_revotes）。domain::ElectionRules を、open への遷移と同じ条件付き書き込み（DB は election_state.allow_blank /
+    allow_revote / max_revotes の LWT、memory はプロセス内）で保存し（ElectionStateStore::transition の
     引数。open 以外の遷移では無視）、以後は ElectionRules::effective で固定した値を使う。固定するのは、open に遷移させた
     プロセス（sealer / api 内蔵のスケジューラ / open --now の api）の設定の値。設定と食い違っていたら起動時に警告する。
-    （封印ルール・再投票ルールの固定は未実装。再投票の可否・上限自体も、この版ではまだ実装していない。）
+    固定したルールは GET /api/v1/election-status の rules で公開する（verifier が再投票のつながりの検証に使う）。
+    （封印ルールの固定は未実装。）
 20. 白票（どの候補者にも投票しない）を選べる。API は candidate_id の予約値 "blank"（小文字の完全一致）を受け付ける。
     実装（ADR 0021）: 候補者の一覧 API は、白票を含めず allow_blank（固定した vote.allow_blank）を返し、画面は真のときだけ
     候補者一覧の最後に白票の選択肢を置く（web::flow::choices）。確認画面は候補者名の型に当てはめず labels.blank_confirm を出す。

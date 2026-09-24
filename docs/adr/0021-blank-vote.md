@@ -61,6 +61,6 @@ ADR 0016（集計）の「白票（無効票）= 選挙区の候補者ではな�
   （API が実行時に返す）。
 
 ## 残っていること
-- 原則19 のうち、再投票の可否・上限と封印ルールの固定は未実装。
-- 既存のキースペースは、`election_state` に `allow_blank` 列が無い。`ALTER TABLE <keyspace>.election_state ADD allow_blank boolean;`
-  を一度実行するか、`scripts/db_reset.sh --all` で作り直す（`CREATE TABLE IF NOT EXISTS` は既存の表に列を足さない）。
+- 原則19 のうち、封印ルールの固定は未実装（再投票の可否・上限の固定は [ADR 0022](0022-revote.md) で実装した）。
+- 既存のキースペースは、`election_state` に `allow_blank` 列が無い。再投票（ADR 0022）で表の形が変わり、`ALTER TABLE` では
+  直せないので、`scripts/db_reset.sh --all` で作り直す（`CREATE TABLE IF NOT EXISTS` は既存の表に列を足さない）。

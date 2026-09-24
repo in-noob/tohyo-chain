@@ -56,6 +56,19 @@ pub struct ElectionStatusResponse {
     pub display_timezone: String,
     /// 表示用タイムゾーンの UTC からのオフセット秒。
     pub display_timezone_offset_secs: i64,
+    /// 実際に使う選挙のルール（open の時点で固定した値。固定前は api の設定の値。原則19）。verifier が、
+    /// 再投票のつながりの検証（`allow_revote`・`max_revotes`）に使う。古い api では省かれる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<ElectionRulesDto>,
+}
+
+/// 選挙のルール（原則19。ADR 0021・0022）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ElectionRulesDto {
+    pub allow_blank: bool,
+    pub allow_revote: bool,
+    /// 再投票の上限回数（初回の投票を含めない）。
+    pub max_revotes: u32,
 }
 
 /// 投票方式。今回実装しているのは、候補者を 1 人選ぶ `single_choice` だけ（将来の拡張に備えて `enum`）。
@@ -78,6 +91,10 @@ pub struct BallotStatusDto {
     pub method: VotingMethod,
     /// ログイン中の有権者が、この投票用紙に投票済みか。
     pub voted: bool,
+    /// この投票用紙に受理された票の数（未投票 0、初回の投票だけなら 1、再投票のたびに 1 増える）。
+    /// 前回の投票内容（投票先）は、画面にも API にも返さない（原則1）。
+    #[serde(default)]
+    pub ballots_cast: u32,
 }
 
 /// `GET /api/v1/ballot-status` のレスポンス。有権者に関係する投票用紙だけが、**表示順**（選挙の種類の順、
@@ -85,6 +102,18 @@ pub struct BallotStatusDto {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BallotStatusResponse {
     pub ballots: Vec<BallotStatusDto>,
+    /// 再投票を認める選挙（固定した `vote.allow_revote` が真）のときだけ入る（ADR 0022）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revote: Option<RevoteStatusDto>,
+}
+
+/// 再投票の条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RevoteStatusDto {
+    /// 再投票の上限回数（初回の投票を含めない）。`ballots_cast` が `max_revotes + 1` に達した投票用紙は、やり直せない。
+    pub max_revotes: u32,
+    /// 今、再投票を受け付けているか（状態が open で、投票期間内。原則18）。
+    pub open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -114,6 +143,12 @@ pub const BLANK_CANDIDATE_ID: &str = "blank";
 pub struct VoteRequest {
     /// 候補者の ID、または白票の予約値 [`BLANK_CANDIDATE_ID`]。
     pub candidate_id: String,
+    /// 再投票（投票済みの投票用紙に、投票し直す）のときだけ指定する。値は、画面が見たこの投票用紙の受理済みの票の数
+    /// （[`BallotStatusDto::ballots_cast`]）で、この値のときだけ再投票する（同時に 2 つ送っても 1 件だけが成功し、
+    /// 残りは 409 `revote_conflict`）。省く（初回の投票）と、投票済みの投票用紙では 409 `already_voted`
+    /// （二重送信で意図せず再投票にならないように、再投票は明示する）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revote: Option<u32>,
 }
 
 /// 投票の受理応答。ballot_id などのレシートは意図的に含めない（買収・強要の証拠になるため）。
@@ -155,6 +190,31 @@ pub struct BallotDto {
     pub candidate_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub party: Option<String>,
+    /// 再投票の仮名 slot（hex）。再投票を認める選挙の票だけ（ADR 0022）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    /// その slot の何番目の票か（1 始まり）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
+    /// 1 つ前の版の票のハッシュ（hex）。初回の投票では省く。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// ビューア向け: この票が置き換えた前の版（API がチェーンから探して付ける。検証には使わない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<ReplacedBallotDto>,
+}
+
+/// 置き換えられた前の版の票（ビューアの「#<前の票> を置き換え（A→B）」のリンク用）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReplacedBallotDto {
+    pub ballot_id: String,
+    /// 前の版の票があるブロックの高さ（同じシャード）。
+    pub height: u64,
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blank: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_name: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -260,10 +320,17 @@ pub struct AnchorDto {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ContestCountsDto {
     pub contest_id: String,
-    /// 投票済みの記録（participation）の件数。
+    /// 投票済みの記録（participation）の件数（= 投票した有権者の数）。
     pub participation: u64,
     /// まだ封印されていない票の件数。
     pub pending: u64,
+    /// 受理した票の数（初回の投票 + 再投票）。票の中身を返さない間（`chain.reveal_ballots=after_close` の締切前）は
+    /// 省く（再投票の件数は、締切後だけ公開する）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast: Option<u64>,
+    /// 未封印の票のうち、有権者の最初の票の件数（再投票の票を除く）。`cast` と同じく、締切前は省く。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_initial: Option<u64>,
 }
 
 /// `GET /api/v1/audit/counts` のレスポンス。投票者や票の中身を含まない集計値のみ。
