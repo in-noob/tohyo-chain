@@ -34,7 +34,7 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | check_step4.sh | clippy/test（--features dev-tools）、起動・ジェネシス確認 | chain.sh#2 |
 | check_step4.sh | 250 票投入 → count トリガーで height=1,2（各 100 件）、time トリガーで height=3（50 件）、以降ブロックが増えない | chain.sh#2 |
 | check_step4.sh | verify OK（blocks=4 ballots=250）、/debug/tamper 後は verify NG | chain.sh#2 |
-| check_step4.sh | 30 票投入 → SIGTERM ではフラッシュしない（ブロックが増えない。ADR 0020 で反転）、ログに投票者 ID が出ない | chain.sh#2 |
+| check_step4.sh | 最小件数未満（9 票）を投入 → SIGTERM ではフラッシュしない（ブロックが増えない。ADR 0020 で反転。30 票だと停止前に時間で封印されうるので 9 票に変更）、ログに投票者 ID が出ない | chain.sh#2 |
 | check_step5.sh | flow モジュールの単体テスト（必須ケース 19 件を含む）、折り返し（wrap-around）が無いことの grep | web.sh#1 |
 | check_step5.sh | flow / error が UI・ブラウザ API に依存しない（原則5） | web.sh#1 |
 | check_step5.sh | wasm 向け clippy | web.sh#1 |
