@@ -483,14 +483,17 @@ check_db_persistence() (
     expect_status 409 "再起動後の再投票"
     echo "再起動後: 未封印の 2 票・投票状況・公開鍵の保持 / 再投票 409: OK"
 
-    # 経過時間の起点は投票開始（起動 1 の時刻。DB の選挙状態に記録）なので、もう 10 秒以上経っている。
-    # 最小件数（10）に達した時点で、すぐに時間で封印される（2 + 8 = 10 票）。
-    for n in $(seq 1 8); do
+    # 経過時間の起点は投票開始（起動 1 で open になった時刻。DB の選挙状態に記録）。9 件（2 + 7）のまま、
+    # 投票開始から 10 秒以上待っても封印されない（最小件数 10 に届かない）。10 件目が届くと、すぐに封印される。
+    for n in $(seq 1 7); do
         [[ "$(inject "$n")" == 201 ]] || fail "投票が 201 ではありません（voter-${n}）"
     done
+    sleep 12
+    if grep -aq 'ブロックを封印しました' "$LOG"; then fail "9 件で封印されました（最小件数は 10）"; fi
+    [[ "$(inject 8)" == 201 ]] || fail "投票が 201 ではありません（voter-8）"
     wait_for_log 'shard=0 height=1 count=10 trigger=time' 3000 "$LOG" \
         || fail "10 件目で、すぐに（投票開始から 10 秒以上経っているので）封印されません"
-    echo "height=1（10 件, trigger=time。起点は DB の投票開始時刻）: OK"
+    echo "9 件は 12 秒待っても封印されない → 10 件目で height=1（10 件, trigger=time。起点は DB の投票開始時刻）: OK"
     head_json
     HEAD1_HASH="$(field block_hash)"
 
