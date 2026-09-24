@@ -1,7 +1,8 @@
 //! インメモリのストア（`VoteStore` / `ChainRead` / `SealStore`）。
 //!
 //! 秘密投票のため、participation と ballot_pool は**別々の構造**で持ち、両者を結ぶキーはない。
-//! - participation: 投票者 → 投票済みの投票用紙の集合。ballot_id・候補者・時刻・到着順を持たない。
+//! - participation: 投票者 → 投票済みの投票用紙と、受理した票の数（`seq`）。ballot_id・候補者・時刻・到着順を持たない。
+//! - slot_state: 再投票の slot → 最後の `seq` と票のハッシュ（再投票を認める選挙だけ。キーは slot）。
 //! - ballot_pool: シャードごとの未封印の票（到着順）。投票者を特定する情報を持たない。
 //!
 //! 封印済みチェーンも同じロックの下で持つので、「ブロック追加 + プールからの削除」を不可分に行える。
@@ -13,18 +14,21 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use application::{
-    CastError, ChainRead, ContestCounts, ElectionAuditEntry, ElectionStateSnapshot,
-    ElectionStateStore, LeaseStore, SealStore, StoreError, VoteStore,
+    AuditEvent, CastError, ChainRead, ContestCounts, ElectionAuditEntry, ElectionStateSnapshot,
+    ElectionStateStore, LeaseStore, SealStore, SlotState, StoreError, VoteStore, VotedContest,
 };
 use async_trait::async_trait;
 use domain::{
     Anchor, Ballot, BallotId, Block, ContestId, ElectionPhase, ElectionRules, Period, ShardId,
-    VoterId,
+    Slot, VoterId, ballot_hash,
 };
 
 #[derive(Default)]
 struct Inner {
-    participation: HashMap<VoterId, HashSet<ContestId>>,
+    /// 投票者 → (投票用紙 → 受理した票の数 `seq`)。ballot_id・候補者・時刻・到着順・slot を持たない。
+    participation: HashMap<VoterId, HashMap<ContestId, u32>>,
+    /// 再投票の状態（slot → 最後の seq と票のハッシュ）。キーは voter_id ではなく slot（ADR 0022）。
+    slot_states: HashMap<Slot, SlotState>,
     /// 添字がシャード番号。未封印の票（到着順）。
     pools: Vec<VecDeque<Ballot>>,
     /// 添字がシャード番号。封印済みブロック（添字が高さ）。
@@ -104,11 +108,11 @@ impl fmt::Debug for InMemoryStore {
 #[async_trait]
 impl VoteStore for InMemoryStore {
     async fn cast(&self, voter: &VoterId, shard: ShardId, ballot: Ballot) -> Result<(), CastError> {
-        // ロックは await をまたがずに保持する。二重投票の判定と 2 つの追加は、
-        // このロックの中で不可分に行われる。
+        // ロックは await をまたがずに保持する。二重投票の判定と追加は、このロックの中で不可分に行われる。
         let mut inner = self.lock();
         let Inner {
             participation,
+            slot_states,
             pools,
             ..
         } = &mut *inner;
@@ -118,25 +122,84 @@ impl VoteStore for InMemoryStore {
             .ok_or(StoreError::InvalidShard)?;
         if participation
             .get(voter)
-            .is_some_and(|voted| voted.contains(&ballot.contest_id))
+            .is_some_and(|voted| voted.contains_key(&ballot.contest_id))
         {
             return Err(CastError::AlreadyVoted);
         }
         participation
             .entry(voter.clone())
             .or_default()
-            .insert(ballot.contest_id.clone());
+            .insert(ballot.contest_id.clone(), 1);
+        if let Some(link) = ballot.revote {
+            slot_states.insert(
+                link.slot,
+                SlotState {
+                    seq: link.seq,
+                    last_ballot_hash: ballot_hash(&ballot),
+                },
+            );
+        }
         pool.push_back(ballot);
         Ok(())
     }
 
-    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<ContestId>, StoreError> {
+    async fn revote(
+        &self,
+        voter: &VoterId,
+        shard: ShardId,
+        ballot: Ballot,
+        prev_seq: u32,
+    ) -> Result<(), CastError> {
+        let link = ballot.revote.ok_or(StoreError::Conflict)?;
+        let mut inner = self.lock();
+        let Inner {
+            participation,
+            slot_states,
+            pools,
+            ..
+        } = &mut *inner;
+        let pool = pools
+            .get_mut(usize::from(shard.0))
+            .ok_or(StoreError::InvalidShard)?;
+        // 条件付き書き込み（seq = prev_seq のときだけ prev_seq + 1 にする）。ロックの中なので、同時に来ても 1 件だけ。
+        let Some(seq) = participation
+            .get_mut(voter)
+            .and_then(|voted| voted.get_mut(&ballot.contest_id))
+            .filter(|seq| **seq == prev_seq)
+        else {
+            return Err(CastError::RevoteConflict);
+        };
+        *seq = link.seq;
+        slot_states.insert(
+            link.slot,
+            SlotState {
+                seq: link.seq,
+                last_ballot_hash: ballot_hash(&ballot),
+            },
+        );
+        pool.push_back(ballot);
+        Ok(())
+    }
+
+    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<VotedContest>, StoreError> {
         let inner = self.lock();
         Ok(inner
             .participation
             .get(voter)
-            .map(|voted| voted.iter().cloned().collect())
+            .map(|voted| {
+                voted
+                    .iter()
+                    .map(|(contest, seq)| VotedContest {
+                        contest: contest.clone(),
+                        ballots: *seq,
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
+    }
+
+    async fn slot_state(&self, slot: &Slot) -> Result<Option<SlotState>, StoreError> {
+        Ok(self.lock().slot_states.get(slot).copied())
     }
 
     async fn pending_by_shard(&self) -> Result<Vec<usize>, StoreError> {
@@ -146,16 +209,22 @@ impl VoteStore for InMemoryStore {
     async fn audit_counts(&self) -> Result<Vec<ContestCounts>, StoreError> {
         let inner = self.lock();
         // participation と票は、それぞれ投票用紙別に数えるだけで、突き合わせない。
-        let mut participation: BTreeMap<ContestId, u64> = BTreeMap::new();
+        let mut participation: BTreeMap<ContestId, (u64, u64)> = BTreeMap::new();
         for voted in inner.participation.values() {
-            for contest in voted {
-                *participation.entry(contest.clone()).or_default() += 1;
+            for (contest, seq) in voted {
+                let entry = participation.entry(contest.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += u64::from(*seq);
             }
         }
-        let mut pending: BTreeMap<ContestId, u64> = BTreeMap::new();
+        let mut pending: BTreeMap<ContestId, (u64, u64)> = BTreeMap::new();
         for pool in &inner.pools {
             for ballot in pool {
-                *pending.entry(ballot.contest_id.clone()).or_default() += 1;
+                let entry = pending.entry(ballot.contest_id.clone()).or_default();
+                entry.0 += 1;
+                if ballot.revote.is_none_or(|link| link.seq <= 1) {
+                    entry.1 += 1;
+                }
             }
         }
         let contests: BTreeSet<ContestId> = participation
@@ -165,10 +234,16 @@ impl VoteStore for InMemoryStore {
             .collect();
         Ok(contests
             .into_iter()
-            .map(|contest| ContestCounts {
-                participation: participation.get(&contest).copied().unwrap_or(0),
-                pending: pending.get(&contest).copied().unwrap_or(0),
-                contest,
+            .map(|contest| {
+                let (participation, cast) = participation.get(&contest).copied().unwrap_or((0, 0));
+                let (pending, pending_initial) = pending.get(&contest).copied().unwrap_or((0, 0));
+                ContestCounts {
+                    participation,
+                    cast,
+                    pending,
+                    pending_initial,
+                    contest,
+                }
             })
             .collect())
     }
@@ -439,9 +514,30 @@ impl ElectionStateStore for InMemoryStore {
                 from,
                 to,
                 actor: actor.to_string(),
+                event: AuditEvent::Transition,
             },
         );
         Ok(true)
+    }
+
+    async fn record_event(
+        &self,
+        event: AuditEvent,
+        phase: ElectionPhase,
+        actor: &str,
+        at_unix_secs: i64,
+    ) -> Result<(), StoreError> {
+        self.lock().election_audit.insert(
+            0,
+            ElectionAuditEntry {
+                at_unix_secs,
+                from: phase,
+                to: phase,
+                actor: actor.to_string(),
+                event,
+            },
+        );
+        Ok(())
     }
 
     async fn recent_audit(&self, limit: usize) -> Result<Vec<ElectionAuditEntry>, StoreError> {
@@ -561,6 +657,7 @@ mod tests {
             ballot_id: BallotId::from_random_bytes([n; 16]),
             contest_id: contest(contest_no),
             candidate_id: candidate(contest_no, candidate_seq),
+            revote: None,
         }
     }
 
@@ -581,7 +678,94 @@ mod tests {
         );
         // 拒否された票はプールに入らない。
         assert_eq!(s.pending_by_shard().await, Ok(vec![0, 1]));
-        assert_eq!(s.voted_contests(&alice).await, Ok(vec![contest(1)]));
+        assert_eq!(contests_of(&s, &alice).await, vec![contest(1)]);
+    }
+
+    /// 投票者が投票済みの投票用紙（昇順）。
+    async fn contests_of(s: &InMemoryStore, v: &VoterId) -> Vec<ContestId> {
+        let mut voted: Vec<ContestId> = s
+            .voted_contests(v)
+            .await
+            .expect("voted")
+            .into_iter()
+            .map(|c| c.contest)
+            .collect();
+        voted.sort();
+        voted
+    }
+
+    /// slot `s` の `seq` 番目の票（`prev` の次の版）。
+    fn linked(n: u8, candidate_seq: u32, s: u8, seq: u32, prev: Option<&Ballot>) -> Ballot {
+        Ballot {
+            revote: Some(domain::RevoteLink {
+                slot: Slot([s; 32]),
+                seq,
+                supersedes: prev.map(ballot_hash),
+            }),
+            ..ballot(n, 1, candidate_seq)
+        }
+    }
+
+    #[tokio::test]
+    async fn revotes_bump_the_seq_only_from_the_expected_value_and_track_the_slot() {
+        let s = store(1);
+        let alice = voter("alice");
+        let first = linked(1, 101, 7, 1, None);
+        s.cast(&alice, ShardId(0), first.clone())
+            .await
+            .expect("cast");
+        assert_eq!(
+            s.slot_state(&Slot([7; 32])).await,
+            Ok(Some(SlotState {
+                seq: 1,
+                last_ballot_hash: ballot_hash(&first)
+            }))
+        );
+        let second = linked(2, 102, 7, 2, Some(&first));
+        s.revote(&alice, ShardId(0), second.clone(), 1)
+            .await
+            .expect("revote");
+        // 同じ前提（seq=1）の、もう 1 つの再投票は負ける（何も保存しない）。
+        let racing = linked(3, 103, 7, 2, Some(&first));
+        assert_eq!(
+            s.revote(&alice, ShardId(0), racing, 1).await,
+            Err(CastError::RevoteConflict)
+        );
+        // 投票していない有権者の再投票も、条件を満たさない。
+        assert_eq!(
+            s.revote(&voter("bob"), ShardId(0), linked(4, 101, 8, 2, None), 1)
+                .await,
+            Err(CastError::RevoteConflict)
+        );
+        let voted = s.voted_contests(&alice).await.expect("voted");
+        assert_eq!(
+            voted,
+            vec![VotedContest {
+                contest: contest(1),
+                ballots: 2
+            }]
+        );
+        assert_eq!(
+            s.slot_state(&Slot([7; 32])).await,
+            Ok(Some(SlotState {
+                seq: 2,
+                last_ballot_hash: ballot_hash(&second)
+            }))
+        );
+        // participation は 1 人、受理した票は 2、未封印は 2（そのうち最初の票は 1）。
+        let counts = s.audit_counts().await.expect("counts");
+        assert_eq!(
+            (
+                counts[0].participation,
+                counts[0].cast,
+                counts[0].pending,
+                counts[0].pending_initial
+            ),
+            (1, 2, 2, 1)
+        );
+        // 未封印の票は到着順（前の版が先）。
+        let pool = s.ballots_in_shard(ShardId(0));
+        assert_eq!(pool, vec![first, second]);
     }
 
     #[tokio::test]
@@ -595,9 +779,7 @@ mod tests {
                 Ok(())
             );
         }
-        let mut voted = s.voted_contests(&alice).await.expect("voted");
-        voted.sort();
-        assert_eq!(voted, vec![contest(1), contest(2)]);
+        assert_eq!(contests_of(&s, &alice).await, vec![contest(1), contest(2)]);
         assert_eq!(s.voted_contests(&voter("carol")).await, Ok(vec![]));
         assert_eq!(s.pending_by_shard().await, Ok(vec![3]));
     }
@@ -1011,8 +1193,14 @@ mod tests {
     #[tokio::test]
     async fn election_rules_are_fixed_when_the_election_opens() {
         let s = store(1);
-        let on = ElectionRules { allow_blank: true };
-        let off = ElectionRules { allow_blank: false };
+        let on = ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        };
+        let off = ElectionRules {
+            allow_blank: false,
+            ..ElectionRules::default()
+        };
         let initial = s.ensure_initialized(Period::default()).await.expect("init");
         assert_eq!(initial.rules, None, "scheduled の間は、まだ固定しない");
         assert!(

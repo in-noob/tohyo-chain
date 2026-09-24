@@ -7,10 +7,11 @@ use gloo_net::http::Request;
 use serde::de::DeserializeOwned;
 use shared_types::{
     AnchorsResponse, BallotStatusResponse, BlockDto, BlocksPageResponse, CandidatesResponse,
-    ChainsResponse, ElectionStatusResponse, LoginRequest, LoginResponse, VoteRequest,
+    ChainsResponse, ElectionStatusResponse, ErrorResponse, LoginRequest, LoginResponse,
+    VoteRequest,
 };
 
-use crate::error::{ApiFailure, classify_status};
+use crate::error::{ApiFailure, classify_error, classify_status};
 
 const BASE: &str = "/api/v1";
 
@@ -75,19 +76,29 @@ pub async fn candidates(token: &str, contest_id: &str) -> Result<CandidatesRespo
     .await
 }
 
-/// 投票する。成功（201）のとき `Ok(())`。応答本文は読まない（`ballot_id` などは返らない）。
-pub async fn vote(token: &str, contest_id: &str, candidate_id: &str) -> Result<(), ApiFailure> {
+/// 投票する。`revote` は、やり直しのときだけ、画面が見たこの投票用紙の受理済みの票の数（ADR 0022）。
+/// 成功（201）のとき `Ok(())`。成功の応答本文は読まない（`ballot_id` などは返らない）。失敗は、エラー応答の
+/// `error`（コード）でも区別する（409 の、投票済み・やり直しの競合・上限）。
+pub async fn vote(
+    token: &str,
+    contest_id: &str,
+    candidate_id: &str,
+    revote: Option<u32>,
+) -> Result<(), ApiFailure> {
     let request = Request::post(&format!("{BASE}/contests/{contest_id}/vote"))
         .header("Authorization", &bearer(token))
         .json(&VoteRequest {
             candidate_id: candidate_id.to_string(),
+            revote,
         })
         .map_err(|_| ApiFailure::Unexpected(0))?;
     let response = request.send().await.map_err(|_| ApiFailure::Network)?;
-    match classify_status(response.status()) {
-        None => Ok(()),
-        Some(failure) => Err(failure),
+    let status = response.status();
+    if classify_status(status).is_none() {
+        return Ok(());
     }
+    let code = response.json::<ErrorResponse>().await.ok().map(|e| e.error);
+    Err(classify_error(status, code.as_deref()).unwrap_or(ApiFailure::Unexpected(status)))
 }
 
 // ---------------------------------------------------------------------------

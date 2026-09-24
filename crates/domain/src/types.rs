@@ -8,6 +8,7 @@ use crate::ids::{CandidateId, ContestId};
 pub const HASH_LEN: usize = 32;
 pub const BALLOT_ID_LEN: usize = 16;
 pub const SIGNATURE_LEN: usize = 64;
+pub const SLOT_LEN: usize = 32;
 
 pub type Hash32 = [u8; HASH_LEN];
 pub type SignatureBytes = [u8; SIGNATURE_LEN];
@@ -31,6 +32,30 @@ impl BallotId {
     }
 }
 
+/// 再投票の仮名 `slot = HMAC-SHA256(revote_key, election_id ‖ voter_id ‖ contest_id)`（原則1）。
+///
+/// 同じ有権者・同じ投票用紙の票（再投票の各版）に共通で、投票者 ID には戻せない（`revote_key` は締切の手続きで
+/// 破棄する）。投票用紙が違えば slot も違うので、1 人の有権者の別の投票用紙の票どうしは結び付かない。
+/// 誤ってログに出しても、チェーンの票と結び付けられないよう、`Debug` では値を出さない。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Slot(pub [u8; SLOT_LEN]);
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Slot(<redacted>)")
+    }
+}
+
+/// 再投票のつながり（`vote.allow_revote = true` の選挙の票だけが持つ。原則1・ADR 0022）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevoteLink {
+    pub slot: Slot,
+    /// その slot の何番目の票か（1 始まり。初回の投票が 1）。
+    pub seq: u32,
+    /// 1 つ前の版の票のハッシュ（[`crate::encoding::ballot_hash`]）。初回の投票（`seq == 1`）では `None`。
+    pub supersedes: Option<Hash32>,
+}
+
 /// 1 票。投票者を特定できる情報は含めない。
 ///
 /// `contest_id` を持つので、シャード単位のチェーンからも投票用紙ごとに集計できる。
@@ -40,6 +65,8 @@ pub struct Ballot {
     pub ballot_id: BallotId,
     pub contest_id: ContestId,
     pub candidate_id: CandidateId,
+    /// 再投票のつながり。再投票を認めない選挙（`vote.allow_revote = false`）では `None`（slot を記録しない）。
+    pub revote: Option<RevoteLink>,
 }
 
 /// ブロックヘッダ。ハッシュ対象は [`crate::encoding::encode_header`] の固定長バイナリ。

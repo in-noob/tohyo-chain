@@ -126,7 +126,10 @@ mod tests {
             contest_id: "e/d".to_string(),
             participation: pending,
             sealed: 0,
+            sealed_revotes: 0,
             pending,
+            pending_initial: None,
+            cast: None,
         };
         assert_eq!(pending_of(&[row(0), row(2), row(5)]), (7, 2));
         assert_eq!(pending_of(&[]), (0, 0));

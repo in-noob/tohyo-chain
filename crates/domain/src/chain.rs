@@ -6,8 +6,9 @@ use crate::signature::{Signer, Verifier};
 use crate::types::{Ballot, Block, BlockHeader, Hash32};
 
 /// ブロックの形式の版。2: 票の `contest_id` / `candidate_id` を、数値（各 4 バイト）から、長さ接頭辞つきの
-/// 文字列 ID（[`crate::ids`]）に変えた（ADR 0013）。
-pub const BLOCK_VERSION: u16 = 2;
+/// 文字列 ID（[`crate::ids`]）に変えた（ADR 0013）。3: 票の後ろに、再投票のつながり（slot・seq・supersedes）を
+/// 足せるようにした（ADR 0022。つながりの無い票のバイト列は版 2 と同じ）。
+pub const BLOCK_VERSION: u16 = 3;
 
 /// 封印（`seal_block`）の失敗。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -252,6 +253,7 @@ mod tests {
             ballot_id: BallotId::from_random_bytes(id),
             contest_id: ContestId::new(&ElectionId::new("2026-general").expect("valid"), &district),
             candidate_id: CandidateId::new(&district, u64::from(i % 3) + 1).expect("valid"),
+            revote: None,
         }
     }
 

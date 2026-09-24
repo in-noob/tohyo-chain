@@ -50,6 +50,7 @@ mod tests {
             now: 0,
             display_timezone: "Asia/Tokyo".to_string(),
             display_timezone_offset_secs: 9 * 3600,
+            rules: None,
         }
     }
 

@@ -689,3 +689,64 @@ fn shipped_config_files_are_valid() {
     assert_eq!(loaded.config.app.mode, Mode::Db);
     assert_eq!(loaded.config.shard.count.get(), 8);
 }
+
+#[test]
+fn revotes_are_off_by_default_and_the_limit_is_validated() {
+    let c = load_for_test(&[]).expect("defaults").config;
+    assert!(!c.vote.allow_revote, "再投票は既定で認めない");
+    assert_eq!(c.vote.max_revotes, 5);
+    let c = load_for_test(&[("vote.allow_revote", "true"), ("vote.max_revotes", "2")])
+        .expect("valid")
+        .config;
+    assert!(c.vote.allow_revote);
+    assert_eq!(c.vote.max_revotes, 2);
+    for bad in ["0", "101", "-1", "x"] {
+        let text = err_text(load_for_test(&[("vote.max_revotes", bad)]));
+        assert!(text.contains("vote.max_revotes"), "{bad}: {text}");
+    }
+}
+
+#[test]
+fn the_revote_key_lives_only_in_the_secrets_directory() {
+    let (config, secrets) = (TempDir::new(), TempDir::new());
+    let loaded = load_from(&sources(&config, &secrets, &[])).expect("valid");
+    assert_eq!(
+        loaded.revote_key_path(),
+        Some(secrets.path().join("revote_key"))
+    );
+    assert_eq!(load_for_test(&[]).expect("valid").revote_key_path(), None);
+    // 環境変数では渡せない（締切の手続きで破棄できないため）。設定項目ではないので、未知の項目になる。
+    let text = err_text(load_from(&sources(
+        &config,
+        &secrets,
+        &[("APP__VOTE__REVOTE_KEY", &"ab".repeat(32))],
+    )));
+    assert!(text.contains("未知の項目"), "{text}");
+}
+
+#[test]
+fn revote_labels_have_defaults_reach_the_web_and_need_the_limit_placeholder() {
+    let loaded = load_for_test(&[]).expect("defaults");
+    let labels = &loaded.config.labels;
+    assert_eq!(labels.revote_button, "投票をやり直す");
+    assert_eq!(labels.revote_confirm, "前回の投票内容を変更します");
+    assert_eq!(
+        labels.revote_limit_reached,
+        "やり直しの上限（{max}回）に達しています"
+    );
+    let out = loaded.web_env();
+    for name in [
+        "APP_WEB_REVOTE_BUTTON",
+        "APP_WEB_REVOTE_CONFIRM",
+        "APP_WEB_REVOTE_LIMIT_REACHED",
+    ] {
+        assert!(out.contains(&format!("export {name}=")), "{out}");
+    }
+    // vote.allow_revote / max_revotes は、ビルド時ではなく実行時に API から受け取る（open の時点で固定するため）。
+    assert!(!out.contains("REVOTE="), "{out}");
+    let text = err_text(load_for_test(&[(
+        "labels.revote_limit_reached",
+        "上限です",
+    )]));
+    assert!(text.contains("labels.revote_limit_reached"), "{text}");
+}

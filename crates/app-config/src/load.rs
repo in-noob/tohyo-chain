@@ -82,6 +82,8 @@ pub fn env_name(key: &str) -> String {
 pub struct Loaded {
     pub config: AppConfig,
     pub(crate) entries: Entries,
+    /// 秘密情報のディレクトリ（`APP_SECRETS_DIR`、既定 `secrets`）。テスト用の読み込みでは `None`。
+    pub secrets_dir: Option<PathBuf>,
 }
 
 /// 実プロセスの入力元から読み込む。
@@ -214,7 +216,11 @@ pub fn load_from(sources: &Sources) -> Result<Loaded, ConfigError> {
         return Err(ConfigError { issues });
     }
     let config = model::extract(&entries)?;
-    Ok(Loaded { config, entries })
+    Ok(Loaded {
+        config,
+        entries,
+        secrets_dir: sources.secrets_dir.clone(),
+    })
 }
 
 /// 項目の型。default.toml の値から決まる。

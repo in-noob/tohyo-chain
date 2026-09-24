@@ -267,18 +267,24 @@ fn block_detail(shard: u16, block: shared_types::BlockDto) -> impl IntoView {
     let genesis = chain::is_genesis(&h);
     let minute = shared_types::time::format_minute_utc(h.sealed_at_minute);
     let notice = chain::hidden_ballots_notice(&block);
-    let rows = chain::ballot_rows(&block.ballots, labels::blank_name());
+    let rows = chain::ballot_rows(shard, &block.ballots, labels::blank_name());
     let counts = chain::choice_counts(&block.ballots, labels::blank_name());
     let ballots = if block.ballots_revealed {
         // 白票は候補者ではないので、別の書式（class "blank"）で表示する。
         let body = rows
             .into_iter()
             .map(|r| {
+                // 行の id は、再投票の票からのリンク（「#<前の票> を置き換え」）の飛び先。
                 view! {
-                    <tr class=r.blank.then_some("blank")>
+                    <tr class=r.blank.then_some("blank") id=chain::ballot_anchor(&r.ballot_id)>
                         <td>{r.index}</td>
                         <td>{r.district}</td>
-                        <td>{r.candidate}</td>
+                        <td>
+                            {r.candidate}
+                            {r.replaces.map(|link| view! {
+                                <br /><a class="replaces" href=link.path>{link.label}</a>
+                            })}
+                        </td>
                         <td><code title=r.ballot_id.clone()>{chain::short_hash(&r.ballot_id)}</code></td>
                     </tr>
                 }

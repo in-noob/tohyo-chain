@@ -1,6 +1,6 @@
 //! Merkle 木と包含証明。
 //!
-//! - 葉   = `SHA256(0x00 ‖ 票)`
+//! - 葉   = `SHA256(0x00 ‖ 票)`（= 票のハッシュ [`crate::encoding::ballot_hash`]）
 //! - 内部 = `SHA256(0x01 ‖ 左 ‖ 右)`
 //! - 空   = `SHA256(0x02)`
 //!
@@ -8,10 +8,9 @@
 //! 提示する第二原像攻撃を防ぐ。要素数が奇数のとき末尾は複製せず、そのまま
 //! 上の段に持ち上げる（複製すると別の票列が同じ根になり得るため）。
 
-use crate::encoding::{encode_ballot, sha256_parts};
+use crate::encoding::sha256_parts;
 use crate::types::{Ballot, Hash32};
 
-const LEAF_PREFIX: u8 = 0x00;
 const NODE_PREFIX: u8 = 0x01;
 const EMPTY_PREFIX: u8 = 0x02;
 
@@ -28,8 +27,9 @@ pub struct InclusionProof {
     pub steps: Vec<(Side, Hash32)>,
 }
 
+/// 葉のハッシュ。票のハッシュ（[`crate::encoding::ballot_hash`]。再投票の `supersedes` に使う）と同じ値。
 pub fn leaf_hash(ballot: &Ballot) -> Hash32 {
-    sha256_parts(&[&[LEAF_PREFIX], &encode_ballot(ballot)])
+    crate::encoding::ballot_hash(ballot)
 }
 
 fn node_hash(left: &Hash32, right: &Hash32) -> Hash32 {
@@ -111,6 +111,7 @@ mod tests {
                 ballot_id: BallotId([i as u8; 16]),
                 contest_id: contest.clone(),
                 candidate_id: CandidateId::new(&district, i as u64 + 1).expect("valid"),
+                revote: None,
             })
             .collect()
     }
@@ -131,10 +132,34 @@ mod tests {
             ballot_id: BallotId([0x11; 16]),
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
             candidate_id: CandidateId::parse("shugiin_smd.13.01.c3").expect("valid"),
+            revote: None,
         };
         assert_eq!(
             hex(&leaf_hash(&b)),
             "47a277def541a974bc80c91068c15aba6c42adaef77322a9454874ef38d54ea8"
+        );
+        // 版 3 の再投票（seq=2。supersedes は seq=1 の票のハッシュ）:
+        // sha256(0x00 ‖ 上の票 ‖ 0x02 ‖ slot ‖ seq(4) ‖ supersedes)。supersedes = sha256(0x00 ‖ 上の票 ‖ 0x01 ‖ slot ‖ seq(4))。
+        let slot = crate::types::Slot([0x5a; 32]);
+        let first = Ballot {
+            revote: Some(crate::types::RevoteLink {
+                slot,
+                seq: 1,
+                supersedes: None,
+            }),
+            ..b.clone()
+        };
+        let second = Ballot {
+            revote: Some(crate::types::RevoteLink {
+                slot,
+                seq: 2,
+                supersedes: Some(leaf_hash(&first)),
+            }),
+            ..b
+        };
+        assert_eq!(
+            hex(&leaf_hash(&second)),
+            "edbe90106bbebc8c170bfff9d2b2fee381248b8a15107f7a1e6a1609c54a8e0d"
         );
     }
 
@@ -150,8 +175,7 @@ mod tests {
         // 2 葉の根は、葉ハッシュ 2 つを連結して葉として扱った値とは異なる。
         let two = ballots(2);
         let root = merkle_root(&two);
-        let concatenated =
-            sha256_parts(&[&[LEAF_PREFIX], &leaf_hash(&two[0]), &leaf_hash(&two[1])]);
+        let concatenated = sha256_parts(&[&[0x00], &leaf_hash(&two[0]), &leaf_hash(&two[1])]);
         assert_ne!(root, concatenated);
     }
 

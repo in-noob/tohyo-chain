@@ -1,10 +1,14 @@
 //! ドメイン型と CQL の行の相互変換（DB に依存しない純粋な関数）。
 
 use application::StoreError;
+use domain::encoding::{decode_revote, encode_revote};
 use domain::{Anchor, Ballot, BallotId, Block, BlockHeader, CandidateId, ContestId, ShardHead};
 
-/// `ballots` 列の 1 要素: (ballot_id, contest_id, candidate_id)。ID は文字列（`domain::ids`）。
-pub type BallotTuple = (Vec<u8>, String, String);
+/// `ballots` 列の 1 要素: (ballot_id, contest_id, candidate_id, revote)。ID は文字列（`domain::ids`）。
+/// `revote` は再投票のつながり（slot・seq・supersedes）の正規化バイト列（`domain::encoding::encode_revote`）。
+/// 再投票を認めない選挙の票では空（`0x`。何も記録しない。ADR 0022）。NULL にしないのは、cqlsh が tuple の中の NULL の blob を
+/// 表示できない（運用者がブロックを確認できなくなる）ため。読むときは、空も NULL も「つながり無し」。
+pub type BallotTuple = (Vec<u8>, String, String, Option<Vec<u8>>);
 
 /// `blocks` テーブルの 1 行（`SELECT` の列順）。
 pub type BlockRow = (
@@ -47,14 +51,26 @@ pub fn ballot_to_tuple(ballot: &Ballot) -> Result<BallotTuple, StoreError> {
         ballot.ballot_id.0.to_vec(),
         ballot.contest_id.as_str().to_string(),
         ballot.candidate_id.as_str().to_string(),
+        Some(encode_revote(ballot.revote.as_ref())),
     ))
 }
 
-pub fn ballot_from_tuple((id, contest, candidate): &BallotTuple) -> Result<Ballot, StoreError> {
+/// 票の再投票のつながりを、DB の `ballot_pool.revote` 列（blob。無ければ NULL）の値にする。
+pub fn revote_to_blob(ballot: &Ballot) -> Option<Vec<u8>> {
+    ballot.revote.as_ref().map(|link| encode_revote(Some(link)))
+}
+
+pub fn ballot_from_tuple(
+    (id, contest, candidate, revote): &BallotTuple,
+) -> Result<Ballot, StoreError> {
     Ok(Ballot {
         ballot_id: BallotId(id.as_slice().try_into().map_err(|_| StoreError::Corrupt)?),
         contest_id: ContestId::parse(contest).map_err(|_| StoreError::Corrupt)?,
         candidate_id: CandidateId::parse(candidate).map_err(|_| StoreError::Corrupt)?,
+        revote: match revote {
+            Some(bytes) => decode_revote(bytes).map_err(|_| StoreError::Corrupt)?,
+            None => None,
+        },
     })
 }
 
@@ -219,6 +235,7 @@ mod tests {
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.03").expect("valid"),
             candidate_id: CandidateId::parse(&format!("shugiin_smd.13.03.c{}", 300 + u32::from(n)))
                 .expect("valid"),
+            revote: None,
         }
     }
 
@@ -267,27 +284,56 @@ mod tests {
         assert_eq!(minute_bucket(u64::MAX), Err(StoreError::Corrupt));
     }
 
+    /// 再投票のつながりを持つ票。
+    fn linked(n: u8) -> Ballot {
+        Ballot {
+            revote: Some(domain::RevoteLink {
+                slot: domain::Slot([n; 32]),
+                seq: 2,
+                supersedes: Some([n; 32]),
+            }),
+            ..ballot(n)
+        }
+    }
+
     #[test]
     fn ballot_roundtrip() {
         let b = ballot(7);
-        assert_eq!(ballot_from_tuple(&ballot_to_tuple(&b).expect("ok")), Ok(b));
+        let tuple = ballot_to_tuple(&b).expect("ok");
+        // 再投票のつながりの無い票は、revote が空（slot を記録しない）。
+        assert_eq!(tuple.3, Some(Vec::new()));
+        assert_eq!(ballot_from_tuple(&tuple), Ok(b));
+        let l = linked(8);
+        let tuple = ballot_to_tuple(&l).expect("ok");
+        assert!(tuple.3.is_some());
+        assert_eq!(ballot_from_tuple(&tuple), Ok(l));
     }
 
     #[test]
     fn ballot_conversion_rejects_bad_data() {
-        let (id, contest, candidate) = ballot_to_tuple(&ballot(1)).expect("ok");
+        let (id, contest, candidate, _) = ballot_to_tuple(&ballot(1)).expect("ok");
         // ballot_id の長さが違う。
         assert_eq!(
-            ballot_from_tuple(&(vec![1, 2, 3], contest.clone(), candidate.clone())),
+            ballot_from_tuple(&(vec![1, 2, 3], contest.clone(), candidate.clone(), None)),
             Err(StoreError::Corrupt)
         );
         // ID の形式が不正（DB のデータが壊れている）。
         assert_eq!(
-            ballot_from_tuple(&(id.clone(), "1".to_string(), candidate.clone())),
+            ballot_from_tuple(&(id.clone(), "1".to_string(), candidate.clone(), None)),
             Err(StoreError::Corrupt)
         );
         assert_eq!(
-            ballot_from_tuple(&(id, contest, "Bad Candidate".to_string())),
+            ballot_from_tuple(&(
+                id.clone(),
+                contest.clone(),
+                "Bad Candidate".to_string(),
+                None
+            )),
+            Err(StoreError::Corrupt)
+        );
+        // 再投票のつながりのバイト列が壊れている。
+        assert_eq!(
+            ballot_from_tuple(&(id, contest, candidate, Some(vec![0x09]))),
             Err(StoreError::Corrupt)
         );
     }
@@ -296,7 +342,7 @@ mod tests {
     fn block_roundtrip_including_genesis_with_null_ballots() {
         let signer = Ed25519Signer::from_seed(&[1u8; 32]);
         let g = genesis(&signer, 100);
-        let b1 = seal_block(&g, vec![ballot(1), ballot(2), ballot(3)], 101, &signer).expect("seal");
+        let b1 = seal_block(&g, vec![ballot(1), ballot(2), linked(3)], 101, &signer).expect("seal");
         for block in [g, b1] {
             let row = as_row(block_to_values(&block).expect("to values"));
             assert_eq!(block_from_row(row), Ok(block));

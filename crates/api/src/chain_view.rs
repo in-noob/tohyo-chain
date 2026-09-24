@@ -4,11 +4,59 @@
 //! （CDN でキャッシュできる）。ただし、**内容がこの先変わる応答には付けない**: `reveal_ballots=after_close` の締切前の詳細は
 //! 票が伏せられていて、締切後に中身が変わるので、`immutable` にすると、票なしの版が CDN に 1 年残ってしまう。
 
-use domain::Block;
+use std::collections::{HashMap, HashSet};
+
+use application::{ChainRead, StoreError};
 use domain::election::Election;
+use domain::{Ballot, Block, Hash32, ShardId, ballot_hash};
 use serde::{Deserialize, Deserializer};
 use shared_types::hex;
-use shared_types::{BallotDto, BlockDto, BlockSummaryDto, HeaderDto};
+use shared_types::{BallotDto, BlockDto, BlockSummaryDto, HeaderDto, ReplacedBallotDto};
+
+/// 再投票の票が置き換えた前の版（ブロックの高さと、その票）。キーは前の版の票のハッシュ（= 次の版の `supersedes`）。
+pub type Replaced = HashMap<Hash32, (u64, Ballot)>;
+
+/// 前の版を探すときに、1 回に読むブロックの数。
+const REPLACED_SCAN_PAGE: usize = 100;
+
+/// `block` の票が置き換えた前の版を、同じシャードのチェーンから探す（ビューアのリンク用。検証には使わない）。
+///
+/// 同じ slot の全版は同じシャードにあり、前の版は次の版と同じか、より低い高さに封印される（プールは到着順に封印するため。
+/// ADR 0022）ので、`block` の高さから下へ、見つかるまで読む。
+pub async fn find_replaced(
+    chains: &dyn ChainRead,
+    shard: ShardId,
+    block: &Block,
+) -> Result<Replaced, StoreError> {
+    let mut wanted: HashSet<Hash32> = block
+        .ballots
+        .iter()
+        .filter_map(|b| b.revote.and_then(|link| link.supersedes))
+        .collect();
+    let mut found = Replaced::new();
+    let mut before = block.header.height.checked_add(1);
+    while !wanted.is_empty() {
+        let page = chains
+            .blocks_before(shard, before, REPLACED_SCAN_PAGE)
+            .await?;
+        let Some(lowest) = page.last().map(|b| b.header.height) else {
+            break;
+        };
+        for candidate in &page {
+            for ballot in &candidate.ballots {
+                let hash = ballot_hash(ballot);
+                if wanted.remove(&hash) {
+                    found.insert(hash, (candidate.header.height, ballot.clone()));
+                }
+            }
+        }
+        if lowest == 0 {
+            break;
+        }
+        before = Some(lowest);
+    }
+    Ok(found)
+}
 
 /// 確定した応答（内容が二度と変わらない）。
 pub const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -108,13 +156,15 @@ pub fn block_summary(block: &Block) -> BlockSummaryDto {
     }
 }
 
-/// 詳細。`revealed` が偽なら、票（`ballot_id`・`contest_id`・`candidate_id`）を返さない。
-/// 表示名（選挙区・候補者・政党）は、選挙データにあれば付ける。
+/// 詳細。`revealed` が偽なら、票（`ballot_id`・`contest_id`・`candidate_id`・再投票の slot / seq / supersedes）を
+/// 返さない。表示名（選挙区・候補者・政党）は、選挙データにあれば付ける。`replaced` は、再投票の票が置き換えた
+/// 前の版（[`find_replaced`]）。
 pub fn block_detail(
     block: &Block,
     revealed: bool,
     election: &Election,
     signer_public_key: Option<&[u8; 32]>,
+    replaced: &Replaced,
 ) -> BlockDto {
     let ballots = if revealed {
         block
@@ -122,10 +172,24 @@ pub fn block_detail(
             .iter()
             .map(|b| {
                 let contest = election.contest(&b.contest_id);
+                let name_of = |id: &domain::CandidateId| {
+                    id.candidate().and_then(|code| {
+                        contest.and_then(|c| c.candidates.iter().find(|c| &c.id == code))
+                    })
+                };
                 // 白票は候補者ではないので、候補者の表示名を付けない（`blank` で示す）。
-                let candidate = b.candidate_id.candidate().and_then(|code| {
-                    contest.and_then(|c| c.candidates.iter().find(|c| &c.id == code))
-                });
+                let candidate = name_of(&b.candidate_id);
+                let link = b.revote;
+                let replaces = link
+                    .and_then(|l| l.supersedes)
+                    .and_then(|prev| replaced.get(&prev))
+                    .map(|(height, prev)| ReplacedBallotDto {
+                        ballot_id: hex::encode(&prev.ballot_id.0),
+                        height: *height,
+                        candidate_id: prev.candidate_id.to_string(),
+                        blank: prev.candidate_id.is_blank(),
+                        candidate_name: name_of(&prev.candidate_id).map(|c| c.name.clone()),
+                    });
                 BallotDto {
                     ballot_id: hex::encode(&b.ballot_id.0),
                     contest_id: b.contest_id.to_string(),
@@ -134,6 +198,10 @@ pub fn block_detail(
                     district_name: contest.map(|c| c.district.name.clone()),
                     candidate_name: candidate.map(|c| c.name.clone()),
                     party: candidate.map(|c| c.party.clone()),
+                    slot: link.map(|l| hex::encode(&l.slot.0)),
+                    seq: link.map(|l| l.seq),
+                    supersedes: link.and_then(|l| l.supersedes).map(|h| hex::encode(&h)),
+                    replaces,
                 }
             })
             .collect()
@@ -263,6 +331,7 @@ mod tests {
             ballot_id: BallotId::from_random_bytes([9; 16]),
             contest_id: ContestId::parse(contest).expect("contest"),
             candidate_id: CandidateId::parse(candidate).expect("candidate"),
+            revote: None,
         };
         seal_block(&genesis, vec![ballot], 11, &signer).expect("seal")
     }
@@ -270,7 +339,7 @@ mod tests {
     #[test]
     fn a_hidden_detail_has_no_ballots_but_keeps_the_header_and_count() {
         let block = block_with("e1/smd.13.01", "smd.13.01.c1");
-        let hidden = block_detail(&block, false, &election(), None);
+        let hidden = block_detail(&block, false, &election(), None, &Replaced::new());
         assert!(!hidden.ballots_revealed);
         assert!(hidden.ballots.is_empty());
         assert_eq!(hidden.header.ballot_count, 1);
@@ -288,7 +357,7 @@ mod tests {
     fn a_revealed_detail_lists_ballots_with_display_names() {
         let block = block_with("e1/smd.13.01", "smd.13.01.c1");
         let key = [4u8; 32];
-        let shown = block_detail(&block, true, &election(), Some(&key));
+        let shown = block_detail(&block, true, &election(), Some(&key), &Replaced::new());
         assert!(shown.ballots_revealed);
         let b = &shown.ballots[0];
         assert_eq!(b.candidate_id, "smd.13.01.c1");
@@ -319,14 +388,14 @@ mod tests {
     #[test]
     fn a_blank_ballot_is_marked_blank_and_has_no_candidate_names() {
         let block = block_with("e1/smd.13.01", "blank");
-        let shown = block_detail(&block, true, &election(), None);
+        let shown = block_detail(&block, true, &election(), None, &Replaced::new());
         let b = &shown.ballots[0];
         assert!(b.blank);
         assert_eq!(b.candidate_id, "blank");
         assert_eq!(b.district_name.as_deref(), Some("東京1区"));
         assert_eq!((&b.candidate_name, &b.party), (&None, &None));
         // 伏せた詳細には、白票かどうかも現れない。
-        let hidden = block_detail(&block, false, &election(), None);
+        let hidden = block_detail(&block, false, &election(), None, &Replaced::new());
         let json = serde_json::to_string(&hidden).expect("json");
         assert!(!json.contains("blank"), "{json}");
     }
@@ -334,13 +403,87 @@ mod tests {
     #[test]
     fn unknown_contests_and_candidates_have_no_display_names() {
         let block = block_with("e1/smd.99.99", "smd.99.99.c1");
-        let shown = block_detail(&block, true, &election(), None);
+        let shown = block_detail(&block, true, &election(), None, &Replaced::new());
         let b = &shown.ballots[0];
         assert_eq!(
             (&b.district_name, &b.candidate_name, &b.party),
             (&None, &None, &None)
         );
         assert_eq!(shown.signer_public_key, None);
+    }
+
+    /// メモリ上のブロック列（添字 = 高さ）だけを返す、読み取り専用のチェーン。
+    struct FixedChain(Vec<Block>);
+
+    #[async_trait::async_trait]
+    impl ChainRead for FixedChain {
+        async fn head(&self, _: ShardId) -> Result<Option<Block>, StoreError> {
+            Ok(self.0.last().cloned())
+        }
+        async fn block(&self, _: ShardId, height: u64) -> Result<Option<Block>, StoreError> {
+            Ok(usize::try_from(height)
+                .ok()
+                .and_then(|h| self.0.get(h))
+                .cloned())
+        }
+        async fn latest_anchor(&self) -> Result<Option<domain::Anchor>, StoreError> {
+            Ok(None)
+        }
+        async fn signer_public_key(&self) -> Result<Option<[u8; 32]>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revote_links_to_the_ballot_it_replaced_only_when_revealed() {
+        let signer = Ed25519Signer::from_seed(&[1u8; 32]);
+        let slot = domain::Slot([3; 32]);
+        let first = Ballot {
+            ballot_id: BallotId::from_random_bytes([1; 16]),
+            contest_id: ContestId::parse("e1/smd.13.01").expect("contest"),
+            candidate_id: CandidateId::parse("smd.13.01.c1").expect("candidate"),
+            revote: Some(domain::RevoteLink {
+                slot,
+                seq: 1,
+                supersedes: None,
+            }),
+        };
+        let second = Ballot {
+            ballot_id: BallotId::from_random_bytes([2; 16]),
+            candidate_id: CandidateId::Blank,
+            revote: Some(domain::RevoteLink {
+                slot,
+                seq: 2,
+                supersedes: Some(ballot_hash(&first)),
+            }),
+            ..first.clone()
+        };
+        let g = genesis(&signer, 10);
+        let b1 = seal_block(&g, vec![first.clone()], 11, &signer).expect("seal");
+        let b2 = seal_block(&b1, vec![second], 12, &signer).expect("seal");
+        let chain = FixedChain(vec![g, b1, b2.clone()]);
+        let replaced = find_replaced(&chain, ShardId(0), &b2).await.expect("scan");
+        assert_eq!(replaced.len(), 1);
+
+        let shown = block_detail(&b2, true, &election(), None, &replaced);
+        let b = &shown.ballots[0];
+        assert_eq!(
+            (b.seq, b.slot.as_deref()),
+            (Some(2), Some(hex::encode(&[3; 32]).as_str()))
+        );
+        assert_eq!(b.supersedes, Some(hex::encode(&ballot_hash(&first))));
+        let replaces = b.replaces.as_ref().expect("replaces");
+        assert_eq!(replaces.ballot_id, hex::encode(&first.ballot_id.0));
+        assert_eq!(replaces.height, 1);
+        assert_eq!(replaces.candidate_name.as_deref(), Some("甲"));
+        assert!(b.blank && !replaces.blank);
+
+        // 締切前（伏せた詳細）には、candidate も supersedes も slot も現れない。
+        let hidden = block_detail(&b2, false, &election(), None, &replaced);
+        let json = serde_json::to_string(&hidden).expect("json");
+        for word in ["supersedes", "slot", "seq", "replaces", "candidate"] {
+            assert!(!json.contains(word), "{word}: {json}");
+        }
     }
 
     #[test]

@@ -15,9 +15,12 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use application::{CastError, ChainRead, Clock, SealStore, StoreError, VoteStore};
+use application::{
+    CastError, ChainRead, Clock, SealStore, SlotState, StoreError, VoteStore, VotedContest,
+};
 use domain::{
-    Ballot, BallotId, CandidateId, ContestId, Ed25519Signer, ShardId, VoterId, genesis, seal_block,
+    Ballot, BallotId, CandidateId, ContestId, Ed25519Signer, RevoteLink, ShardId, Slot, VoterId,
+    ballot_hash, genesis, seal_block,
 };
 use infra_scylla::{ConnectError, ScyllaConfig, ScyllaStore};
 use scylla::client::session::Session;
@@ -121,6 +124,7 @@ fn ballot(n: u8, contest_no: u32, candidate_seq: u32) -> Ballot {
             "shugiin_smd.13.{contest_no:02}.c{candidate_seq}"
         ))
         .expect("valid"),
+        revote: None,
     }
 }
 
@@ -138,6 +142,31 @@ async fn cast_n(store: &ScyllaStore, shard: u16, first: u8, n: u8) {
             )
             .await
             .expect("cast");
+    }
+}
+
+/// 投票者が投票済みの投票用紙（昇順）。
+async fn contests_of(s: &ScyllaStore, v: &VoterId) -> Vec<ContestId> {
+    let mut voted: Vec<ContestId> = s
+        .voted_contests(v)
+        .await
+        .expect("voted")
+        .into_iter()
+        .map(|c| c.contest)
+        .collect();
+    voted.sort();
+    voted
+}
+
+/// slot `s` の `seq` 番目の票（`prev` の次の版）。`n` は ballot_id の元。
+fn linked(n: u8, candidate_seq: u32, s: u8, seq: u32, prev: Option<&Ballot>) -> Ballot {
+    Ballot {
+        revote: Some(RevoteLink {
+            slot: Slot([s; 32]),
+            seq,
+            supersedes: prev.map(ballot_hash),
+        }),
+        ..ballot(n, 1, candidate_seq)
     }
 }
 
@@ -163,9 +192,7 @@ async fn participation_lwt_and_pool_basics() {
         Ok(())
     );
 
-    let mut voted = s.voted_contests(&alice).await.expect("voted");
-    voted.sort();
-    assert_eq!(voted, vec![contest(1), contest(2)]);
+    assert_eq!(contests_of(s, &alice).await, vec![contest(1), contest(2)]);
     assert_eq!(s.voted_contests(&voter("carol")).await, Ok(vec![]));
     assert_eq!(s.pending_by_shard().await, Ok(vec![2, 1]));
 
@@ -357,11 +384,16 @@ async fn participation_and_pool_share_no_identifying_columns() {
         "{pool:?}"
     );
     assert!(
-        !participation
-            .iter()
-            .any(|c| c.contains("ballot") || c.contains("candidate") || c.contains("minute")),
+        !participation.iter().any(|c| c.contains("ballot")
+            || c.contains("candidate")
+            || c.contains("minute")
+            || c.contains("slot")
+            || c == "revote"),
         "{participation:?}"
     );
+    // 再投票の状態は slot がキーで、投票者の列も候補者の列も持たない（ADR 0022）。
+    let slot_state = columns("slot_state").await;
+    assert_eq!(slot_state, vec!["last_ballot_hash", "seq", "slot"]);
     db.teardown().await;
 }
 
@@ -559,10 +591,7 @@ async fn state_survives_a_new_connection() {
     let reopened = ScyllaStore::connect(&config(&db.keyspace, 1), db.clock.clone())
         .await
         .expect("reconnect");
-    assert_eq!(
-        reopened.voted_contests(&voter("v1")).await,
-        Ok(vec![contest(1)])
-    );
+    assert_eq!(contests_of(&reopened, &voter("v1")).await, vec![contest(1)]);
     assert_eq!(
         reopened
             .cast(&voter("v1"), ShardId(0), ballot(50, 1, 101))
@@ -929,8 +958,16 @@ async fn election_rules_are_fixed_by_the_open_transition() {
 
     let db = setup(1).await;
     let s = &db.store;
-    let on = ElectionRules { allow_blank: true };
-    let off = ElectionRules { allow_blank: false };
+    let on = ElectionRules {
+        allow_blank: true,
+        ..ElectionRules::default()
+    };
+    // 再投票の可否・上限も、同じ書き込みで固定する（ADR 0022）。
+    let off = ElectionRules {
+        allow_blank: false,
+        allow_revote: true,
+        max_revotes: 3,
+    };
     let initial = s.ensure_initialized(Period::default()).await.expect("init");
     assert_eq!(initial.rules, None, "scheduled の間は、まだ固定しない");
     // open への遷移（LWT）と同じ書き込みで固定する。遅れて来た 2 つ目の遷移は失敗し、値を変えない。
@@ -957,5 +994,158 @@ async fn election_rules_are_fixed_by_the_open_transition() {
     let snapshot = reopened.get().await.expect("get");
     assert_eq!(snapshot.phase, ElectionPhase::Closing);
     assert_eq!(snapshot.rules, Some(off));
+    db.teardown().await;
+}
+
+// --- 再投票（ADR 0022）---
+
+#[tokio::test]
+#[ignore = "requires ScyllaDB"]
+async fn revotes_bump_the_seq_with_lwt_and_track_the_slot() {
+    let db = setup(1).await;
+    let s = &db.store;
+    let alice = voter("alice");
+    let first = linked(1, 101, 7, 1, None);
+    s.cast(&alice, ShardId(0), first.clone())
+        .await
+        .expect("cast");
+    assert_eq!(
+        s.slot_state(&Slot([7; 32])).await,
+        Ok(Some(SlotState {
+            seq: 1,
+            last_ballot_hash: ballot_hash(&first)
+        }))
+    );
+    // 同じ分の中の再投票。ballot_id が前の版より小さくても、プールでは前の版の後に並ぶ（seq がクラスタリングキー）。
+    let mut second = linked(2, 102, 7, 2, Some(&first));
+    second.ballot_id = BallotId::from_random_bytes([0; 16]);
+    s.revote(&alice, ShardId(0), second.clone(), 1)
+        .await
+        .expect("revote");
+    assert_eq!(
+        s.revote(&alice, ShardId(0), linked(3, 103, 7, 2, Some(&first)), 1)
+            .await,
+        Err(CastError::RevoteConflict)
+    );
+    assert_eq!(
+        s.voted_contests(&alice).await,
+        Ok(vec![VotedContest {
+            contest: contest(1),
+            ballots: 2
+        }])
+    );
+    assert_eq!(
+        s.slot_state(&Slot([7; 32])).await,
+        Ok(Some(SlotState {
+            seq: 2,
+            last_ballot_hash: ballot_hash(&second)
+        }))
+    );
+    assert_eq!(
+        s.peek_pending(ShardId(0), 10).await,
+        Ok(vec![first.clone(), second.clone()])
+    );
+    // 件数による封印（先頭の 1 件）でも、前の版から封印される。
+    let signer = signer();
+    let g = genesis(&signer, 100);
+    s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
+    let batch = s.peek_pending(ShardId(0), 1).await.expect("peek");
+    assert_eq!(batch, vec![first]);
+    let block = seal_block(&g, batch, 101, &signer).expect("seal");
+    s.commit(ShardId(0), block.clone(), 1)
+        .await
+        .expect("commit");
+    // 封印したブロックの票は、つながりごと読み戻せる。
+    assert_eq!(s.head(ShardId(0)).await, Ok(Some(block)));
+    // participation 1 人・受理した票 2・未封印 1（最初の票ではない）。
+    let counts = s.audit_counts().await.expect("counts");
+    assert_eq!(
+        (
+            counts[0].participation,
+            counts[0].cast,
+            counts[0].pending,
+            counts[0].pending_initial
+        ),
+        (1, 2, 1, 0)
+    );
+    // 再投票を認めない選挙の票は、seq を NULL のまま保存する（1 票として数える）。
+    s.cast(&voter("bob"), ShardId(0), ballot(9, 1, 101))
+        .await
+        .expect("cast");
+    assert_eq!(
+        s.voted_contests(&voter("bob")).await,
+        Ok(vec![VotedContest {
+            contest: contest(1),
+            ballots: 1
+        }])
+    );
+    db.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ScyllaDB"]
+async fn lwt_lets_exactly_one_of_20_concurrent_revotes_through() {
+    let db = setup(1).await;
+    let alice = voter("alice");
+    let first = linked(1, 101, 3, 1, None);
+    db.store
+        .cast(&alice, ShardId(0), first.clone())
+        .await
+        .expect("cast");
+    let mut tasks = Vec::new();
+    for i in 0..20u8 {
+        let (store, alice) = (db.store.clone(), alice.clone());
+        let next = linked(10 + i, 102, 3, 2, Some(&first));
+        tasks.push(tokio::spawn(async move {
+            store.revote(&alice, ShardId(0), next, 1).await
+        }));
+    }
+    let (mut ok, mut conflicts) = (0, 0);
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(()) => ok += 1,
+            Err(CastError::RevoteConflict) => conflicts += 1,
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert_eq!((ok, conflicts), (1, 19));
+    assert_eq!(db.store.pending_len(ShardId(0)).await, Ok(2));
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ScyllaDB"]
+async fn audit_events_are_recorded_next_to_transitions() {
+    use application::{AuditEvent, ElectionStateStore};
+    use domain::{ElectionPhase, ElectionRules, Period};
+
+    let db = setup(1).await;
+    let s = &db.store;
+    s.ensure_initialized(Period::default()).await.expect("init");
+    s.transition(
+        ElectionPhase::Scheduled,
+        ElectionPhase::Open,
+        ElectionRules::default(),
+        "a",
+        10,
+    )
+    .await
+    .expect("open");
+    s.record_event(
+        AuditEvent::RevoteKeyDestroyed,
+        ElectionPhase::Open,
+        "sealer:x",
+        20,
+    )
+    .await
+    .expect("event");
+    let audit = s.recent_audit(10).await.expect("audit");
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[0].event, AuditEvent::RevoteKeyDestroyed);
+    assert_eq!(
+        (audit[0].from, audit[0].to),
+        (ElectionPhase::Open, ElectionPhase::Open)
+    );
+    assert_eq!(audit[1].event, AuditEvent::Transition);
     db.teardown().await;
 }

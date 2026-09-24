@@ -15,8 +15,8 @@ use shared_types::hex;
 use shared_types::{
     AnchorDto, AnchorsResponse, AuditCountsResponse, BallotStatusDto, BallotStatusResponse,
     BlocksPageResponse, CandidateDto, CandidatesResponse, ChainsResponse, ContestCountsDto,
-    ElectionStatusResponse, HeadDto, HeadRefDto, LoginRequest, LoginResponse, ShardSummaryDto,
-    VoteRequest, VoteResponse,
+    ElectionRulesDto, ElectionStatusResponse, HeadDto, HeadRefDto, LoginRequest, LoginResponse,
+    RevoteStatusDto, ShardSummaryDto, VoteRequest, VoteResponse,
 };
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -82,7 +82,30 @@ async fn election_status(
         now: i64::try_from(now).unwrap_or(i64::MAX),
         display_timezone: state.display_timezone.name.to_string(),
         display_timezone_offset_secs: state.display_timezone.offset_secs,
+        rules: Some(rules_dto(state.rules(&snapshot))),
     }))
+}
+
+fn rules_dto(rules: domain::ElectionRules) -> ElectionRulesDto {
+    ElectionRulesDto {
+        allow_blank: rules.allow_blank,
+        allow_revote: rules.allow_revote,
+        max_revotes: rules.max_revotes,
+    }
+}
+
+/// 投票を受け付けてよいか（原則18）。受け付けないなら、理由ごとのエラー。
+fn ensure_accepting(
+    snapshot: &application::ElectionStateSnapshot,
+    now: u64,
+) -> Result<(), ApiError> {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    match vote_gate(snapshot.phase, snapshot.period, now) {
+        VoteGate::Accept => Ok(()),
+        VoteGate::NotStarted => Err(ApiError::VotingNotStarted),
+        VoteGate::Closing => Err(ApiError::VotingClosing),
+        VoteGate::Ended => Err(ApiError::VotingClosed),
+    }
 }
 
 async fn healthz() -> Json<Value> {
@@ -120,6 +143,14 @@ async fn ballot_status(
     State(state): State<Arc<AppState>>,
     AuthedVoter(voter): AuthedVoter,
 ) -> Result<Json<BallotStatusResponse>, ApiError> {
+    let now = state.clock.now_unix_secs();
+    let snapshot = state.election_gate.snapshot(now).await?;
+    let rules = state.rules(&snapshot);
+    // 再投票を認める選挙だけ、上限と「今やり直せるか」を返す（前回の投票内容は返さない）。
+    let revote = rules.allow_revote.then(|| RevoteStatusDto {
+        max_revotes: rules.max_revotes,
+        open: ensure_accepting(&snapshot, now).is_ok(),
+    });
     let ballots = state
         .voting
         .ballot_status(&voter)
@@ -134,9 +165,10 @@ async fn ballot_status(
                 domain::VotingMethod::SingleChoice => shared_types::VotingMethod::SingleChoice,
             },
             voted: b.voted,
+            ballots_cast: b.ballots_cast,
         })
         .collect();
-    Ok(Json(BallotStatusResponse { ballots }))
+    Ok(Json(BallotStatusResponse { ballots, revote }))
 }
 
 /// 候補者の一覧（選挙データの並び順）と、白票を選べるか（`allow_blank`）。白票は候補者ではないので、一覧には入れない
@@ -175,30 +207,34 @@ async fn vote(
     Path((election_id, district_id)): Path<(String, String)>,
     Json(req): Json<VoteRequest>,
 ) -> Result<(StatusCode, Json<VoteResponse>), ApiError> {
-    // 投票を受け付けてよいのは、状態が open で、かつ 開始時刻 <= 現在時刻 < 終了時刻 のときだけ（原則18）。
+    // 投票（再投票も）を受け付けてよいのは、状態が open で、かつ 開始時刻 <= 現在時刻 < 終了時刻 のときだけ（原則18）。
     let now = state.clock.now_unix_secs();
     let snapshot = state.election_gate.snapshot(now).await?;
-    #[allow(clippy::cast_possible_wrap)]
-    let now_i64 = now as i64;
-    match vote_gate(snapshot.phase, snapshot.period, now_i64) {
-        VoteGate::Accept => {}
-        VoteGate::NotStarted => return Err(ApiError::VotingNotStarted),
-        VoteGate::Closing => return Err(ApiError::VotingClosing),
-        VoteGate::Ended => return Err(ApiError::VotingClosed),
-    }
+    ensure_accepting(&snapshot, now)?;
 
     let contest = contest_from_path(&election_id, &district_id)?;
     // 候補者 ID の形式が不正なら、その投票用紙に存在しない候補者として扱う。予約値 "blank" は白票。
     let candidate =
         CandidateId::parse(&req.candidate_id).map_err(|_| ApiError::InvalidCandidate)?;
-    // 白票を受け付けるかは、open の時点で固定した選挙のルール（原則19）。
-    let allow_blank = state.rules(&snapshot).allow_blank;
-    state
-        .voting
-        .cast_vote(&voter, contest, candidate, allow_blank)
-        .await?;
+    // 白票・再投票を受け付けるかは、open の時点で固定した選挙のルール（原則19）。
+    let rules = state.rules(&snapshot);
+    let result = match req.revote {
+        Some(expected) => {
+            state
+                .voting
+                .revote(&voter, contest, candidate, rules, expected)
+                .await
+        }
+        None => {
+            state
+                .voting
+                .cast_vote(&voter, contest, candidate, rules)
+                .await
+        }
+    };
+    result.map_err(|e| ApiError::from_service(e, rules))?;
     // 秘密投票: ここでは投票者も候補者もログに出さない。
-    tracing::debug!("投票を受理しました");
+    tracing::debug!(revote = req.revote.is_some(), "投票を受理しました");
     Ok((
         StatusCode::CREATED,
         Json(VoteResponse {
@@ -335,7 +371,19 @@ async fn chain_block(
         .ok_or(ApiError::NotFound)?;
     let signer = state.chains.signer_public_key().await?;
     let revealed = state.reveal.is_revealed(state.clock.now_unix_secs());
-    let detail = chain_view::block_detail(&block, revealed, &state.election, signer.as_ref());
+    // 票を返すときだけ、再投票の票が置き換えた前の版を、同じシャードのチェーンから探す（ビューアのリンク用）。
+    let replaced = if revealed {
+        chain_view::find_replaced(state.chains.as_ref(), shard_id, &block).await?
+    } else {
+        Default::default()
+    };
+    let detail = chain_view::block_detail(
+        &block,
+        revealed,
+        &state.election,
+        signer.as_ref(),
+        &replaced,
+    );
     Ok(cached(
         chain_view::block_detail_cache(revealed),
         Json(detail),
@@ -392,6 +440,8 @@ fn anchor_dto(anchor: &domain::Anchor) -> AnchorDto {
 async fn audit_counts(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AuditCountsResponse>, ApiError> {
+    // 受理した票の数（再投票を含む）は、票の中身を公開してよいときだけ返す（再投票の件数は締切後だけ公開する）。
+    let revealed = state.reveal.is_revealed(state.clock.now_unix_secs());
     let contests = state
         .voting
         .audit_counts()
@@ -401,6 +451,8 @@ async fn audit_counts(
             contest_id: c.contest.to_string(),
             participation: c.participation,
             pending: c.pending,
+            cast: revealed.then_some(c.cast),
+            pending_initial: revealed.then_some(c.pending_initial),
         })
         .collect();
     Ok(Json(AuditCountsResponse { contests }))

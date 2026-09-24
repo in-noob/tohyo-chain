@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use super::compute::{DistrictTally, GroupTotal, Tally};
+use super::compute::{DistrictTally, GroupTotal, RevoteReport, Tally};
 use super::gate::Phase;
 use super::{Meta, Reconciliation};
 
@@ -210,6 +210,47 @@ pub fn render(
     out
 }
 
+/// 再投票の件数と変更の内訳（A→B の件数表。締切後の集計だけで表示する）。白票は `blank_name`。
+pub fn render_revotes(report: &RevoteReport, ballot_item: &str, blank_name: &str) -> String {
+    let mut out = String::from("■ 再投票（締切後）\n");
+    let _ = writeln!(
+        out,
+        "  再投票の件数: {} 件（投票した有権者 {} 人。集計は、それぞれの最後の票だけを数えています）",
+        report.revotes, report.slots
+    );
+    if report.contests.is_empty() {
+        return out;
+    }
+    let name = |id: &str, name: &Option<String>| match name {
+        Some(name) => name.clone(),
+        None if id == domain::BLANK_CANDIDATE_ID => blank_name.to_string(),
+        None => id.to_string(),
+    };
+    let rows: Vec<Vec<String>> = report
+        .contests
+        .iter()
+        .flat_map(|c| {
+            c.changes.iter().map(move |change| {
+                vec![
+                    format!("{}（{}）", c.name, c.type_name),
+                    format!(
+                        "{} → {}",
+                        name(&change.from_candidate_id, &change.from_name),
+                        name(&change.to_candidate_id, &change.to_name)
+                    ),
+                    change.count.to_string(),
+                ]
+            })
+        })
+        .collect();
+    out.push_str(&table(
+        &[ballot_item, "変更の内訳（前 → 後）", "件数"],
+        &rows,
+        &[false, false, true],
+    ));
+    out
+}
+
 /// 突合の結果（検証と突合が済んでいる前提の要約）。
 pub fn render_reconciliation(recon: &Reconciliation, ballot_item: &str) -> String {
     let mismatched = recon.contests.iter().filter(|r| !r.consistent).count();
@@ -222,7 +263,7 @@ pub fn render_reconciliation(recon: &Reconciliation, ballot_item: &str) -> Strin
     );
     let _ = writeln!(
         out,
-        "  {ballot_item}別の突合（投票済み記録 = 封印済みの票）: {} 枚中 {} 枚が一致、未封印 {unsealed} 件",
+        "  {ballot_item}別の突合（投票済み記録 = 封印済みの slot の数（再投票は 1 人 1 つ））: {} 枚中 {} 枚が一致、未封印 {unsealed} 件",
         recon.contests.len(),
         recon.contests.len() - mismatched
     );

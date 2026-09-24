@@ -20,6 +20,12 @@ pub const DEFAULT_BLANK_OPTION: &str = "白票（どの候補者にも投票し�
 pub const DEFAULT_BLANK_CONFIRM: &str = "白票として投票します。よろしいですか？";
 /// 白票の呼び名（`labels.blank_name`）。ビューアの票の一覧で使う。
 pub const DEFAULT_BLANK_NAME: &str = "白票";
+/// 全投票完了の画面の、やり直しのボタン（`labels.revote_button`）。
+pub const DEFAULT_REVOTE_BUTTON: &str = "投票をやり直す";
+/// やり直しの確認画面の文言（`labels.revote_confirm`）。前回の投票内容は表示しない。
+pub const DEFAULT_REVOTE_CONFIRM: &str = "前回の投票内容を変更します";
+/// 上限に達した投票用紙の理由（`labels.revote_limit_reached`。`{max}` は上限回数）。
+pub const DEFAULT_REVOTE_LIMIT_REACHED: &str = "やり直しの上限（{max}回）に達しています";
 
 pub fn site_title() -> &'static str {
     option_env!("APP_WEB_SITE_TITLE").unwrap_or(DEFAULT_SITE_TITLE)
@@ -55,6 +61,18 @@ pub fn blank_name() -> &'static str {
     option_env!("APP_WEB_BLANK_NAME").unwrap_or(DEFAULT_BLANK_NAME)
 }
 
+pub fn revote_button() -> &'static str {
+    option_env!("APP_WEB_REVOTE_BUTTON").unwrap_or(DEFAULT_REVOTE_BUTTON)
+}
+
+pub fn revote_confirm() -> &'static str {
+    option_env!("APP_WEB_REVOTE_CONFIRM").unwrap_or(DEFAULT_REVOTE_CONFIRM)
+}
+
+pub fn revote_limit_reached() -> &'static str {
+    option_env!("APP_WEB_REVOTE_LIMIT_REACHED").unwrap_or(DEFAULT_REVOTE_LIMIT_REACHED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +103,18 @@ mod tests {
         }
         if option_env!("APP_WEB_BLANK_NAME").is_none() {
             assert_eq!(blank_name(), "白票");
+        }
+        if option_env!("APP_WEB_REVOTE_BUTTON").is_none() {
+            assert_eq!(revote_button(), "投票をやり直す");
+        }
+        if option_env!("APP_WEB_REVOTE_CONFIRM").is_none() {
+            assert_eq!(revote_confirm(), "前回の投票内容を変更します");
+        }
+        if option_env!("APP_WEB_REVOTE_LIMIT_REACHED").is_none() {
+            assert_eq!(
+                revote_limit_reached(),
+                "やり直しの上限（{max}回）に達しています"
+            );
         }
     }
 }

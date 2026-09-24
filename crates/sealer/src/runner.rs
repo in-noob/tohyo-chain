@@ -6,13 +6,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use application::{ElectionStateSnapshot, ElectionStateStore, StoreError};
+use application::{ElectionStateSnapshot, ElectionStateStore, RevoteKeyVault, StoreError};
 use domain::{ElectionPhase, ElectionRules, automatic_transition, voting_started_at};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::coordinator::Coordinator;
+use crate::revote_key::destroy_revote_key;
 use crate::schedule::AnchorSchedule;
 use crate::sealer::Sealer;
 
@@ -44,7 +45,8 @@ impl SealerHandle {
 /// `election` / `election_grace`: 選挙状態（scheduled → open → closing → closed）の自動遷移と
 /// 締切の手続きを、このプロセス内のスケジューラが行う（原則17。memory モードにはリース・複数プロセスが
 /// 無いので、Coordinator の「アンカー担当」に相当する役割を、この唯一の sealer タスクがそのまま担う）。
-/// `rules` は、open に遷移させるときに選挙状態へ固定する選挙のルール（設定 `vote.allow_blank`。原則19）。
+/// `rules` は、open に遷移させるときに選挙状態へ固定する選挙のルール（設定 `vote.*`。原則19）。
+/// `revote_keys` は、締切の手続きの中で破棄する再投票の鍵（ADR 0022。api と同じものを渡すと、api のメモリ上の鍵も消える）。
 pub fn spawn(
     mut sealer: Sealer,
     tick: Duration,
@@ -52,6 +54,7 @@ pub fn spawn(
     election: Arc<dyn ElectionStateStore>,
     election_grace: Duration,
     rules: ElectionRules,
+    revote_keys: Arc<RevoteKeyVault>,
 ) -> SealerHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -76,7 +79,8 @@ pub fn spawn(
                         tracing::error!(error = %e, "アンカーの作成に失敗しました");
                     }
                     if let Some(snapshot) = snapshot {
-                        election_tick(&mut sealer, &election, snapshot, election_grace, rules, &mut closing_deadline).await;
+                        let duty = ElectionDuty { election: &election, grace: election_grace, rules, revote_keys: &revote_keys };
+                        election_tick(&mut sealer, &duty, snapshot, &mut closing_deadline).await;
                     }
                 }
                 // 停止指示、または送信側の破棄。
@@ -107,15 +111,27 @@ async fn election_snapshot(
     }
 }
 
+/// memory モードの選挙状態の遷移に使うもの（`spawn` の引数）。
+struct ElectionDuty<'a> {
+    election: &'a Arc<dyn ElectionStateStore>,
+    grace: Duration,
+    rules: ElectionRules,
+    revote_keys: &'a RevoteKeyVault,
+}
+
 /// memory モードの選挙状態の遷移（原則17）。`spawn` のループから、tick ごとに呼ぶ。
 async fn election_tick(
     sealer: &mut Sealer,
-    election: &Arc<dyn ElectionStateStore>,
+    duty: &ElectionDuty<'_>,
     snapshot: ElectionStateSnapshot,
-    grace: Duration,
-    rules: ElectionRules,
     closing_deadline: &mut Option<Duration>,
 ) {
+    let ElectionDuty {
+        election,
+        grace,
+        rules,
+        revote_keys,
+    } = *duty;
     let wall_now = i64::try_from(sealer.wall_now_unix_secs()).unwrap_or(i64::MAX);
     const ACTOR: &str = "sealer:memory";
 
@@ -145,6 +161,22 @@ async fn election_tick(
             sealer.close_flush().await;
             let deadline = *closing_deadline.get_or_insert_with(|| sealer.now() + grace);
             if sealer.now() < deadline {
+                return;
+            }
+            // 投票の受け付けが止まった（待ち時間が過ぎた）ので、再投票の鍵を破棄する（ADR 0022）。
+            // 失敗したら closed に進めない（次の周期で再試行）。
+            let frozen = ElectionRules::effective(snapshot.rules, rules);
+            if let Err(e) = destroy_revote_key(
+                revote_keys,
+                election.as_ref(),
+                frozen,
+                ElectionPhase::Closing,
+                ACTOR,
+                wall_now,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "再投票の鍵の破棄に失敗しました");
                 return;
             }
             match sealer.total_pending().await {

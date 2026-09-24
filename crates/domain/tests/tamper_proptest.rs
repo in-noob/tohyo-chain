@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use domain::encoding::{HEADER_LEN, decode_ballot, decode_header, encode_ballot, encode_header};
 use domain::{
     Ballot, BallotId, Block, CandidateId, ContestId, DistrictId, Ed25519Signer, ElectionId,
-    genesis, seal_block, verify_chain,
+    RevoteLink, Slot, genesis, seal_block, verify_chain,
 };
 use proptest::prelude::*;
 
@@ -39,10 +39,20 @@ fn build_chain(seed: &[u8; 32], groups: &[BTreeMap<[u8; 16], u32>]) -> (Vec<Bloc
             .iter()
             .map(|(id, cand)| {
                 let (contest_id, candidate_id) = sample_ids(*cand);
+                // 一部の票に、再投票のつながり（版 3）を付ける。改ざんは、つながりのバイトも対象になる。
+                let revote = (cand % 2 == 0).then(|| {
+                    let seq = cand % 4 + 1;
+                    RevoteLink {
+                        slot: Slot([id[0]; 32]),
+                        seq,
+                        supersedes: (seq > 1).then_some([id[1]; 32]),
+                    }
+                });
                 Ballot {
                     ballot_id: BallotId(*id),
                     contest_id,
                     candidate_id,
+                    revote,
                 }
             })
             .collect();

@@ -185,7 +185,7 @@ APP__CREDENTIALS__OUTPUT_FILE_ENABLED=false cargo run -q -p credgen -- --confirm
 ## DB のリセット（`scripts/db_reset.sh`）
 
 ```
-scripts/db_reset.sh            # = --votes: 投票済み記録・票のプール・ブロック・アンカー・リースを削除（選挙の定義と認証情報は残す）
+scripts/db_reset.sh            # = --votes: 投票済み記録・再投票の状態（slot_state）・票のプール・ブロック・アンカー・リースを削除（選挙の定義と認証情報は残す）
 scripts/db_reset.sh --all      # キースペースを削除して、スキーマから作り直す（認証情報も消える）
 scripts/db_reset.sh --yes      # 確認を省略
 ```
@@ -222,7 +222,7 @@ scripts/db_reset.sh --yes      # 確認を省略
 |---|---|
 | `/chain` | シャードの一覧と、それぞれの先頭ブロック。署名者の公開鍵。「このチェーンを検証するには」（verifier のコマンド）|
 | `/chain/{shard}` | ブロックの一覧（新しい順。「さらに古いブロックを表示」でページ送り）|
-| `/chain/{shard}/blocks/{height}` | ブロックの詳細: 高さ・ブロックハッシュ・前のブロックのハッシュ（前のブロックへのリンク）・Merkle 根・票数・封印時刻（分単位）・署名・署名者の公開鍵。締切後（`reveal_ballots=always` なら常に）は、票の一覧（`ballot_id` のハッシュ順）と、選挙区・候補者の表示名 |
+| `/chain/{shard}/blocks/{height}` | ブロックの詳細: 高さ・ブロックハッシュ・前のブロックのハッシュ（前のブロックへのリンク）・Merkle 根・票数・封印時刻（分単位）・署名・署名者の公開鍵。締切後（`reveal_ballots=always` なら常に）は、票の一覧（`ballot_id` のハッシュ順）と、選挙区・候補者の表示名。再投票の票には「#<前の票> を置き換え（A→B）」のリンク（[再投票](#再投票)）|
 | `/chain/anchors` | アンカーの一覧と、各アンカーが指す各シャードの先頭ブロックへのリンク |
 
 **API**（認証なし）:
@@ -239,7 +239,7 @@ scripts/db_reset.sh --yes      # 確認を省略
   （CDN でキャッシュできる）。ただし、**内容がこの先変わる応答には付けない**: 締切前の詳細は票が伏せられていて、締切後に中身が変わる
   ので、`immutable` にすると、票なしの版が CDN に 1 年残ってしまう。
 - **`chain.reveal_ballots=after_close`**（要 `election.voting_closes_at`）: 締切前は、詳細に票の中身（`ballot_id`・`contest_id`・
-  `candidate_id`）を含めず、ヘッダー（ハッシュ・Merkle 根・票数・署名など）だけを返す（`ballots_revealed: false`）。締切は、api の時計で判定する
+  `candidate_id`・再投票の `slot` / `seq` / `supersedes`）を含めず、ヘッダー（ハッシュ・Merkle 根・票数・署名など）だけを返す（`ballots_revealed: false`）。締切は、api の時計で判定する
   （締切ちょうどから公開。api の再起動は不要）。**ブロックのハッシュは票から再計算するので、このとき、`verifier verify` /
   `tally` も、締切後にしかできない**（締切前は「票が非公開のため、締切後に実行してください」と表示して、終了コード 4）。
   既定の `always` は、これまでどおり、常に公開。
@@ -282,8 +282,10 @@ scripts/tally.sh --allow-interim          # closed になる前の中間集計�
 
 **集計の前に、必ず次を行い、どれかが通らなければ集計しない**（改ざんされたデータを集計しても意味がないため）:
 
-1. チェーン全体の検証と、投票済み記録（participation）との突合 — 失敗したら中止（終了コード 3）。突合は、投票用紙ごとの
-   件数の一致、`ballot_id` の重複、アンカーの確認。
+1. チェーン全体の検証と、投票済み記録（participation）との突合 — 失敗したら中止（終了コード 3）。検証には、再投票のつながり
+   （slot ごとに seq が 1 から連続・supersedes が 1 つ前の票のハッシュ・上限・再投票を認めない選挙に 2 回目の票が無い）を含む。
+   突合は、投票用紙ごとの件数の一致（participation = チェーン内の slot の数（重複を除く）+ 未封印の最初の票）、`ballot_id` の重複、
+   アンカーの確認。
 2. 未封印の票が残っていないこと — 残っていれば、件数を表示して中止（終了コード 4）。`--allow-interim` でも通らない。
    残りの票は、締切の手続き（選挙状態 `closing`。[選挙状態](#選挙状態選挙のスケジュールscriptselectionsh)を参照）の中でだけ
    封印される（sealer の停止ではフラッシュしない）ので、`closed` になるのを待ってから、もう一度実行する。
@@ -300,6 +302,7 @@ scripts/tally.sh --allow-interim          # closed になる前の中間集計�
 | 都道府県別の合計 | 表示、`prefectures.csv`、`tally.json` |
 | 選挙の種類別の合計 | 表示、`types.csv`、`tally.json` |
 | 突合の結果（シャード・ブロック・票数、投票用紙ごとの一致、重複、アンカー） | 表示、`reconciliation.csv`、`tally.json` |
+| 再投票の件数と変更の内訳（前の票の投票先 → 次の票の投票先の件数表。**締切後（closed）の集計だけ**。中間集計では出さない） | 表示、`revotes.csv`、`tally.json` の `revotes` |
 
 - 表示名は、seed（選挙区・候補者・政党・選挙の種類・都道府県）と、設定 `labels.ballot_item`（表の見出し）・`labels.blank_name`
   （白票の行・列の名前。既定「白票」）から取る。
@@ -327,7 +330,7 @@ scripts/tally.sh --allow-interim          # closed になる前の中間集計�
 | [config/dev.toml](config/dev.toml) | 開発用（`app.env=dev`）。default との差分だけ（封印間隔 10 秒など）|
 | [config/production.example.toml](config/production.example.toml) | 本番用の例。`config/production.toml` にコピーして使う（`app.env=production` では必須）|
 | `config/local.toml` | 手元だけの上書き（**gitignore**）|
-| `secrets/` | 秘密情報。1 ファイル 1 値（**gitignore**）: `secrets/session_secret`、`secrets/sealer_signing_seed`、`secrets/admin_token` |
+| `secrets/` | 秘密情報。1 ファイル 1 値（**gitignore**）: `secrets/session_secret`、`secrets/sealer_signing_seed`、`secrets/admin_token`、`secrets/revote_key`（再投票の鍵。このファイルでだけ渡せる。[再投票](#再投票)）|
 
 **優先順位（後のものが勝つ）**: `default.toml` → `config/<app.env>.toml` → `config/local.toml` → `secrets/` → 環境変数。
 環境変数は `APP__<セクション>__<項目>`（大文字。例: `APP__SEAL__MAX_BALLOTS=5`、`APP__DB__NODES=host1:9042,host2:9042`）。
@@ -372,8 +375,9 @@ eval "$(cargo run -q -p app-config -- web-env)"   # 画面の文言（labels.*�
 | `election.seed_dir` / `election.election_id` | `seed` / `2026-general` | 選挙データのディレクトリと、読み込む選挙の ID（`<seed_dir>/<election_id>/`）。[選挙データ](#選挙データ)を参照 |
 | `election.voting_opens_at` / `voting_closes_at` | 空 | 投票の開始（RFC 3339。**未実装**）/ 締切（RFC 3339。`verifier tally` の「締切後の集計か」の判定と、`chain.reveal_ballots=after_close` の公開の判定に使う。空だと `--allow-interim` なしでは集計できない。api は、締切後の投票を拒否しない）|
 | `vote.allow_blank` | `true` | 白票を選べるか（[白票](#白票)）。選挙状態が `open` に移った時点の値を固定し、それ以降は設定を変えても使わない（原則19）|
+| `vote.allow_revote` / `vote.max_revotes` | `false` / `5` | 投票期間中の再投票を認めるか・上限回数（1〜100。初回の投票を含めない）（[再投票](#再投票)）。`open` に移った時点で固定する |
 | `chain.reveal_ballots` | `always` | ブロックの詳細で票の中身を公開するタイミング（`always` = 常に / `after_close` = `election.voting_closes_at` 以後だけ。要 `voting_closes_at`）。[ビューア](#ブロックチェーンのビューアchain)を参照 |
-| `labels.*` | 現行の文言 | 画面・API のエラー・集計の文言（`site_title` / `done_message` / `login_heading` / `ballot_item`（既定「投票用紙」）/ `progress`（既定「{total}枚中{current}枚目」）/ `blank_option`（白票の選択肢。既定「白票（どの候補者にも投票しない）」）/ `blank_confirm`（白票の確認の文言。既定「白票として投票します。よろしいですか？」）/ `blank_name`（集計・ビューア・エラーでの白票の呼び名。既定「白票」））|
+| `labels.*` | 現行の文言 | 画面・API のエラー・集計の文言（`site_title` / `done_message` / `login_heading` / `ballot_item`（既定「投票用紙」）/ `progress`（既定「{total}枚中{current}枚目」）/ `blank_option`（白票の選択肢。既定「白票（どの候補者にも投票しない）」）/ `blank_confirm`（白票の確認の文言。既定「白票として投票します。よろしいですか？」）/ `blank_name`（集計・ビューア・エラーでの白票の呼び名。既定「白票」）/ `revote_button`（既定「投票をやり直す」）/ `revote_confirm`（既定「前回の投票内容を変更します」）/ `revote_limit_reached`（上限の理由。`{max}` は上限回数。既定「やり直しの上限（{max}回）に達しています」））|
 
 **旧来の環境変数名からの移行**（旧名は廃止した）:
 
@@ -461,7 +465,7 @@ cargo run -q -p seedgen -- --check seed              # 既存のデータ（手�
   （「「○○」に投票します」）ではなく、`labels.blank_confirm`（「白票として投票します。よろしいですか？」）を表示する。
 - **API**: `POST /api/v1/contests/{election_id}/{district_id}/vote` の `candidate_id` に、予約値 `"blank"` を指定する（小文字の
   完全一致。`"BLANK"` などは存在しない候補者として 422 `invalid_candidate`）。`GET …/candidates` は、候補者の一覧（白票は含めない）と、
-  白票を選べるか（`allow_blank`）を返す。白票でも、その投票用紙は投票済みになる（再投票は 409）。
+  白票を選べるか（`allow_blank`）を返す。白票でも、その投票用紙は投票済みになる（再投票を認めない選挙では、2 回目の投票は 409）。
 - **白票を使わない選挙**: `vote.allow_blank = false` にすると、画面に白票の選択肢を出さず、API も 422 `blank_not_allowed` で拒否する。
   この値は選挙のルールなので、選挙状態が `open` に移った時点で、open に移したプロセス（db モードは sealer、memory モードと
   `open --now` は api）の設定の値を選挙状態（DB の `election_state.allow_blank`。memory モードはプロセス内）に固定し、それ以降は
@@ -469,11 +473,35 @@ cargo run -q -p seedgen -- --check seed              # 既存のデータ（手�
 - **チェーン・ビューア・集計**: 票の `candidate_id` に `blank` がそのまま入る（ブロックの形式は変わらない）。ビューアは、白票を
   `labels.blank_name` で、候補者と区別できる書式で表示し、ブロックの「投票先別の票数」でも候補者の後の別の行にする。集計は上記の
   [集計](#集計verifier-tally--scriptstallysh)を参照。
-- この列を追加する前に作った DB のキースペースは、`ALTER TABLE <keyspace>.election_state ADD allow_blank boolean;` を一度実行するか、
-  `scripts/db_reset.sh --all` で作り直す。
 
-**チェーンの形式（版 2）**: 票の `contest_id` / `candidate_id` は文字列で、票の正規化バイト列は
+### 再投票
+
+`vote.allow_revote = true`（既定 `false`）の選挙では、投票期間中（状態が `open` で、期間内）に、投票済みの投票用紙に投票し直せる
+（上限は `vote.max_revotes` 回。既定 5。[ADR 0022](docs/adr/0022-revote.md)）。集計は、それぞれの最後の票だけを数える。
+
+- **鍵**: `secrets/revote_key`（64 桁の hex。`APP_SECRETS_DIR` の下）。**このファイルでだけ渡せる**（環境変数では渡せない）。
+  再投票の仮名 `slot = HMAC-SHA256(revote_key, election_id ‖ voter_id ‖ contest_id)` の計算に使い、ログにも DB にも出さない。
+  鍵が無いと、api は起動しない。**締切の手続き（`closing`）の中で、ファイルごと破棄される**（`election_audit` に
+  `revote_key_destroyed`。`scripts/election.sh status` の監査ログに出る）。`scripts/dev_up.sh` は、`vote.allow_revote = true` で鍵が
+  無ければ、乱数で作る。作り方の例: `(umask 077; od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > secrets/revote_key)`。
+- **画面**: すべての投票用紙に投票した後の完了画面に「投票をやり直す」（`labels.revote_button`。期間内だけ）→ 投票済みの投票用紙の
+  一覧（固定の順番）から 1 枚を選ぶ（上限に達したものは選べず、理由 `labels.revote_limit_reached` を表示）→ 候補者を選ぶ →
+  確認画面は「前回の投票内容を変更します」（`labels.revote_confirm`）。**前回の投票内容は、画面にも API にも出さない**。
+- **API**: `POST …/vote` の本文に `"revote": <見た票の数>`（`GET /api/v1/ballot-status` の、その投票用紙の `ballots_cast`）を足す。
+  その値のときだけ再投票する（同時に 2 つ送っても、1 件だけが 201、残りは 409 `revote_conflict`）。`revote` を省くと、投票済みの
+  投票用紙には 409 `already_voted`。上限は 409 `revote_limit_reached`、再投票を認めない選挙は 409 `revote_not_allowed`、
+  まだ投票していない投票用紙は 409 `not_voted`。`ballot-status` は、再投票を認める選挙だけ `revote: { max_revotes, open }` を返す。
+- **チェーン**: 票に `slot`・`seq`（その slot の何番目の票か）・`supersedes`（1 つ前の票のハッシュ）が入る（ブロックの形式の版 3）。
+  同じ slot の票は、同じシャード（`hash(slot)`）に入る。再投票を認めない選挙の票は、これまでと同じ（slot を記録しない）。
+- **検証・集計**: `verifier verify` / `tally` が、再投票のつながりと突合を確認する（[集計](#集計verifier-tally--scriptstallysh)）。
+  締切後の集計だけ、再投票の件数と変更の内訳（`revotes.csv`）を出す。
+- **DB**: 再投票に対応する前に作ったキースペースは、表の形（`ballot_pool` のクラスタリングキー・`slot_state`・`blocks` の票の形）が
+  違うので、`scripts/db_reset.sh --all` で作り直す（api / sealer は接続時に検出して、手順つきで起動を拒否する）。
+
+**チェーンの形式（版 3）**: 票の `contest_id` / `candidate_id` は文字列で、票の正規化バイト列は
 `ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id`（[ADR 0013](docs/adr/0013-string-ids-and-chain-format-v2.md)）。
+版 3 から、再投票のつながりを持つ票だけ、後ろに `0x01 ‖ slot(32) ‖ seq(4)` または `0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32)` を足す
+（つながりの無い票は版 2 と同じバイト列。[ADR 0022](docs/adr/0022-revote.md)）。
 DB のスキーマも文字列（`text`）になった。旧いスキーマ・旧いチェーンとは互換性がないので、既存のキースペース（手動で使う `vote` など）は、
 `DROP KEYSPACE` して `docs/schema.cql` を投入し直す（接続時に、旧いスキーマなら、その手順つきで失敗する）。
 
@@ -511,11 +539,11 @@ scripts/check_all.sh        # 上記に加えて、scripts/check/*.sh の全ス�
 
 | スイート | 内容 | 目安の時間 |
 |---|---|---|
-| `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`）・白票（投票 → 封印 → tally の白票の数・`vote.allow_blank=false` での拒否） | 約 5 分（Docker が必要） |
-| `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API・封印ルール（原則9: 最小件数・close --now での締切の封印） | 約 8〜9 分（Docker が必要） |
+| `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`）・白票（投票 → 封印 → tally の白票の数・`vote.allow_blank=false` での拒否）・再投票（A → B → 白票・上限・同時の再投票・締切での鍵の破棄・tally は最後の票だけ・`vote.allow_revote=false` では 409） | 約 5 分（Docker が必要） |
+| `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API・封印ルール（原則9: 最小件数・close --now での締切の封印）・再投票（DB の LWT・締切前の非公開・sealer による鍵の破棄・verify / tally・置き換えのリンク） | 約 10 分（Docker が必要） |
 | `election.sh` | 投票フロー（ログイン・状態・候補者・投票・再投票拒否・並列・対象外・秘密投票）・47 都道府県規模の選挙データ（生成・表示範囲・投票順・壊れたデータの検出）・選挙状態の遷移と投票の受付期間（schedule → 自動 open → 自動 closing → closed・期間の境界・締切直前の票の封印・公開用ポートと管理用リスナーの分離） | 約 1.5 分 |
 | `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh` | 約 1.5 分（Docker が必要） |
-| `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release`・白票（選択肢・確認の文言・ビューアの別の行） | 数秒〜数十秒 |
+| `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release`・白票（選択肢・確認の文言・ビューアの別の行）・投票のやり直し（完了画面のボタン・一覧・上限の理由・確認の文言・置き換えのリンク） | 数秒〜数十秒 |
 | `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
 
 `core.sh` と `chain.sh`、`auth.sh` は Docker（Compose プラグイン）が必要で、DB を起動する。DB の起動に失敗したときは、

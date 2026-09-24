@@ -8,14 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use application::{
-    CastError, ChainRead, Clock, ContestCounts, CredentialAdmin, CredentialRecord, CredentialStore,
-    ElectionAuditEntry, ElectionStateSnapshot, ElectionStateStore, LeaseStore, RegistryEntry,
-    SealStore, StoreError, VoteStore, VoterRoll,
+    AuditEvent, CastError, ChainRead, Clock, ContestCounts, CredentialAdmin, CredentialRecord,
+    CredentialStore, ElectionAuditEntry, ElectionStateSnapshot, ElectionStateStore, LeaseStore,
+    RegistryEntry, SealStore, SlotState, StoreError, VoteStore, VotedContest, VoterRoll,
 };
 use async_trait::async_trait;
 use domain::{
     Anchor, Ballot, Block, ContestId, DistrictId, ElectionPhase, ElectionRules, Period, ShardId,
-    VoterId,
+    Slot, VoterId, ballot_hash,
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -28,8 +28,30 @@ use scylla::value::{CqlValue, Row};
 
 use crate::convert::{
     AnchorRow, BallotTuple, BlockRow, anchor_from_row, anchor_to_values, ballot_from_tuple,
-    block_from_row, block_to_values, minute_bucket, pool_delete_timestamp,
+    block_from_row, block_to_values, minute_bucket, pool_delete_timestamp, revote_to_blob,
 };
+
+/// プールの行のキー（`received_minute`, `seq`, `ballot_id`）。
+type PoolKey = (i64, i32, Vec<u8>);
+
+/// プールの `seq` 列（クラスタリングキー）: 再投票のつながりの `seq`、無ければ 0。同じ分の中では、前の版が先に並ぶ
+/// （封印は先頭から取るので、次の版が前の版より先に封印されない。ADR 0022）。
+fn pool_seq(ballot: &Ballot) -> i32 {
+    ballot
+        .revote
+        .map_or(0, |link| i32::try_from(link.seq).unwrap_or(i32::MAX))
+}
+
+/// participation の `seq` 列から、受理した票の数（NULL = 再投票を認めない選挙の 1 票）。
+fn participation_ballots(seq: Option<i32>) -> Result<u32, StoreError> {
+    match seq {
+        None => Ok(1),
+        Some(n) => u32::try_from(n)
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or(StoreError::Corrupt),
+    }
+}
 
 /// DB 操作を再試行する最大回数（タイムアウトなど一時的な失敗のため）。
 const MAX_ATTEMPTS: u32 = 5;
@@ -65,7 +87,11 @@ struct Statements {
     insert_participation: PreparedStatement,
     select_attempt: PreparedStatement,
     delete_participation: PreparedStatement,
+    revote_participation: PreparedStatement,
+    revert_participation: PreparedStatement,
     select_voted: PreparedStatement,
+    upsert_slot_state: PreparedStatement,
+    select_slot_state: PreparedStatement,
     insert_pool: PreparedStatement,
     select_pool_head: PreparedStatement,
     select_pool_keys: PreparedStatement,
@@ -212,13 +238,14 @@ impl ScyllaStore {
         let ks = config.keyspace.as_str();
         let p = |cql: String, consistency| prepare(&session, cql.replace("{ks}", ks), consistency);
         let stmts = Statements {
+            // seq: 再投票を認める選挙だけ 1（認めない選挙では NULL。slot に関わる情報を持たない）。
             insert_participation: p(
-                "INSERT INTO {ks}.participation (voter_id, contest_id, attempt) VALUES (?, ?, ?) IF NOT EXISTS".into(),
+                "INSERT INTO {ks}.participation (voter_id, contest_id, attempt, seq) VALUES (?, ?, ?, ?) IF NOT EXISTS".into(),
                 quorum,
             )
             .await?,
             select_attempt: p(
-                "SELECT attempt FROM {ks}.participation WHERE voter_id = ? AND contest_id = ?".into(),
+                "SELECT attempt, seq FROM {ks}.participation WHERE voter_id = ? AND contest_id = ?".into(),
                 serial,
             )
             .await?,
@@ -227,28 +254,52 @@ impl ScyllaStore {
                 quorum,
             )
             .await?,
+            // 再投票: seq = n のときだけ n + 1 にする（同時に送られても 1 件だけが成功する）。
+            revote_participation: p(
+                "UPDATE {ks}.participation SET seq = ?, attempt = ? WHERE voter_id = ? AND contest_id = ? IF seq = ?".into(),
+                quorum,
+            )
+            .await?,
+            // 再投票の取り消し（補償）: 自分の試行（attempt）で n + 1 にした行だけを、n に戻す。
+            revert_participation: p(
+                "UPDATE {ks}.participation SET seq = ? WHERE voter_id = ? AND contest_id = ? IF seq = ? AND attempt = ?".into(),
+                quorum,
+            )
+            .await?,
             select_voted: p(
-                "SELECT contest_id FROM {ks}.participation WHERE voter_id = ?".into(),
+                "SELECT contest_id, seq FROM {ks}.participation WHERE voter_id = ?".into(),
                 serial,
+            )
+            .await?,
+            // slot_state の書き込み時刻は「分の先頭 + seq」（マイクロ秒）: participation の LWT とマイクロ秒で突き合わせ
+            // られないよう分に丸め、同じ分の中でも、後の版（seq が大きい）が必ず勝つようにする。
+            upsert_slot_state: p(
+                "INSERT INTO {ks}.slot_state (slot, seq, last_ballot_hash) VALUES (?, ?, ?) USING TIMESTAMP ?".into(),
+                quorum,
+            )
+            .await?,
+            select_slot_state: p(
+                "SELECT seq, last_ballot_hash FROM {ks}.slot_state WHERE slot = ?".into(),
+                quorum,
             )
             .await?,
             // 書き込み時刻を分に丸めて指定する（participation の LWT とマイクロ秒で突き合わせられないように）。
             insert_pool: p(
-                "INSERT INTO {ks}.ballot_pool (shard, received_minute, ballot_id, contest_id, candidate_id) \
-                 VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?"
+                "INSERT INTO {ks}.ballot_pool (shard, received_minute, seq, ballot_id, contest_id, candidate_id, revote) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?"
                     .into(),
                 quorum,
             )
             .await?,
             select_pool_head: p(
-                "SELECT received_minute, ballot_id, contest_id, candidate_id FROM {ks}.ballot_pool \
+                "SELECT received_minute, ballot_id, contest_id, candidate_id, revote FROM {ks}.ballot_pool \
                  WHERE shard = ? LIMIT ?"
                     .into(),
                 quorum,
             )
             .await?,
             select_pool_keys: p(
-                "SELECT received_minute, ballot_id FROM {ks}.ballot_pool WHERE shard = ?".into(),
+                "SELECT received_minute, seq, ballot_id FROM {ks}.ballot_pool WHERE shard = ?".into(),
                 quorum,
             )
             .await?,
@@ -258,7 +309,7 @@ impl ScyllaStore {
             )
             .await?,
             delete_pool: p(
-                "DELETE FROM {ks}.ballot_pool USING TIMESTAMP ? WHERE shard = ? AND received_minute = ? AND ballot_id = ?".into(),
+                "DELETE FROM {ks}.ballot_pool USING TIMESTAMP ? WHERE shard = ? AND received_minute = ? AND seq = ? AND ballot_id = ?".into(),
                 quorum,
             )
             .await?,
@@ -361,12 +412,12 @@ impl ScyllaStore {
             .await?,
             // 監査用: participation / プールを全体（プールはシャードごと）走査して、投票用紙別に数える。
             select_participation_contests: p(
-                "SELECT contest_id FROM {ks}.participation".into(),
+                "SELECT contest_id, seq FROM {ks}.participation".into(),
                 quorum,
             )
             .await?,
             select_pool_contests: p(
-                "SELECT contest_id FROM {ks}.ballot_pool WHERE shard = ?".into(),
+                "SELECT contest_id, seq FROM {ks}.ballot_pool WHERE shard = ?".into(),
                 quorum,
             )
             .await?,
@@ -407,14 +458,16 @@ impl ScyllaStore {
             )
             .await?,
             insert_election_state: p(
-                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank) \
-                 VALUES (?, 'scheduled', ?, ?, null, null, null) IF NOT EXISTS"
+                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, opened_at, closing_started_at, \
+                 allow_blank, allow_revote, max_revotes) \
+                 VALUES (?, 'scheduled', ?, ?, null, null, null, null, null) IF NOT EXISTS"
                     .into(),
                 quorum,
             )
             .await?,
             select_election_state: p(
-                "SELECT phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank FROM {ks}.election_state WHERE scope = ?"
+                "SELECT phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank, allow_revote, max_revotes \
+                 FROM {ks}.election_state WHERE scope = ?"
                     .into(),
                 serial,
             )
@@ -431,7 +484,8 @@ impl ScyllaStore {
             )
             .await?,
             update_election_phase_open: p(
-                "UPDATE {ks}.election_state SET phase = ?, opened_at = ?, allow_blank = ? WHERE scope = ? IF phase = ?"
+                "UPDATE {ks}.election_state SET phase = ?, opened_at = ?, allow_blank = ?, allow_revote = ?, max_revotes = ? \
+                 WHERE scope = ? IF phase = ?"
                     .into(),
                 quorum,
             )
@@ -443,14 +497,14 @@ impl ScyllaStore {
             )
             .await?,
             insert_election_audit: p(
-                "INSERT INTO {ks}.election_audit (scope, at_unix_secs, id, from_phase, to_phase, actor) \
-                 VALUES (?, ?, ?, ?, ?, ?)"
+                "INSERT INTO {ks}.election_audit (scope, at_unix_secs, id, from_phase, to_phase, actor, event) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
                     .into(),
                 quorum,
             )
             .await?,
             select_election_audit: p(
-                "SELECT at_unix_secs, from_phase, to_phase, actor FROM {ks}.election_audit \
+                "SELECT at_unix_secs, from_phase, to_phase, actor, event FROM {ks}.election_audit \
                  WHERE scope = ? LIMIT ?"
                     .into(),
                 quorum,
@@ -510,18 +564,21 @@ impl ScyllaStore {
         }
     }
 
-    /// 投票用紙の ID の列を、投票用紙ごとに数える。
+    /// (投票用紙の ID, seq) の列を、投票用紙ごとに数える。`(行数, weigh(seq) の合計)` に足し込む。
     fn count_contests(
         result: QueryResult,
-        into: &mut BTreeMap<ContestId, u64>,
+        into: &mut BTreeMap<ContestId, (u64, u64)>,
+        weigh: impl Fn(Option<i32>) -> Result<u64, StoreError>,
     ) -> Result<(), StoreError> {
         for row in rows(result)?
-            .rows::<(String,)>()
+            .rows::<(String, Option<i32>)>()
             .map_err(|e| decode_error("contest_id", e))?
         {
-            let (contest,) = row.map_err(|e| decode_error("contest_id", e))?;
+            let (contest, seq) = row.map_err(|e| decode_error("contest_id", e))?;
             let contest = ContestId::parse(&contest).map_err(|_| StoreError::Corrupt)?;
-            *into.entry(contest).or_default() += 1;
+            let entry = into.entry(contest).or_default();
+            entry.0 += 1;
+            entry.1 += weigh(seq)?;
         }
         Ok(())
     }
@@ -552,25 +609,21 @@ impl ScyllaStore {
         decode_block(result)
     }
 
-    /// プールの全行のキー（`received_minute`, `ballot_id`）。ブロックの票から削除対象の行を特定する。
-    async fn pool_keys(&self, shard: i32) -> Result<Vec<(i64, Vec<u8>)>, StoreError> {
+    /// プールの全行のキー（`received_minute`, `seq`, `ballot_id`）。ブロックの票から削除対象の行を特定する。
+    async fn pool_keys(&self, shard: i32) -> Result<Vec<PoolKey>, StoreError> {
         let result = with_retry("pool keys", || {
             self.session
                 .execute_unpaged(&self.stmts.select_pool_keys, (shard,))
         })
         .await?;
         rows(result)?
-            .rows::<(i64, Vec<u8>)>()
+            .rows::<PoolKey>()
             .map_err(|e| decode_error("プールのキー", e))?
             .map(|row| row.map_err(|e| decode_error("プールのキー", e)))
             .collect()
     }
 
-    async fn delete_pool_rows(
-        &self,
-        shard: i32,
-        keys: &[(i64, Vec<u8>)],
-    ) -> Result<(), StoreError> {
+    async fn delete_pool_rows(&self, shard: i32, keys: &[PoolKey]) -> Result<(), StoreError> {
         // 同じパーティション（shard）への削除なので、バッチは原子的に適用される。
         for chunk in keys.chunks(DELETE_BATCH) {
             let mut batch = Batch::new(BatchType::Unlogged);
@@ -583,15 +636,16 @@ impl ScyllaStore {
             // 削除が無効にならないように）。
             let values = chunk
                 .iter()
-                .map(|(minute, id)| {
+                .map(|(minute, seq, id)| {
                     Ok((
                         pool_delete_timestamp(*minute)?,
                         shard,
                         *minute,
+                        *seq,
                         id.as_slice(),
                     ))
                 })
-                .collect::<Result<Vec<(i64, i32, i64, &[u8])>, StoreError>>()?;
+                .collect::<Result<Vec<(i64, i32, i64, i32, &[u8])>, StoreError>>()?;
             with_retry("pool delete", || self.session.batch(&batch, &values)).await?;
         }
         Ok(())
@@ -607,21 +661,23 @@ impl ScyllaStore {
             .iter()
             .map(|b| b.ballot_id.0.as_slice())
             .collect();
-        let victims: Vec<(i64, Vec<u8>)> = self
+        let victims: Vec<PoolKey> = self
             .pool_keys(shard)
             .await?
             .into_iter()
-            .filter(|(_, id)| sealed.contains(id.as_slice()))
+            .filter(|(_, _, id)| sealed.contains(id.as_slice()))
             .collect();
         self.delete_pool_rows(shard, &victims).await
     }
 
-    /// participation の LWT が既存の行に負けたとき、その行が「自分の先の試行」のものかを調べる。
+    /// participation の LWT が既存の行に負けたとき、その行が「自分の先の試行」のものかを調べる
+    /// （再投票では、`seq` も自分が書いた値であること）。
     async fn attempt_is_ours(
         &self,
         voter: &VoterId,
         contest: &str,
         attempt: &[u8],
+        seq: Option<i32>,
     ) -> Result<bool, StoreError> {
         let result = with_retry("participation attempt", || {
             self.session
@@ -629,9 +685,91 @@ impl ScyllaStore {
         })
         .await?;
         let existing = rows(result)?
-            .maybe_first_row::<(Option<Vec<u8>>,)>()
+            .maybe_first_row::<(Option<Vec<u8>>, Option<i32>)>()
             .map_err(|e| decode_error("attempt", e))?;
-        Ok(matches!(existing, Some((Some(stored),)) if stored == attempt))
+        Ok(matches!(existing, Some((Some(stored), stored_seq))
+            if stored == attempt && (seq.is_none() || stored_seq == seq)))
+    }
+
+    /// 票をプールに入れる（書き込み時刻は分に丸める）。
+    async fn insert_pool_row(
+        &self,
+        shard: i32,
+        minute: i64,
+        timestamp_micros: i64,
+        ballot: &Ballot,
+    ) -> Result<(), StoreError> {
+        let ballot_id = ballot.ballot_id.0;
+        let revote = revote_to_blob(ballot);
+        with_retry("pool insert", || {
+            self.session.execute_unpaged(
+                &self.stmts.insert_pool,
+                (
+                    shard,
+                    minute,
+                    pool_seq(ballot),
+                    ballot_id.as_slice(),
+                    ballot.contest_id.as_str(),
+                    ballot.candidate_id.as_str(),
+                    revote.as_deref(),
+                    timestamp_micros,
+                ),
+            )
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// slot_state を、票の `seq` とハッシュで上書きする。書き込み時刻は「分の先頭 + seq」（後の版が必ず勝つ）。
+    async fn write_slot_state(
+        &self,
+        ballot: &Ballot,
+        minute_micros: i64,
+    ) -> Result<(), StoreError> {
+        let Some(link) = ballot.revote else {
+            return Ok(());
+        };
+        let seq = i32::try_from(link.seq).map_err(|_| StoreError::Corrupt)?;
+        let hash = ballot_hash(ballot);
+        let timestamp = minute_micros
+            .checked_add(i64::from(link.seq))
+            .ok_or(StoreError::Corrupt)?;
+        with_retry("slot_state upsert", || {
+            self.session.execute_unpaged(
+                &self.stmts.upsert_slot_state,
+                (link.slot.0.as_slice(), seq, hash.as_slice(), timestamp),
+            )
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// プールの 1 行を消す（slot_state の書き込みに失敗したときの取り消し）。
+    async fn delete_pool_row(&self, shard: i32, minute: i64, ballot: &Ballot) {
+        let key = (minute, pool_seq(ballot), ballot.ballot_id.0.to_vec());
+        if self.delete_pool_rows(shard, &[key]).await.is_err() {
+            tracing::error!("プールの票の取り消しに失敗しました");
+        }
+    }
+
+    /// 再投票の取り消し（補償）: 自分の試行で `prev_seq + 1` にした行だけを、`prev_seq` に戻す（ベストエフォート）。
+    async fn revert_revote(&self, voter: &VoterId, contest: &str, prev_seq: i32, attempt: &[u8]) {
+        let outcome = with_retry("participation revert", || {
+            self.session.execute_unpaged(
+                &self.stmts.revert_participation,
+                (
+                    prev_seq,
+                    voter.as_str(),
+                    contest,
+                    prev_seq.saturating_add(1),
+                    attempt,
+                ),
+            )
+        })
+        .await;
+        if outcome.is_err() {
+            tracing::error!("再投票の取り消し（補償）に失敗しました");
+        }
     }
 
     /// participation を取り消す（自分の `attempt` の行だけ。ベストエフォート）。
@@ -698,7 +836,37 @@ async fn ensure_schema_current(session: &Session, keyspace: &str) -> Result<(), 
         ))),
         // テーブルが無い: スキーマの投入漏れ（準備の段階で、分かりやすいエラーになる）。
         None => Ok(()),
+    }?;
+    ensure_revote_schema(session, keyspace).await
+}
+
+/// 再投票（ADR 0022）のスキーマ（`ballot_pool` のクラスタリングキー `seq`・`slot_state` など）であること。
+/// クラスタリングキーは `ALTER TABLE` では足せないので、古いスキーマなら、作り直しの手順つきで知らせる。
+async fn ensure_revote_schema(session: &Session, keyspace: &str) -> Result<(), ConnectError> {
+    let result = session
+        .query_unpaged(
+            "SELECT column_name FROM system_schema.columns \
+             WHERE keyspace_name = ? AND table_name = 'ballot_pool'",
+            (keyspace.to_ascii_lowercase(),),
+        )
+        .await
+        .map_err(|e| ConnectError::Connect(e.to_string()))?;
+    let columns: Vec<String> = result
+        .into_rows_result()
+        .map_err(|e| ConnectError::Connect(e.to_string()))?
+        .rows::<(String,)>()
+        .map_err(|e| ConnectError::Connect(e.to_string()))?
+        .filter_map(Result::ok)
+        .map(|(c,)| c)
+        .collect();
+    if columns.is_empty() || columns.iter().any(|c| c == "seq") {
+        return Ok(());
     }
+    Err(ConnectError::Schema(format!(
+        "キースペース {keyspace} のスキーマが古いです（ballot_pool に、再投票の seq 列がありません）。\
+         再投票に対応したスキーマ（ブロックの形式の版 3。ADR 0022）は、既存の表に列を足すだけでは作れません。\
+         scripts/db_reset.sh --all で作り直してください（例: DROP KEYSPACE {keyspace} の後に docs/schema.cql を投入）。"
+    )))
 }
 
 async fn prepare(
@@ -728,66 +896,136 @@ fn decode_block(result: QueryResult) -> Result<Option<Block>, StoreError> {
 impl VoteStore for ScyllaStore {
     /// 1. participation に LWT（`IF NOT EXISTS`）で記録する。既にあれば `AlreadyVoted`。
     /// 2. 票をプールに追加する（書き込み時刻は分に丸める）。失敗したら 1 を取り消す。
+    /// 3. 再投票を認める選挙の票（slot つき）なら、slot_state に (1, 票のハッシュ) を記録する。失敗したら 2・1 を取り消す。
     ///
     /// 票を先に入れると、途中で落ちたときに二重投票が起き得るので、participation を先にする。
     async fn cast(&self, voter: &VoterId, shard: ShardId, ballot: Ballot) -> Result<(), CastError> {
         let shard = self.shard_index(shard)?;
         let contest = ballot.contest_id.as_str();
-        let candidate_id = ballot.candidate_id.as_str();
         let (minute, timestamp_micros) = minute_bucket(self.clock.now_unix_secs())?;
         // participation 専用の乱数。ballot_id とは無関係にして、両者を結び付けない。
         let attempt: [u8; 16] = rand::random();
+        // 再投票を認める選挙だけ seq を持つ（認めない選挙は NULL）。
+        let seq: Option<i32> = ballot.revote.map(|_| 1);
 
         let inserted = with_retry("participation LWT", || {
             self.session.execute_unpaged(
                 &self.stmts.insert_participation,
-                (voter.as_str(), contest, attempt.as_slice()),
+                (voter.as_str(), contest, attempt.as_slice(), seq),
             )
         })
         .await?;
         if !applied(inserted)? {
             // 既存の行が、タイムアウトして結果が分からなかった自分の先の試行なら、適用済みとして続ける。
-            if !self.attempt_is_ours(voter, contest, &attempt).await? {
+            if !self.attempt_is_ours(voter, contest, &attempt, None).await? {
                 return Err(CastError::AlreadyVoted);
             }
         }
 
-        let ballot_id = ballot.ballot_id.0;
-        let pooled = with_retry("pool insert", || {
-            self.session.execute_unpaged(
-                &self.stmts.insert_pool,
-                (
-                    shard,
-                    minute,
-                    ballot_id.as_slice(),
-                    contest,
-                    candidate_id,
-                    timestamp_micros,
-                ),
-            )
-        })
-        .await;
-        if let Err(e) = pooled {
+        if let Err(e) = self
+            .insert_pool_row(shard, minute, timestamp_micros, &ballot)
+            .await
+        {
+            self.compensate(voter, contest, &attempt).await;
+            return Err(e.into());
+        }
+        if let Err(e) = self.write_slot_state(&ballot, timestamp_micros).await {
+            self.delete_pool_row(shard, minute, &ballot).await;
             self.compensate(voter, contest, &attempt).await;
             return Err(e.into());
         }
         Ok(())
     }
 
-    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<ContestId>, StoreError> {
+    /// 1. participation の `seq` を、LWT（`UPDATE … SET seq = n + 1 IF seq = n`）で進める。負けたら `RevoteConflict`。
+    /// 2. 票をプールに追加する。失敗したら 1 を戻す。
+    /// 3. slot_state を (n + 1, 票のハッシュ) にする。失敗したら 2 を消して 1 を戻す。
+    async fn revote(
+        &self,
+        voter: &VoterId,
+        shard: ShardId,
+        ballot: Ballot,
+        prev_seq: u32,
+    ) -> Result<(), CastError> {
+        let shard = self.shard_index(shard)?;
+        let contest = ballot.contest_id.as_str();
+        let link = ballot.revote.ok_or(StoreError::Conflict)?;
+        let prev = i32::try_from(prev_seq).map_err(|_| StoreError::Corrupt)?;
+        let next = i32::try_from(link.seq).map_err(|_| StoreError::Corrupt)?;
+        if prev.checked_add(1) != Some(next) {
+            return Err(StoreError::Conflict.into());
+        }
+        let (minute, timestamp_micros) = minute_bucket(self.clock.now_unix_secs())?;
+        let attempt: [u8; 16] = rand::random();
+
+        let updated = with_retry("participation revote LWT", || {
+            self.session.execute_unpaged(
+                &self.stmts.revote_participation,
+                (next, attempt.as_slice(), voter.as_str(), contest, prev),
+            )
+        })
+        .await?;
+        if !applied(updated)?
+            && !self
+                .attempt_is_ours(voter, contest, &attempt, Some(next))
+                .await?
+        {
+            return Err(CastError::RevoteConflict);
+        }
+
+        if let Err(e) = self
+            .insert_pool_row(shard, minute, timestamp_micros, &ballot)
+            .await
+        {
+            self.revert_revote(voter, contest, prev, &attempt).await;
+            return Err(e.into());
+        }
+        if let Err(e) = self.write_slot_state(&ballot, timestamp_micros).await {
+            self.delete_pool_row(shard, minute, &ballot).await;
+            self.revert_revote(voter, contest, prev, &attempt).await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    async fn voted_contests(&self, voter: &VoterId) -> Result<Vec<VotedContest>, StoreError> {
         let result = with_retry("voted contests", || {
             self.session
                 .execute_unpaged(&self.stmts.select_voted, (voter.as_str(),))
         })
         .await?;
         rows(result)?
-            .rows::<(String,)>()
+            .rows::<(String, Option<i32>)>()
             .map_err(|e| decode_error("投票済みの投票用紙", e))?
             .map(|row| {
-                let (contest,) = row.map_err(|e| decode_error("投票済みの投票用紙", e))?;
-                ContestId::parse(&contest).map_err(|_| StoreError::Corrupt)
+                let (contest, seq) = row.map_err(|e| decode_error("投票済みの投票用紙", e))?;
+                Ok(VotedContest {
+                    contest: ContestId::parse(&contest).map_err(|_| StoreError::Corrupt)?,
+                    ballots: participation_ballots(seq)?,
+                })
             })
             .collect()
+    }
+
+    async fn slot_state(&self, slot: &Slot) -> Result<Option<SlotState>, StoreError> {
+        let result = with_retry("slot_state", || {
+            self.session
+                .execute_unpaged(&self.stmts.select_slot_state, (slot.0.as_slice(),))
+        })
+        .await?;
+        rows(result)?
+            .maybe_first_row::<(i32, Vec<u8>)>()
+            .map_err(|e| decode_error("slot_state", e))?
+            .map(|(seq, hash)| {
+                Ok(SlotState {
+                    seq: u32::try_from(seq).map_err(|_| StoreError::Corrupt)?,
+                    last_ballot_hash: hash
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| StoreError::Corrupt)?,
+                })
+            })
+            .transpose()
     }
 
     async fn pending_by_shard(&self) -> Result<Vec<usize>, StoreError> {
@@ -807,7 +1045,10 @@ impl VoteStore for ScyllaStore {
                 .execute_unpaged(&self.stmts.select_participation_contests, &[])
         })
         .await?;
-        Self::count_contests(result, &mut participation)?;
+        // participation: 行数 = 投票した有権者の数、seq の合計 = 受理した票の数（seq が NULL なら 1 票）。
+        Self::count_contests(result, &mut participation, |seq| {
+            participation_ballots(seq).map(u64::from)
+        })?;
 
         let mut pending = BTreeMap::new();
         for shard in 0..self.shard_count.get() {
@@ -817,7 +1058,10 @@ impl VoteStore for ScyllaStore {
                     .execute_unpaged(&self.stmts.select_pool_contests, (shard,))
             })
             .await?;
-            Self::count_contests(result, &mut pending)?;
+            // プール: 行数 = 未封印の票、seq が 0（slot なし）か 1 の票 = 有権者の最初の票。
+            Self::count_contests(result, &mut pending, |seq| {
+                Ok(u64::from(seq.unwrap_or(0) <= 1))
+            })?;
         }
 
         let contests: BTreeSet<ContestId> = participation
@@ -827,10 +1071,16 @@ impl VoteStore for ScyllaStore {
             .collect();
         Ok(contests
             .into_iter()
-            .map(|contest| ContestCounts {
-                participation: participation.get(&contest).copied().unwrap_or(0),
-                pending: pending.get(&contest).copied().unwrap_or(0),
-                contest,
+            .map(|contest| {
+                let (participation, cast) = participation.get(&contest).copied().unwrap_or((0, 0));
+                let (pending, pending_initial) = pending.get(&contest).copied().unwrap_or((0, 0));
+                ContestCounts {
+                    participation,
+                    cast,
+                    pending,
+                    pending_initial,
+                    contest,
+                }
             })
             .collect())
     }
@@ -957,12 +1207,12 @@ impl SealStore for ScyllaStore {
         })
         .await?;
         rows(result)?
-            .rows::<(i64, Vec<u8>, String, String)>()
+            .rows::<(i64, Vec<u8>, String, String, Option<Vec<u8>>)>()
             .map_err(|e| decode_error("プールの票", e))?
             .map(|row| {
-                let (_minute, id, contest, candidate) =
+                let (_minute, id, contest, candidate, revote) =
                     row.map_err(|e| decode_error("プールの票", e))?;
-                ballot_from_tuple(&(id, contest, candidate))
+                ballot_from_tuple(&(id, contest, candidate, revote))
             })
             .collect()
     }
@@ -1005,7 +1255,7 @@ impl SealStore for ScyllaStore {
                 .pool_keys(shard)
                 .await?
                 .into_iter()
-                .map(|(_, id)| id)
+                .map(|(_, _, id)| id)
                 .collect();
             if !block
                 .ballots
@@ -1171,10 +1421,21 @@ type ElectionStateRow = (
     Option<i64>,
     Option<i64>,
     Option<bool>,
+    Option<bool>,
+    Option<i32>,
 );
 
 fn election_state_row(row: ElectionStateRow) -> Result<ElectionStateSnapshot, StoreError> {
-    let (phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank) = row;
+    let (
+        phase,
+        opens_at,
+        closes_at,
+        opened_at,
+        closing_started_at,
+        allow_blank,
+        allow_revote,
+        max_revotes,
+    ) = row;
     let phase = phase
         .as_deref()
         .and_then(ElectionPhase::parse)
@@ -1188,7 +1449,19 @@ fn election_state_row(row: ElectionStateRow) -> Result<ElectionStateSnapshot, St
         opened_at,
         closing_started_at,
         // open の時点で固定した選挙のルール（原則19）。open 前と、ルールを記録する前の版で open にした選挙は NULL。
-        rules: allow_blank.map(|allow_blank| ElectionRules { allow_blank }),
+        // 再投票の列が無い（この列を足す前に open にした選挙）ときは、再投票を認めない。
+        rules: allow_blank
+            .map(|allow_blank| {
+                Ok::<_, StoreError>(ElectionRules {
+                    allow_blank,
+                    allow_revote: allow_revote.unwrap_or(false),
+                    max_revotes: match max_revotes {
+                        Some(n) => u32::try_from(n).map_err(|_| StoreError::Corrupt)?,
+                        None => 0,
+                    },
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -1254,6 +1527,8 @@ impl ElectionStateStore for ScyllaStore {
                         to.as_str(),
                         at_unix_secs,
                         rules.allow_blank,
+                        rules.allow_revote,
+                        i32::try_from(rules.max_revotes).unwrap_or(i32::MAX),
                         ELECTION_SCOPE,
                         from.as_str(),
                     ),
@@ -1281,25 +1556,24 @@ impl ElectionStateStore for ScyllaStore {
             return Ok(false);
         }
         // 監査ログはベストエフォート: 失敗しても状態遷移そのものは既に成功している。
-        let id: Vec<u8> = rand::random::<[u8; 8]>().to_vec();
-        if let Err(e) = with_retry("election_audit insert", || {
-            self.session.execute_unpaged(
-                &self.stmts.insert_election_audit,
-                (
-                    ELECTION_SCOPE,
-                    at_unix_secs,
-                    id.clone(),
-                    from.as_str(),
-                    to.as_str(),
-                    actor,
-                ),
-            )
-        })
-        .await
+        if let Err(e) = self
+            .insert_audit(AuditEvent::Transition, from, to, actor, at_unix_secs)
+            .await
         {
             tracing::warn!(error = %e, "election_audit への記録に失敗しました（状態遷移は成功しています）");
         }
         Ok(true)
+    }
+
+    async fn record_event(
+        &self,
+        event: AuditEvent,
+        phase: ElectionPhase,
+        actor: &str,
+        at_unix_secs: i64,
+    ) -> Result<(), StoreError> {
+        self.insert_audit(event, phase, phase, actor, at_unix_secs)
+            .await
     }
 
     async fn recent_audit(&self, limit: usize) -> Result<Vec<ElectionAuditEntry>, StoreError> {
@@ -1313,11 +1587,19 @@ impl ElectionStateStore for ScyllaStore {
         })
         .await?;
         rows(result)?
-            .rows::<(i64, Option<String>, Option<String>, Option<String>)>()
+            .rows::<(
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )>()
             .map_err(|e| decode_error("選挙状態の監査ログ", e))?
             .map(|row| {
-                let (at_unix_secs, from, to, actor) =
+                let (at_unix_secs, from, to, actor, event) =
                     row.map_err(|e| decode_error("選挙状態の監査ログ", e))?;
+                let event =
+                    AuditEvent::parse(event.as_deref().unwrap_or("")).ok_or(StoreError::Corrupt)?;
                 let from = from
                     .as_deref()
                     .and_then(ElectionPhase::parse)
@@ -1331,6 +1613,7 @@ impl ElectionStateStore for ScyllaStore {
                     from,
                     to,
                     actor: actor.ok_or(StoreError::Corrupt)?,
+                    event,
                 })
             })
             .collect()
@@ -1338,6 +1621,34 @@ impl ElectionStateStore for ScyllaStore {
 }
 
 impl ScyllaStore {
+    /// `election_audit` に 1 行記録する。`id` は、同じ秒の記録が競合しないための乱数（票とは無関係）。
+    async fn insert_audit(
+        &self,
+        event: AuditEvent,
+        from: ElectionPhase,
+        to: ElectionPhase,
+        actor: &str,
+        at_unix_secs: i64,
+    ) -> Result<(), StoreError> {
+        let id: Vec<u8> = rand::random::<[u8; 8]>().to_vec();
+        with_retry("election_audit insert", || {
+            self.session.execute_unpaged(
+                &self.stmts.insert_election_audit,
+                (
+                    ELECTION_SCOPE,
+                    at_unix_secs,
+                    id.clone(),
+                    from.as_str(),
+                    to.as_str(),
+                    actor,
+                    event.as_str(),
+                ),
+            )
+        })
+        .await
+        .map(|_| ())
+    }
+
     async fn get_election_state(&self) -> Result<ElectionStateSnapshot, StoreError> {
         let result = with_retry("election_state get", || {
             self.session

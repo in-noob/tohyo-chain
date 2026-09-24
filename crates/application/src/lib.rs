@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod credentials;
 pub mod ports;
+pub mod revote;
 pub mod session;
 pub mod voting;
 
@@ -14,9 +15,11 @@ pub use credentials::{
     InlineChecker, PasswordChecker, PasswordParams, RegistryEntry,
 };
 pub use ports::{
-    AuthError, Authenticator, BallotIdSource, CastError, ChainRead, Clock, ContestCounts,
-    Credentials, ElectionAuditEntry, ElectionRepository, ElectionStateSnapshot, ElectionStateStore,
-    LeaseStore, SealStore, StoreError, SystemClock, VoteStore, VoterRoll,
+    AuditEvent, AuthError, Authenticator, BallotIdSource, CastError, ChainRead, Clock,
+    ContestCounts, Credentials, ElectionAuditEntry, ElectionRepository, ElectionStateSnapshot,
+    ElectionStateStore, LeaseStore, SealStore, SlotState, StoreError, SystemClock, VoteStore,
+    VotedContest, VoterRoll,
 };
+pub use revote::{KeyDestroyed, REVOTE_KEY_FILE, RevoteKey, RevoteKeyError, RevoteKeyVault};
 pub use session::{SessionError, SessionSigner, SessionToken};
 pub use voting::{BallotStatus, RandomBallotIds, ServiceError, VotingService};

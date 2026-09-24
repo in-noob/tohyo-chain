@@ -5,7 +5,10 @@
 //!
 //! - 票   = `ballot_id(16) ‖ len(contest_id)(2) ‖ contest_id ‖ len(candidate_id)(2) ‖ candidate_id`
 //!   （ID は文字列 [`crate::ids`] の ASCII バイト列。長さは 2 バイトの固定幅・ビッグエンディアンで、
-//!   先頭に置くので、フィールドの境界が曖昧にならない）。最大 197 バイト。ブロックの形式の版 2 から。
+//!   先頭に置くので、フィールドの境界が曖昧にならない）。ブロックの形式の版 2 から。
+//!   版 3 から、再投票のつながり（[`RevoteLink`]）を持つ票だけ、後ろに次のどちらかを足す（ADR 0022）:
+//!   `0x01 ‖ slot(32) ‖ seq(4)`（初回の投票。`supersedes` なし）/
+//!   `0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32)`（再投票）。つながりの無い票は版 2 と同じバイト列。最大 266 バイト。
 //! - ヘッダ = `version(2) ‖ height(8) ‖ prev_hash(32) ‖ merkle_root(32)
 //!            ‖ ballot_count(4) ‖ sealed_at_minute(8)`                  = 86 バイト（固定長）
 //! - `block_hash = SHA256("vote/block/v1" ‖ ヘッダ)`
@@ -13,10 +16,22 @@
 use sha2::{Digest, Sha256};
 
 use crate::ids::{CANDIDATE_ID_MAX_LEN, CONTEST_ID_MAX_LEN, CandidateId, ContestId, IdError};
-use crate::types::{BALLOT_ID_LEN, Ballot, BallotId, BlockHeader, HASH_LEN, Hash32};
+use crate::types::{
+    BALLOT_ID_LEN, Ballot, BallotId, BlockHeader, HASH_LEN, Hash32, RevoteLink, SLOT_LEN, Slot,
+};
 
+/// 再投票のつながりの正規化バイト列の最大長（`tag(1) ‖ slot(32) ‖ seq(4) ‖ supersedes(32)`）。
+pub const MAX_REVOTE_LEN: usize = 1 + SLOT_LEN + 4 + HASH_LEN;
 /// 票の正規化バイト列の最大長。
-pub const MAX_BALLOT_LEN: usize = BALLOT_ID_LEN + 2 + CONTEST_ID_MAX_LEN + 2 + CANDIDATE_ID_MAX_LEN;
+pub const MAX_BALLOT_LEN: usize =
+    BALLOT_ID_LEN + 2 + CONTEST_ID_MAX_LEN + 2 + CANDIDATE_ID_MAX_LEN + MAX_REVOTE_LEN;
+
+/// 再投票のつながりの種類（先頭の 1 バイト）。初回の投票（前の票なし）。
+const REVOTE_TAG_INITIAL: u8 = 0x01;
+/// 再投票のつながりの種類。前の票のハッシュ（`supersedes`）つき。
+const REVOTE_TAG_SUPERSEDES: u8 = 0x02;
+/// 票のハッシュ（Merkle 木の葉と同じ値）の接頭辞。
+const BALLOT_HASH_PREFIX: u8 = 0x00;
 pub const HEADER_LEN: usize = 86;
 
 /// ブロックハッシュのドメイン分離タグ。
@@ -40,18 +55,55 @@ pub fn sha256_parts(parts: &[&[u8]]) -> Hash32 {
     hasher.finalize().into()
 }
 
-/// 票の正規化バイト列: `ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id`。
+/// 票の正規化バイト列: `ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id [‖ 再投票のつながり]`。
 pub fn encode_ballot(ballot: &Ballot) -> Vec<u8> {
     let contest = ballot.contest_id.as_str().as_bytes();
     let candidate = ballot.candidate_id.as_str().as_bytes();
-    let mut out = Vec::with_capacity(BALLOT_ID_LEN + 4 + contest.len() + candidate.len());
+    let mut out =
+        Vec::with_capacity(BALLOT_ID_LEN + 4 + contest.len() + candidate.len() + MAX_REVOTE_LEN);
     out.extend_from_slice(&ballot.ballot_id.0);
     // ID の最大長は検証済み（97・80 バイト）なので、`u16` に収まる。
     out.extend_from_slice(&(contest.len() as u16).to_be_bytes());
     out.extend_from_slice(contest);
     out.extend_from_slice(&(candidate.len() as u16).to_be_bytes());
     out.extend_from_slice(candidate);
+    out.extend_from_slice(&encode_revote(ballot.revote.as_ref()));
     out
+}
+
+/// 再投票のつながりの正規化バイト列（無ければ空）。DB の `blocks.ballots` にも、このバイト列で保存する。
+pub fn encode_revote(revote: Option<&RevoteLink>) -> Vec<u8> {
+    let Some(link) = revote else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(MAX_REVOTE_LEN);
+    out.push(if link.supersedes.is_some() {
+        REVOTE_TAG_SUPERSEDES
+    } else {
+        REVOTE_TAG_INITIAL
+    });
+    out.extend_from_slice(&link.slot.0);
+    out.extend_from_slice(&link.seq.to_be_bytes());
+    if let Some(prev) = &link.supersedes {
+        out.extend_from_slice(prev);
+    }
+    out
+}
+
+/// [`encode_revote`] の逆。空なら `None`。
+pub fn decode_revote(bytes: &[u8]) -> Result<Option<RevoteLink>, BallotDecodeError> {
+    let mut rest = bytes;
+    let link = take_revote(&mut rest)?;
+    if !rest.is_empty() {
+        return Err(BallotDecodeError::TrailingBytes);
+    }
+    Ok(link)
+}
+
+/// 票のハッシュ `SHA256(0x00 ‖ encode_ballot(ballot))`。Merkle 木の葉と同じ値で、再投票の `supersedes`
+/// （1 つ前の版の票）に使う。票のバイト列には `supersedes` 自体も含まれるので、同じ slot の票は、ハッシュでつながる。
+pub fn ballot_hash(ballot: &Ballot) -> Hash32 {
+    sha256_parts(&[&[BALLOT_HASH_PREFIX], &encode_ballot(ballot)])
 }
 
 /// 票の正規化バイト列の解釈の失敗。
@@ -63,6 +115,8 @@ pub enum BallotDecodeError {
     TrailingBytes,
     #[error("票の ID が不正です: {0}")]
     InvalidId(#[from] IdError),
+    #[error("再投票のつながりの種類が不正です（{0:#04x}）")]
+    InvalidRevoteTag(u8),
 }
 
 /// [`encode_ballot`] の逆。ID の検証（[`crate::ids`]）も行う。
@@ -72,6 +126,7 @@ pub fn decode_ballot(bytes: &[u8]) -> Result<Ballot, BallotDecodeError> {
     ballot_id.copy_from_slice(take_slice(&mut rest, BALLOT_ID_LEN)?);
     let contest = take_string(&mut rest)?;
     let candidate = take_string(&mut rest)?;
+    let revote = take_revote(&mut rest)?;
     if !rest.is_empty() {
         return Err(BallotDecodeError::TrailingBytes);
     }
@@ -79,7 +134,35 @@ pub fn decode_ballot(bytes: &[u8]) -> Result<Ballot, BallotDecodeError> {
         ballot_id: BallotId(ballot_id),
         contest_id: ContestId::parse(&contest)?,
         candidate_id: CandidateId::parse(&candidate)?,
+        revote,
     })
+}
+
+/// 再投票のつながりを読む。残りが空なら `None`（つながりの無い票）。
+fn take_revote(rest: &mut &[u8]) -> Result<Option<RevoteLink>, BallotDecodeError> {
+    let Some((&tag, tail)) = rest.split_first() else {
+        return Ok(None);
+    };
+    if tag != REVOTE_TAG_INITIAL && tag != REVOTE_TAG_SUPERSEDES {
+        return Err(BallotDecodeError::InvalidRevoteTag(tag));
+    }
+    *rest = tail;
+    let mut slot = [0u8; SLOT_LEN];
+    slot.copy_from_slice(take_slice(rest, SLOT_LEN)?);
+    let seq = take_slice(rest, 4)?;
+    let seq = u32::from_be_bytes([seq[0], seq[1], seq[2], seq[3]]);
+    let supersedes = if tag == REVOTE_TAG_SUPERSEDES {
+        let mut prev = [0u8; HASH_LEN];
+        prev.copy_from_slice(take_slice(rest, HASH_LEN)?);
+        Some(prev)
+    } else {
+        None
+    };
+    Ok(Some(RevoteLink {
+        slot: Slot(slot),
+        seq,
+        supersedes,
+    }))
 }
 
 /// 先頭から `n` バイトを切り出す（`rest` は残りに進める）。
@@ -168,6 +251,81 @@ mod tests {
             ballot_id: BallotId([0x11; 16]),
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
             candidate_id: CandidateId::parse("shugiin_smd.13.01.c3").expect("valid"),
+            revote: None,
+        }
+    }
+
+    fn revote(seq: u32, supersedes: Option<Hash32>) -> Option<RevoteLink> {
+        Some(RevoteLink {
+            slot: Slot([0x5a; 32]),
+            seq,
+            supersedes,
+        })
+    }
+
+    #[test]
+    fn a_ballot_without_a_revote_link_is_encoded_exactly_as_in_version_2() {
+        // 版 2 のバイト列（つながりの無い票）は、版 3 でも変わらない（既存のチェーンの Merkle 根が変わらない）。
+        let encoded = encode_ballot(&sample_ballot());
+        assert_eq!(encoded.len(), 16 + 2 + 30 + 2 + 20);
+        assert!(encoded.ends_with(b"shugiin_smd.13.01.c3"));
+    }
+
+    #[test]
+    fn revote_links_are_appended_with_a_tag_fixed_width_and_big_endian() {
+        let initial = Ballot {
+            revote: revote(1, None),
+            ..sample_ballot()
+        };
+        let encoded = encode_ballot(&initial);
+        let base = encode_ballot(&sample_ballot());
+        let mut expected = base.clone();
+        expected.push(0x01);
+        expected.extend_from_slice(&[0x5a; 32]);
+        expected.extend_from_slice(&[0, 0, 0, 1]);
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_ballot(&encoded), Ok(initial.clone()));
+
+        let second = Ballot {
+            revote: revote(0x0102_0304, Some(ballot_hash(&initial))),
+            ..sample_ballot()
+        };
+        let encoded = encode_ballot(&second);
+        let mut expected = base;
+        expected.push(0x02);
+        expected.extend_from_slice(&[0x5a; 32]);
+        expected.extend_from_slice(&[1, 2, 3, 4]);
+        expected.extend_from_slice(&ballot_hash(&initial));
+        assert_eq!(encoded, expected);
+        assert_eq!(encoded.len(), MAX_BALLOT_LEN - (97 - 30) - (80 - 20));
+        assert_eq!(decode_ballot(&encoded), Ok(second.clone()));
+        assert_eq!(
+            decode_revote(&encode_revote(second.revote.as_ref())),
+            Ok(second.revote)
+        );
+        assert_eq!(decode_revote(&[]), Ok(None));
+    }
+
+    #[test]
+    fn revote_links_change_the_ballot_hash_and_reject_malformed_tags() {
+        let plain = sample_ballot();
+        let linked = Ballot {
+            revote: revote(1, None),
+            ..sample_ballot()
+        };
+        assert_ne!(ballot_hash(&plain), ballot_hash(&linked));
+        // ハッシュは Merkle 木の葉と同じ値。
+        assert_eq!(ballot_hash(&plain), crate::merkle::leaf_hash(&plain));
+        let mut bad = encode_ballot(&linked);
+        let tag_at = encode_ballot(&plain).len();
+        bad[tag_at] = 0x03;
+        assert_eq!(
+            decode_ballot(&bad),
+            Err(BallotDecodeError::InvalidRevoteTag(0x03))
+        );
+        let good = encode_ballot(&linked);
+        for cut in encode_ballot(&plain).len() + 1..good.len() {
+            assert!(decode_ballot(&good[..cut]).is_err(), "cut={cut}");
         }
     }
 
@@ -203,10 +361,23 @@ mod tests {
         for cut in 0..bytes.len() {
             assert!(decode_ballot(&bytes[..cut]).is_err(), "cut={cut}");
         }
-        // 後ろに余計なバイト。
+        // 後ろに余計なバイト: 再投票のつながりの種類として読まれ、不正な種類になる。
         let mut long = bytes.clone();
         long.push(0);
-        assert_eq!(decode_ballot(&long), Err(BallotDecodeError::TrailingBytes));
+        assert_eq!(
+            decode_ballot(&long),
+            Err(BallotDecodeError::InvalidRevoteTag(0))
+        );
+        // つながりの後ろに余計なバイト。
+        let mut linked = encode_ballot(&Ballot {
+            revote: revote(1, None),
+            ..sample_ballot()
+        });
+        linked.push(0);
+        assert_eq!(
+            decode_ballot(&linked),
+            Err(BallotDecodeError::TrailingBytes)
+        );
         // ID の文字種が不正（大文字）。
         let mut bad = bytes.clone();
         bad[18] = b'X';
@@ -218,7 +389,7 @@ mod tests {
 
     #[test]
     fn maximum_ballot_length_matches_the_id_limits() {
-        assert_eq!(MAX_BALLOT_LEN, 197);
+        assert_eq!(MAX_BALLOT_LEN, 197 + 69);
     }
 
     #[test]

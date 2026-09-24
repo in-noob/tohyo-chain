@@ -124,7 +124,11 @@ for h in data.get("heads", []):
     print(f"  shard={h['shard']} height={h.get('height')} block_hash={h.get('block_hash')}")
 print("直近の監査ログ:")
 for e in data.get("recent_audit", []):
-    print(f"  {e['at_unix_secs']}: {e['from']} -> {e['to']} ({e['actor']})")
+    if e.get("event", "transition") == "transition":
+        print(f"  {e['at_unix_secs']}: {e['from']} -> {e['to']} ({e['actor']})")
+    else:
+        # 遷移ではない出来事（締切の手続きの中での、再投票の鍵の破棄 revote_key_destroyed など）。
+        print(f"  {e['at_unix_secs']}: {e['event']}（{e['to']} の間）({e['actor']})")
 PY
     if ! command -v python3 >/dev/null 2>&1; then
         echo "（heads・recent_audit の整形表示には python3 が必要です。生の応答:）"

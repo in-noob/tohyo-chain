@@ -2,19 +2,24 @@
 //!
 //! 有権者は、名簿（[`VoterRoll`]）で自分に属する選挙区の投票用紙だけを、表示順（選挙の種類の順、次に選挙区の順）で
 //! 見て、投票できる。投票する順番の固定は、`ballot_status` の並びと画面の flow で担う（この層は順番を強制しない）。
+//!
+//! 再投票（ADR 0022）: 選挙のルール `allow_revote`（open の時点で固定）が真なら、票に再投票の仮名 `slot`
+//! （[`crate::revote::RevoteKey::slot`]）と `seq`・`supersedes` を付け、シャードを `hash(slot)` で決める。偽なら slot を
+//! 記録せず（不要な情報は持たない）、シャードは `hash(ballot_id)`、2 回目の投票は拒否する。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use domain::{
-    Ballot, BallotId, Candidate, CandidateId, Contest, ContestId, ElectionTypeCode, VoterId,
-    VotingMethod, shard_for,
+    Ballot, BallotId, Candidate, CandidateId, Contest, ContestId, ElectionRules, ElectionTypeCode,
+    RevoteLink, ShardId, VoterId, VotingMethod, shard_for, shard_for_slot,
 };
 
 use crate::ports::{
     BallotIdSource, CastError, ContestCounts, ElectionRepository, StoreError, VoteStore, VoterRoll,
 };
+use crate::revote::RevoteKeyVault;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ServiceError {
@@ -27,11 +32,26 @@ pub enum ServiceError {
     BlankNotAllowed,
     #[error("投票済みです")]
     AlreadyVoted,
+    /// 再投票を認めない選挙（open の時点で固定した `vote.allow_revote` が偽）で、再投票が指定された。
+    #[error("この選挙では再投票できません")]
+    RevoteNotAllowed,
+    /// 再投票の上限（`vote.max_revotes`）に達している。
+    #[error("再投票の上限に達しています")]
+    RevoteLimitReached,
+    /// 同時に送られた別の再投票が先に受理された（何も保存していない）。
+    #[error("同時に送られた別の再投票と競合しました")]
+    RevoteConflict,
+    /// まだ投票していない投票用紙に、再投票が指定された。
+    #[error("まだ投票していません")]
+    NotVotedYet,
     /// 名簿で、この有権者に属さない選挙区（名簿に無い有権者を含む）。
     #[error("この有権者の対象ではありません")]
     NotEligible,
     #[error("サービスが利用できません")]
     Unavailable,
+    /// 再投票を認める選挙なのに、再投票の鍵（`secrets/revote_key`）が無い（破棄済み・未設定）。
+    #[error("再投票の鍵がありません")]
+    RevoteKeyUnavailable,
 }
 
 impl From<StoreError> for ServiceError {
@@ -44,6 +64,7 @@ impl From<CastError> for ServiceError {
     fn from(e: CastError) -> Self {
         match e {
             CastError::AlreadyVoted => Self::AlreadyVoted,
+            CastError::RevoteConflict => Self::RevoteConflict,
             CastError::Store(_) => Self::Unavailable,
         }
     }
@@ -60,6 +81,9 @@ pub struct BallotStatus {
     pub type_name: String,
     pub method: VotingMethod,
     pub voted: bool,
+    /// この投票用紙に受理された票の数（未投票は 0、初回の投票だけなら 1、再投票するたびに 1 増える）。
+    /// 票の中身（前回の投票先）は含まない。
+    pub ballots_cast: u32,
 }
 
 /// UUIDv4 の `ballot_id` を乱数から作る。
@@ -78,6 +102,8 @@ pub struct VotingService {
     store: Arc<dyn VoteStore>,
     ids: Arc<dyn BallotIdSource>,
     shard_count: NonZeroU16,
+    /// 再投票の鍵（slot の計算に使う。締切の手続きで破棄される）。
+    revote_keys: Arc<RevoteKeyVault>,
 }
 
 impl VotingService {
@@ -87,6 +113,7 @@ impl VotingService {
         store: Arc<dyn VoteStore>,
         ids: Arc<dyn BallotIdSource>,
         shard_count: NonZeroU16,
+        revote_keys: Arc<RevoteKeyVault>,
     ) -> Self {
         Self {
             elections,
@@ -94,6 +121,7 @@ impl VotingService {
             store,
             ids,
             shard_count,
+            revote_keys,
         }
     }
 
@@ -108,11 +136,12 @@ impl VotingService {
             .filter_map(|contest| Some((election.contest_position(&contest.id)?, contest)))
             .collect();
         mine.sort_by_key(|(position, _)| *position);
-        let voted: HashSet<ContestId> = self
+        let voted: HashMap<ContestId, u32> = self
             .store
             .voted_contests(voter)
             .await?
             .into_iter()
+            .map(|v| (v.contest, v.ballots))
             .collect();
         Ok(mine
             .into_iter()
@@ -128,7 +157,8 @@ impl VotingService {
                     election_type: election_type.clone(),
                     type_name,
                     method,
-                    voted: voted.contains(&contest.id),
+                    voted: voted.contains_key(&contest.id),
+                    ballots_cast: voted.get(&contest.id).copied().unwrap_or(0),
                 }
             })
             .collect())
@@ -148,39 +178,131 @@ impl VotingService {
         Ok(found.candidates.clone())
     }
 
-    /// 1 票を投じる。`ballot_id` はここで新規に採番し、`voter` とは無関係な乱数にする。
+    /// 初回の投票。`ballot_id` はここで新規に採番し、`voter` とは無関係な乱数にする。
     ///
-    /// `candidate` が白票（[`CandidateId::Blank`]）のときは、`allow_blank`（open の時点で固定した選挙のルール）が
-    /// 真のときだけ受け付ける。
+    /// `rules` は open の時点で固定した選挙のルール。`candidate` が白票（[`CandidateId::Blank`]）のときは、
+    /// `allow_blank` が真のときだけ受け付ける。`allow_revote` が真なら、票に slot（`seq = 1`）を付ける。
     pub async fn cast_vote(
         &self,
         voter: &VoterId,
         contest: ContestId,
         candidate: CandidateId,
-        allow_blank: bool,
+        rules: ElectionRules,
     ) -> Result<(), ServiceError> {
         let election = self.elections.election().await?;
         let found = election
             .contest(&contest)
             .ok_or(ServiceError::ContestNotFound)?;
         self.ensure_eligible(voter, found).await?;
-        if !found.accepts(&candidate, allow_blank) {
-            return Err(if candidate.is_blank() {
-                ServiceError::BlankNotAllowed
-            } else {
-                ServiceError::InvalidCandidate
-            });
-        }
+        self.ensure_accepts(found, &candidate, rules)?;
 
+        let mut ballot = Ballot {
+            ballot_id: self.ids.next_ballot_id(),
+            contest_id: contest,
+            candidate_id: candidate,
+            revote: None,
+        };
+        let shard = if rules.allow_revote {
+            let slot = self
+                .revote_key()?
+                .slot(election.id(), voter, &ballot.contest_id);
+            ballot.revote = Some(RevoteLink {
+                slot,
+                seq: 1,
+                supersedes: None,
+            });
+            // 同じ slot の全版を同じチェーンに入れる。
+            shard_for_slot(&slot, self.shard_count)
+        } else {
+            // シャードは ballot_id から決める（voter_id からは決めない）。
+            shard_for(&ballot.ballot_id, self.shard_count)
+        };
+        self.store.cast(voter, shard, ballot).await?;
+        Ok(())
+    }
+
+    /// 再投票（投票期間中に、投票済みの投票用紙に投票し直す）。前回の投票内容は読まない・返さない。
+    ///
+    /// `expected` は、画面が見た受理済みの票の数（`ballots_cast`）。この値のときだけ再投票する（同じ画面から 2 つの
+    /// 再投票が同時に送られても、1 件だけが成功する。二重送信で 2 回やり直したことにならない）。
+    ///
+    /// 1. participation の `seq`（受理した票の数 n）を読む。`expected` と違えば競合、上限（`max_revotes + 1`）なら拒否。
+    /// 2. slot_state から、最後の票のハッシュを読む（`seq` が n でなければ、別の再投票と競合している）。
+    /// 3. `seq = n + 1`・`supersedes` = 最後の票のハッシュ の票を、条件付き書き込み（`seq = n` のときだけ）で保存する。
+    pub async fn revote(
+        &self,
+        voter: &VoterId,
+        contest: ContestId,
+        candidate: CandidateId,
+        rules: ElectionRules,
+        expected: u32,
+    ) -> Result<(), ServiceError> {
+        if !rules.allow_revote {
+            return Err(ServiceError::RevoteNotAllowed);
+        }
+        let election = self.elections.election().await?;
+        let found = election
+            .contest(&contest)
+            .ok_or(ServiceError::ContestNotFound)?;
+        self.ensure_eligible(voter, found).await?;
+        self.ensure_accepts(found, &candidate, rules)?;
+
+        let prev_seq = self
+            .store
+            .voted_contests(voter)
+            .await?
+            .into_iter()
+            .find(|v| v.contest == contest)
+            .map(|v| v.ballots)
+            .ok_or(ServiceError::NotVotedYet)?;
+        if prev_seq != expected {
+            return Err(ServiceError::RevoteConflict);
+        }
+        if prev_seq >= rules.max_seq() {
+            return Err(ServiceError::RevoteLimitReached);
+        }
+        let slot = self.revote_key()?.slot(election.id(), voter, &contest);
+        let last = match self.store.slot_state(&slot).await? {
+            Some(state) if state.seq == prev_seq => state.last_ballot_hash,
+            // participation と slot_state の seq が食い違う: 別の再投票が、ちょうど書き込み中（または、その途中で失敗した）。
+            _ => return Err(ServiceError::RevoteConflict),
+        };
         let ballot = Ballot {
             ballot_id: self.ids.next_ballot_id(),
             contest_id: contest,
             candidate_id: candidate,
+            revote: Some(RevoteLink {
+                slot,
+                seq: prev_seq.saturating_add(1),
+                supersedes: Some(last),
+            }),
         };
-        // シャードは ballot_id から決める（voter_id からは決めない）。
-        let shard = shard_for(&ballot.ballot_id, self.shard_count);
-        self.store.cast(voter, shard, ballot).await?;
+        let shard: ShardId = shard_for_slot(&slot, self.shard_count);
+        self.store.revote(voter, shard, ballot, prev_seq).await?;
         Ok(())
+    }
+
+    /// 投票先を、この投票用紙が受け付けるか（白票は `allow_blank` のときだけ）。
+    fn ensure_accepts(
+        &self,
+        contest: &Contest,
+        candidate: &CandidateId,
+        rules: ElectionRules,
+    ) -> Result<(), ServiceError> {
+        if contest.accepts(candidate, rules.allow_blank) {
+            Ok(())
+        } else if candidate.is_blank() {
+            Err(ServiceError::BlankNotAllowed)
+        } else {
+            Err(ServiceError::InvalidCandidate)
+        }
+    }
+
+    /// 再投票の鍵。再投票を認める選挙なのに無い（破棄済み・未設定）なら、投票を受け付けない。
+    fn revote_key(&self) -> Result<Arc<crate::revote::RevoteKey>, ServiceError> {
+        self.revote_keys
+            .key()
+            .ok_or(ServiceError::RevoteKeyUnavailable)
     }
 
     /// 名簿で、この投票用紙の選挙区が有権者に属していること。
@@ -239,12 +361,16 @@ mod tests {
         }
     }
 
-    /// 呼び出しを記録するだけのストア。`fail` なら常に障害を返す。`voted` は投票済みの投票用紙。
+    /// 呼び出しを記録するだけのストア。`fail` なら常に障害を返す。`voted` は投票済みの投票用紙（受理した票の数つき）。
+    /// `slots` は slot_state、`revote_conflict` なら再投票の条件付き書き込みが負ける。
     #[derive(Default)]
     struct RecordingStore {
         fail: bool,
-        voted: Vec<ContestId>,
+        voted: Vec<(ContestId, u32)>,
+        slots: Mutex<HashMap<domain::Slot, crate::ports::SlotState>>,
+        revote_conflict: bool,
         casts: Mutex<Vec<(ShardId, Ballot)>>,
+        revotes: Mutex<Vec<(ShardId, Ballot, u32)>>,
     }
 
     #[async_trait]
@@ -258,11 +384,52 @@ mod tests {
             if self.fail {
                 return Err(StoreError::Unavailable.into());
             }
+            if let Some(link) = ballot.revote {
+                self.slots.lock().expect("test lock").insert(
+                    link.slot,
+                    crate::ports::SlotState {
+                        seq: link.seq,
+                        last_ballot_hash: domain::ballot_hash(&ballot),
+                    },
+                );
+            }
             self.casts.lock().expect("test lock").push((shard, ballot));
             Ok(())
         }
-        async fn voted_contests(&self, _: &VoterId) -> Result<Vec<ContestId>, StoreError> {
-            Ok(self.voted.clone())
+        async fn revote(
+            &self,
+            _voter: &VoterId,
+            shard: ShardId,
+            ballot: Ballot,
+            prev_seq: u32,
+        ) -> Result<(), CastError> {
+            if self.revote_conflict {
+                return Err(CastError::RevoteConflict);
+            }
+            self.revotes
+                .lock()
+                .expect("test lock")
+                .push((shard, ballot, prev_seq));
+            Ok(())
+        }
+        async fn voted_contests(
+            &self,
+            _: &VoterId,
+        ) -> Result<Vec<crate::ports::VotedContest>, StoreError> {
+            Ok(self
+                .voted
+                .iter()
+                .map(|(contest, ballots)| crate::ports::VotedContest {
+                    contest: contest.clone(),
+                    ballots: *ballots,
+                })
+                .collect())
+        }
+        async fn slot_state(
+            &self,
+            slot: &domain::Slot,
+        ) -> Result<Option<crate::ports::SlotState>, StoreError> {
+            Ok(self.slots.lock().expect("test lock").get(slot).copied())
         }
         async fn pending_by_shard(&self) -> Result<Vec<usize>, StoreError> {
             Ok(vec![])
@@ -353,7 +520,27 @@ mod tests {
             store,
             Arc::new(FixedId(BallotId::from_random_bytes([7; 16]))),
             NonZeroU16::new(4).expect("non-zero"),
+            Arc::new(RevoteKeyVault::in_memory(Some(
+                crate::revote::RevoteKey::new([9; 32]),
+            ))),
         )
+    }
+
+    /// 再投票を認めない選挙のルール（白票の可否だけを変える）。
+    fn blank(allow_blank: bool) -> ElectionRules {
+        ElectionRules {
+            allow_blank,
+            ..ElectionRules::default()
+        }
+    }
+
+    /// 再投票を認める選挙のルール（上限 2 回）。
+    fn revotes() -> ElectionRules {
+        ElectionRules {
+            allow_revote: true,
+            max_revotes: 2,
+            ..ElectionRules::default()
+        }
     }
 
     fn alice() -> VoterId {
@@ -368,7 +555,7 @@ mod tests {
             &alice(),
             contest_id("shugiin_smd.13.01"),
             cand("shugiin_smd.13.01", 2),
-            true,
+            blank(true),
         )
         .await
         .expect("cast");
@@ -392,7 +579,7 @@ mod tests {
                 &alice(),
                 contest_id("governor.99"),
                 cand("governor.99", 1),
-                true
+                blank(true)
             )
             .await,
             Err(ServiceError::ContestNotFound)
@@ -402,7 +589,7 @@ mod tests {
                 &alice(),
                 contest_id("shugiin_smd.13.01"),
                 cand("shugiin_smd.13.01", 9),
-                true
+                blank(true)
             )
             .await,
             Err(ServiceError::InvalidCandidate)
@@ -413,7 +600,7 @@ mod tests {
                 &alice(),
                 contest_id("shugiin_smd.13.01"),
                 cand("shugiin_smd.13.02", 1),
-                true
+                blank(true)
             )
             .await,
             Err(ServiceError::InvalidCandidate)
@@ -434,7 +621,7 @@ mod tests {
                 &alice(),
                 contest_id("governor.13"),
                 CandidateId::Blank,
-                false
+                blank(false)
             )
             .await,
             Err(ServiceError::BlankNotAllowed)
@@ -445,7 +632,7 @@ mod tests {
             &alice(),
             contest_id("governor.13"),
             CandidateId::Blank,
-            true,
+            blank(true),
         )
         .await
         .expect("blank vote");
@@ -468,7 +655,7 @@ mod tests {
             (&stranger, "governor.13"),
         ] {
             assert_eq!(
-                svc.cast_vote(voter, contest_id(district), cand(district, 1), true)
+                svc.cast_vote(voter, contest_id(district), cand(district, 1), blank(true))
                     .await,
                 Err(ServiceError::NotEligible),
                 "{voter:?} {district}"
@@ -500,7 +687,7 @@ mod tests {
                 &alice(),
                 contest_id("governor.13"),
                 cand("governor.13", 1),
-                true
+                blank(true)
             )
             .await,
             Err(ServiceError::Unavailable)
@@ -538,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn ballot_status_marks_voted_ballots_without_changing_the_order() {
         let svc = service(Arc::new(RecordingStore {
-            voted: vec![contest_id("governor.13")],
+            voted: vec![(contest_id("governor.13"), 1)],
             ..Default::default()
         }));
         let status = svc.ballot_status(&alice()).await.expect("status");
@@ -552,6 +739,183 @@ mod tests {
                 ("2026-general/governor.13", true),
                 ("2026-general/shugiin_smd.13.01", false)
             ]
+        );
+        assert_eq!(
+            status.iter().map(|b| b.ballots_cast).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+    }
+
+    // --- 再投票（ADR 0022）---
+
+    #[tokio::test]
+    async fn without_revotes_no_slot_is_recorded_and_the_shard_comes_from_the_ballot_id() {
+        let store = Arc::new(RecordingStore::default());
+        let svc = service(store.clone());
+        svc.cast_vote(
+            &alice(),
+            contest_id("governor.13"),
+            cand("governor.13", 1),
+            blank(true),
+        )
+        .await
+        .expect("cast");
+        // ロックの中身は複製して、ロックはこの文の終わりで手放す（await をまたいで持たない）。
+        let (shard, ballot) = store.casts.lock().expect("test lock")[0].clone();
+        assert_eq!(ballot.revote, None);
+        assert_eq!(
+            shard,
+            shard_for(&ballot.ballot_id, NonZeroU16::new(4).expect("non-zero"))
+        );
+        assert_eq!(
+            svc.revote(
+                &alice(),
+                contest_id("governor.13"),
+                cand("governor.13", 1),
+                blank(true),
+                1
+            )
+            .await,
+            Err(ServiceError::RevoteNotAllowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn with_revotes_the_first_vote_carries_seq_1_and_the_shard_comes_from_the_slot() {
+        let store = Arc::new(RecordingStore::default());
+        let svc = service(store.clone());
+        svc.cast_vote(
+            &alice(),
+            contest_id("governor.13"),
+            cand("governor.13", 1),
+            revotes(),
+        )
+        .await
+        .expect("cast");
+        let casts = store.casts.lock().expect("test lock");
+        let link = casts[0].1.revote.expect("slot");
+        assert_eq!((link.seq, link.supersedes), (1, None));
+        let key = crate::revote::RevoteKey::new([9; 32]);
+        let expected = key.slot(
+            &domain::ElectionId::new("2026-general").expect("valid"),
+            &alice(),
+            &contest_id("governor.13"),
+        );
+        assert_eq!(link.slot, expected);
+        assert_eq!(
+            casts[0].0,
+            shard_for_slot(&expected, NonZeroU16::new(4).expect("non-zero"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revote_links_to_the_last_ballot_and_respects_the_limit() {
+        let store = Arc::new(RecordingStore::default());
+        let svc = service(store.clone());
+        let contest = contest_id("governor.13");
+        svc.cast_vote(&alice(), contest.clone(), cand("governor.13", 1), revotes())
+            .await
+            .expect("cast");
+        let first = store.casts.lock().expect("test lock")[0].1.clone();
+
+        // 投票済みの記録（seq=1）がある状態で、再投票（白票）。
+        let store2 = Arc::new(RecordingStore {
+            voted: vec![(contest.clone(), 1)],
+            slots: Mutex::new(store.slots.lock().expect("test lock").clone()),
+            ..Default::default()
+        });
+        let svc2 = service(store2.clone());
+        svc2.revote(&alice(), contest.clone(), CandidateId::Blank, revotes(), 1)
+            .await
+            .expect("revote");
+        let (shard, ballot, prev_seq) = store2.revotes.lock().expect("test lock")[0].clone();
+        let link = ballot.revote.expect("slot");
+        assert_eq!(prev_seq, 1);
+        assert_eq!(link.seq, 2);
+        assert_eq!(link.slot, first.revote.expect("slot").slot);
+        assert_eq!(link.supersedes, Some(domain::ballot_hash(&first)));
+        assert_eq!(shard, store.casts.lock().expect("test lock")[0].0);
+        assert_eq!(ballot.candidate_id, CandidateId::Blank);
+        assert_ne!(ballot.ballot_id, BallotId([0; 16]));
+
+        // 上限（max_revotes=2 → seq は 3 まで）に達していたら拒否する。
+        let full = service(Arc::new(RecordingStore {
+            voted: vec![(contest.clone(), 3)],
+            ..Default::default()
+        }));
+        assert_eq!(
+            full.revote(&alice(), contest.clone(), CandidateId::Blank, revotes(), 3)
+                .await,
+            Err(ServiceError::RevoteLimitReached)
+        );
+        // まだ投票していない。
+        assert_eq!(
+            service(Arc::new(RecordingStore::default()))
+                .revote(&alice(), contest.clone(), CandidateId::Blank, revotes(), 1)
+                .await,
+            Err(ServiceError::NotVotedYet)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revote_that_loses_the_race_is_a_conflict() {
+        let contest = contest_id("governor.13");
+        // 画面が見た票の数（1）が古い: 別の再投票が先に受理されて、もう 2。
+        let stale = service(Arc::new(RecordingStore {
+            voted: vec![(contest.clone(), 2)],
+            ..Default::default()
+        }));
+        assert_eq!(
+            stale
+                .revote(&alice(), contest.clone(), CandidateId::Blank, revotes(), 1)
+                .await,
+            Err(ServiceError::RevoteConflict)
+        );
+        // slot_state が participation より遅れている（別の再投票の書き込み中）。
+        let behind = service(Arc::new(RecordingStore {
+            voted: vec![(contest.clone(), 2)],
+            ..Default::default()
+        }));
+        assert_eq!(
+            behind
+                .revote(&alice(), contest.clone(), CandidateId::Blank, revotes(), 2)
+                .await,
+            Err(ServiceError::RevoteConflict)
+        );
+        // 条件付き書き込みに負けた。
+        let store = Arc::new(RecordingStore::default());
+        service(store.clone())
+            .cast_vote(&alice(), contest.clone(), cand("governor.13", 1), revotes())
+            .await
+            .expect("cast");
+        let lost = service(Arc::new(RecordingStore {
+            voted: vec![(contest.clone(), 1)],
+            slots: Mutex::new(store.slots.lock().expect("test lock").clone()),
+            revote_conflict: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            lost.revote(&alice(), contest, CandidateId::Blank, revotes(), 1)
+                .await,
+            Err(ServiceError::RevoteConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_revote_key_a_revote_election_accepts_no_votes() {
+        let svc = VotingService {
+            revote_keys: Arc::new(RevoteKeyVault::none()),
+            ..service(Arc::new(RecordingStore::default()))
+        };
+        assert_eq!(
+            svc.cast_vote(
+                &alice(),
+                contest_id("governor.13"),
+                cand("governor.13", 1),
+                revotes()
+            )
+            .await,
+            Err(ServiceError::RevoteKeyUnavailable)
         );
     }
 

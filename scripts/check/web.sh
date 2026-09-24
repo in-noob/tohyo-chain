@@ -6,6 +6,9 @@
 #      その成果物に対して、両方の確認を行う。docs/testing.md の「除外した項目」を参照）
 #   4. 白票: 候補者一覧の最後に白票の選択肢（allow_blank=false なら出さない）・確認画面の文言・ビューアの別の行
 #      （API と集計の確認は core.sh#10）
+#   5. 投票のやり直し（再投票。ADR 0022）: 完了画面の「投票をやり直す」（許可・期間内だけ）・固定の順番の一覧・上限に達した
+#      投票用紙は選べず理由を表示・確認画面は「前回の投票内容を変更します」・ビューアの「#<前の票> を置き換え（A→B）」
+#      （API・封印・集計は core.sh#11・chain.sh#9）
 # ブラウザでの動作確認は docs/manual_check_step5.md・docs/manual_check_step15.md（手動）で行う。
 # 注意: trunk は crates/web で実行する（このスクリプトは、ワークスペースのルートから実行する）。
 set -euo pipefail
@@ -313,9 +316,58 @@ check_blank_choice() (
     echo "OK: web#4 白票"
 )
 
+# ===========================================================================
+# 5. 投票のやり直し（画面。API・封印・集計は core.sh#11・chain.sh#9）
+# ===========================================================================
+check_revote_screens() (
+    set -euo pipefail
+    fail() {
+        echo "FAIL: $1" >&2
+        exit 1
+    }
+    echo "== 5-1. やり直しの画面遷移・表示ロジックのテスト（必須ケース）"
+    REQUIRED=(
+        flow::tests::the_revote_button_needs_all_ballots_voted_an_open_period_and_revotes_allowed
+        flow::tests::the_revote_list_keeps_the_fixed_order_and_blocks_ballots_at_the_limit
+        flow::tests::revote_pages_open_only_for_voted_ballots_below_the_limit_while_open
+        flow::tests::a_revote_sends_the_seen_count_and_bumps_it_after_acceptance
+        flow::tests::revote_failures_return_to_the_revote_list_with_a_notice
+        error::tests::conflicts_are_told_apart_by_the_error_code
+        chain::tests::a_revote_links_to_the_ballot_it_replaced_with_a_to_b
+    )
+    if ! out="$(cargo test -p web --lib 2>&1)"; then
+        echo "$out" >&2
+        fail "web のテストが失敗しました"
+    fi
+    for name in "${REQUIRED[@]}"; do
+        grep -Eq "^test ${name} \.\.\. ok$" <<<"$out" \
+            || fail "必須テスト ${name} が成功していません（存在しない可能性があります）"
+    done
+    echo "やり直しの画面遷移・表示ロジック: 必須 ${#REQUIRED[@]} 件 OK"
+
+    echo "== 5-2. 画面が、設定の文言と flow の判定で組み立てられ、前回の投票内容を出さない"
+    grep -q 'flow::can_revote(' crates/web/src/pages/done.rs && grep -q 'labels::revote_button()' crates/web/src/pages/done.rs \
+        || fail "完了画面が、flow::can_revote と labels::revote_button() で「投票をやり直す」を出していません"
+    REVOTE=crates/web/src/pages/revote.rs
+    grep -q 'flow::revote_items(' "$REVOTE" && grep -q 'labels::revote_limit_reached()' "$REVOTE" \
+        || fail "$REVOTE が、flow::revote_items と labels::revote_limit_reached() を使っていません"
+    grep -q 'labels::revote_confirm()' crates/web/src/pages/vote.rs \
+        || fail "やり直しの確認画面が labels::revote_confirm() を出していません"
+    # 前回の投票内容は、API も返さない（BallotStatusDto に候補者の項目が無い）。画面が候補者を覚えておく経路も無いこと。
+    if grep -nE 'candidate' "$REVOTE"; then
+        fail "$REVOTE に候補者の情報が出てきます（前回の投票内容は表示しない）"
+    fi
+    grep -q 'chain::ballot_anchor(' crates/web/src/pages/chain.rs && grep -qF 'a.replaces' crates/web/style.css \
+        || fail "ビューアに、前の票へのリンク（行のアンカー・a.replaces の書式）がありません"
+    echo "完了画面のボタン・一覧（上限の理由）・確認の文言・ビューアのリンク・前回の投票内容を出さない: OK"
+
+    echo "OK: web#5 投票のやり直し"
+)
+
 check_flow_and_purity
 check_design_tokens_and_theme
 check_trunk_build
 check_blank_choice
+check_revote_screens
 
 echo "OK: check/web.sh"

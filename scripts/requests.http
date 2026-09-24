@@ -68,6 +68,17 @@ Content-Type: application/json
   "candidate_id": "blank"
 }
 
+### 再投票（vote.allow_revote=true の選挙だけ。ADR 0022）: "revote" に、ballot-status の ballots_cast（見た票の数）を入れる → 201
+### 見た票の数が古い・同時に送られた → 409 revote_conflict / 上限 → 409 revote_limit_reached / 認めない選挙 → 409 revote_not_allowed
+POST {{baseUrl}}/api/v1/contests/2026-general/sangiin_district.13/vote
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "candidate_id": "sangiin_district.13.c1",
+  "revote": 1
+}
+
 ### 候補者がその投票用紙にいない → 422
 POST {{baseUrl}}/api/v1/contests/2026-general/shugiin_smd.13.01/vote
 Authorization: Bearer {{token}}

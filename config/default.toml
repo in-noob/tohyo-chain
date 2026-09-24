@@ -127,6 +127,15 @@ state_cache_secs = 5
 # 選挙のルールなので、選挙状態が open に移った時点の値を DB（memory モードではプロセス内）に固定し、それ以降は
 # 設定を変えても使わない（原則19。open に移すプロセス（sealer / api）の値が固定される）。
 allow_blank = true
+# 投票期間中の再投票（同じ投票用紙に投票し直すこと）を認めるか（ADR 0022）。true なら、票に再投票の仮名
+#   slot = HMAC-SHA256(revote_key, election_id || voter_id || contest_id) と、その slot の何番目の票か（seq）・前の票のハッシュ
+#   （supersedes）を記録し、集計は slot ごとに最後の票だけを数える。false なら、2 回目の投票は拒否し（409）、slot を記録しない。
+#   true のときは、鍵を secrets/revote_key（64 桁の hex。1 ファイル。環境変数では渡せない）に置く。鍵は、ログにも DB にも出さず、
+#   締切の手続き（closing）の中で、ファイルごと破棄する（election_audit に revote_key_destroyed を記録）。
+# 白票の可否と同じく、open に移った時点の値を固定する（原則19）。
+allow_revote = false
+# 再投票の上限回数（1〜100。初回の投票を含めない。1 つの投票用紙の票は最大 max_revotes + 1 件）。open の時点で固定する。
+max_revotes = 5
 
 [chain]
 # チェーンの API（ブロックの詳細）が票（ballot_id・contest_id・candidate_id）を公開するタイミング。
@@ -166,3 +175,9 @@ blank_option = "白票（どの候補者にも投票しない）"
 blank_confirm = "白票として投票します。よろしいですか？"
 # 白票の呼び名。集計結果（候補者とは別の行）・ビューア（票の一覧）・API のエラーメッセージに使う。
 blank_name = "白票"
+# 全投票完了の画面で、再投票が許可されていて投票期間内のときに表示するボタン（vote.allow_revote = true のときだけ）。
+revote_button = "投票をやり直す"
+# 再投票の確認画面の文言。前回の投票内容は表示しない（画面にも API にも返さない）。
+revote_confirm = "前回の投票内容を変更します"
+# 再投票の上限（vote.max_revotes）に達した投票用紙を選べない理由。画面と API のエラーメッセージに使う。{max} は上限回数（必須）。
+revote_limit_reached = "やり直しの上限（{max}回）に達しています"

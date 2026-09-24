@@ -37,7 +37,7 @@ pub fn ProgressPage() -> impl IntoView {
         }
         leptos::task::spawn_local(async move {
             match api::ballot_status(&token).await {
-                Ok(status) => state.ballots.set(Some(status.ballots)),
+                Ok(status) => state.set_status(status),
                 Err(ApiFailure::Unauthorized) => {
                     state.notice.set(Some(
                         "セッションの有効期限が切れました。もう一度ログインしてください。".into(),

@@ -5,12 +5,12 @@ use leptos_router::NavigateOptions;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::hooks::use_navigate;
 use leptos_router::path;
-use shared_types::BallotStatusDto;
+use shared_types::{BallotStatusDto, BallotStatusResponse, RevoteStatusDto};
 
 use crate::flow::{self, GuardContext, Route as Page};
 use crate::pages::{
     ChainAnchorsPage, ChainBlockPage, ChainIndexPage, ChainShardPage, DonePage, LoginPage,
-    ProgressPage, VotePage,
+    ProgressPage, RevotePage, RevoteVotePage, VotePage,
 };
 use crate::theme::{self, Mode};
 
@@ -28,6 +28,8 @@ pub struct AppState {
     pub last_voted: RwSignal<Option<String>>,
     /// 次の画面で一度だけ見せる案内。
     pub notice: RwSignal<Option<String>>,
+    /// 再投票の条件（再投票を認める選挙だけ。上限と、今受け付けているか）。前回の投票内容は持たない。
+    pub revote: RwSignal<Option<RevoteStatusDto>>,
 }
 
 impl AppState {
@@ -37,7 +39,14 @@ impl AppState {
             ballots: RwSignal::new(None),
             last_voted: RwSignal::new(None),
             notice: RwSignal::new(None),
+            revote: RwSignal::new(None),
         }
+    }
+
+    /// `ballot-status` の応答を反映する（投票用紙の一覧と、再投票の条件）。
+    pub fn set_status(&self, status: BallotStatusResponse) {
+        self.ballots.set(Some(status.ballots));
+        self.revote.set(status.revote);
     }
 
     /// セッションに関わる状態をすべて破棄する。
@@ -45,6 +54,7 @@ impl AppState {
         self.token.set(None);
         self.ballots.set(None);
         self.last_voted.set(None);
+        self.revote.set(None);
     }
 }
 
@@ -67,10 +77,12 @@ pub fn use_guard(page: Page) {
         let logged_in = state.token.with(Option::is_some);
         let ballots = state.ballots.get_untracked();
         let last_voted = state.last_voted.get_untracked();
+        let revote = state.revote.get_untracked();
         let ctx = GuardContext {
             logged_in,
             ballots: ballots.as_deref(),
             last_voted: last_voted.as_deref(),
+            revote: revote.as_ref(),
         };
         if let Some(target) = flow::guard(&ctx, &page) {
             navigate(&target.path(), replace());
@@ -160,6 +172,9 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/progress") view=ProgressPage />
                     <Route path=path!("/ballots/:election_id/:district_id") view=VotePage />
                     <Route path=path!("/done") view=DonePage />
+                    // 投票のやり直し（再投票を認める選挙だけ。ADR 0022）。
+                    <Route path=path!("/revote") view=RevotePage />
+                    <Route path=path!("/revote/:election_id/:district_id") view=RevoteVotePage />
                     // ブロックチェーンのビューア（ログイン不要。ルート保護の対象外）。
                     <Route path=path!("/chain") view=ChainIndexPage />
                     <Route path=path!("/chain/anchors") view=ChainAnchorsPage />

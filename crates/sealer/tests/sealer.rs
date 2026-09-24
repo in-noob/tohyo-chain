@@ -72,6 +72,7 @@ async fn cast(store: &InMemoryStore, shard: u16, first_id: u32, n: u32) {
             contest_id: ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"),
             candidate_id: CandidateId::parse(&format!("shugiin_smd.13.01.c{}", 1 + i % 4))
                 .expect("valid"),
+            revote: None,
         };
         let voter = VoterId::new(&format!("voter-{shard}-{i}")).expect("valid");
         store
@@ -436,7 +437,11 @@ async fn spawned_task_seals_periodically_and_does_not_flush_on_shutdown() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
-        ElectionRules { allow_blank: true },
+        ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
 
     // 100 件到着 → 次の周期（200ms 以内）で件数封印される。
@@ -474,7 +479,11 @@ async fn spawned_task_flushes_only_in_the_closing_procedure() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
-        ElectionRules { allow_blank: true },
+        ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
     run_spawned_for(&clock, 1).await;
     assert_eq!(store.get().await.expect("state").phase, ElectionPhase::Open);
@@ -490,7 +499,10 @@ async fn spawned_task_flushes_only_in_the_closing_procedure() {
             .transition(
                 ElectionPhase::Open,
                 ElectionPhase::Closing,
-                ElectionRules { allow_blank: true },
+                ElectionRules {
+                    allow_blank: true,
+                    ..ElectionRules::default()
+                },
                 "test",
                 opens_at + 6
             )
@@ -698,7 +710,11 @@ async fn spawned_task_adds_nothing_while_idle_and_finalizes_only_on_change() {
         Duration::from_secs(10),
         f.store.clone(),
         Duration::from_secs(1),
-        ElectionRules { allow_blank: true },
+        ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
 
     // 票が無いまま 60 秒（封印・アンカーの間隔が 6 回ずつ）: ブロックもアンカーも増えない。
@@ -740,7 +756,11 @@ async fn spawned_task_finalizes_the_anchor_on_shutdown_without_flushing() {
         Duration::from_secs(600),
         f.store.clone(),
         Duration::from_secs(1),
-        ElectionRules { allow_blank: true },
+        ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        Arc::new(application::RevoteKeyVault::none()),
     );
     cast(&store, 0, 0, 104).await;
     tokio::time::sleep(Duration::from_millis(250)).await;

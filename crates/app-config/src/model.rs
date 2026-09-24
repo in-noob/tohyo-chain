@@ -179,7 +179,14 @@ pub struct Election {
 pub struct Vote {
     /// 白票（どの候補者にも投票しない）を選べるか。
     pub allow_blank: bool,
+    /// 投票期間中の再投票を認めるか（ADR 0022）。
+    pub allow_revote: bool,
+    /// 再投票の上限回数（初回の投票を含めない）。
+    pub max_revotes: u32,
 }
+
+/// `vote.max_revotes` の上限（1 つの投票用紙の票が際限なく増えないように）。
+pub const MAX_REVOTES_LIMIT: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayTimezone {
@@ -225,6 +232,12 @@ pub struct Labels {
     pub blank_confirm: String,
     /// 集計結果・ビューア・API のエラーでの、白票の呼び名。
     pub blank_name: String,
+    /// 全投票完了の画面の、再投票のボタン。
+    pub revote_button: String,
+    /// 再投票の確認画面の文言（前回の投票内容は表示しない）。
+    pub revote_confirm: String,
+    /// 再投票の上限に達した投票用紙の理由（画面・API のエラー）。`{max}` は `vote.max_revotes`。
+    pub revote_limit_reached: String,
 }
 
 impl Election {
@@ -538,6 +551,8 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
     let state_cache_secs = r.uint("election.state_cache_secs", 0, 3600);
 
     let allow_blank = r.boolean("vote.allow_blank");
+    let allow_revote = r.boolean("vote.allow_revote");
+    let max_revotes = r.uint("vote.max_revotes", 1, MAX_REVOTES_LIMIT);
 
     let reveal = r.choice(
         "chain.reveal_ballots",
@@ -565,7 +580,16 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         blank_option: r.label("labels.blank_option", 100),
         blank_confirm: r.label("labels.blank_confirm", 200),
         blank_name: r.label("labels.blank_name", 30),
+        revote_button: r.label("labels.revote_button", 100),
+        revote_confirm: r.label("labels.revote_confirm", 200),
+        revote_limit_reached: r.label("labels.revote_limit_reached", 200),
     };
+    if !labels.revote_limit_reached.contains("{max}") {
+        r.bad(
+            "labels.revote_limit_reached",
+            "{max}（再投票の上限回数）を含めてください（例: やり直しの上限（{max}回）に達しています）",
+        );
+    }
     if !labels.progress.contains("{total}") || !labels.progress.contains("{current}") {
         r.bad(
             "labels.progress",
@@ -658,7 +682,11 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
             display_timezone,
             state_cache_secs,
         },
-        vote: Vote { allow_blank },
+        vote: Vote {
+            allow_blank,
+            allow_revote,
+            max_revotes: u32::try_from(max_revotes).unwrap_or(u32::MAX),
+        },
         chain: Chain {
             reveal_ballots: reveal,
         },

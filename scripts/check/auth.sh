@@ -309,7 +309,7 @@ check_credgen_and_db_auth() (
     echo "件数を表示して確認を求め、no では何も消えない: OK"
     out="$(./scripts/db_reset.sh --votes --yes 2>&1)" || { echo "$out" >&2; fail "db_reset --votes --yes が失敗しました"; }
     echo "$out" | tail -3
-    for t in participation ballot_pool blocks anchors sealer_lease; do
+    for t in participation slot_state ballot_pool blocks anchors sealer_lease; do
         expect_count "$t" 0 "db_reset --votes の後"
     done
     expect_count credentials 100 "db_reset --votes の後（認証情報は残る）"

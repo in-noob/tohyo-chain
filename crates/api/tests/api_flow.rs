@@ -121,7 +121,11 @@ fn config(shards: u16) -> Config {
         },
         admin_bind: "127.0.0.1:0".to_string(),
         admin_token: None,
-        rules: ElectionRules { allow_blank: true },
+        rules: ElectionRules {
+            allow_blank: true,
+            ..ElectionRules::default()
+        },
+        revote_key_path: None,
     }
 }
 
@@ -143,12 +147,14 @@ async fn built_rules(configured: bool, frozen: bool) -> (Router, Sealer) {
     let mut cfg = config(1);
     cfg.rules = ElectionRules {
         allow_blank: configured,
+        ..ElectionRules::default()
     };
     built_from(
         cfg,
         1_000,
         Some(ElectionRules {
             allow_blank: frozen,
+            ..ElectionRules::default()
         }),
     )
     .await
@@ -740,6 +746,12 @@ fn to_block(v: &Value) -> Block {
                     .expect("valid contest id"),
                 candidate_id: CandidateId::parse(b["candidate_id"].as_str().expect("cand"))
                     .expect("valid candidate id"),
+                // 再投票のつながり（slot・seq・supersedes）。再投票を認めない選挙の票には無い。
+                revote: b.get("slot").map(|slot| domain::RevoteLink {
+                    slot: domain::Slot(hex32(slot)),
+                    seq: b["seq"].as_u64().expect("seq") as u32,
+                    supersedes: b.get("supersedes").map(hex32),
+                }),
             })
             .collect(),
         block_hash: hex32(&v["block_hash"]),
@@ -965,11 +977,14 @@ async fn audit_counts_report_participation_and_pending_per_ballot_only() {
             assert_eq!(status, StatusCode::CREATED);
         }
     }
-    // 投票用紙の ID の昇順（`shugiin_pr.tokyo` < `shugiin_smd.13.01`）。
+    // 投票用紙の ID の昇順（`shugiin_pr.tokyo` < `shugiin_smd.13.01`）。票を公開している（always）ので、受理した票の数
+    // （cast）と、未封印のうち最初の票の数（pending_initial）も返す。再投票が無いので、cast = participation。
     let expected = |pending_smd: u64, pending_pr: u64| {
         json!({ "contests": [
-            { "contest_id": "2026-general/shugiin_pr.tokyo", "participation": 2, "pending": pending_pr },
-            { "contest_id": "2026-general/shugiin_smd.13.01", "participation": 3, "pending": pending_smd },
+            { "contest_id": "2026-general/shugiin_pr.tokyo", "participation": 2, "cast": 2,
+              "pending": pending_pr, "pending_initial": pending_pr },
+            { "contest_id": "2026-general/shugiin_smd.13.01", "participation": 3, "cast": 3,
+              "pending": pending_smd, "pending_initial": pending_smd },
         ]})
     };
     let (status, body) = send(&app, "GET", "/api/v1/audit/counts", None, None).await;
@@ -1432,7 +1447,10 @@ async fn app_at_phase(now: u64, period: Period, phase: ElectionPhase) -> Router 
             .transition(
                 current,
                 next,
-                ElectionRules { allow_blank: true },
+                ElectionRules {
+                    allow_blank: true,
+                    ..ElectionRules::default()
+                },
                 "test",
                 0,
             )
@@ -1574,4 +1592,298 @@ async fn closed_rejects_voting_with_its_own_message() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_error(&body, "voting_closed");
+}
+
+// --- 再投票（ADR 0022）---
+
+/// 再投票の鍵のファイル（テストごとに別の一時ファイル）。
+fn revote_key_file() -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "api-flow-revote-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("revote_key");
+    std::fs::write(&path, "5a".repeat(32)).expect("write key");
+    path
+}
+
+/// 再投票を認める選挙（上限 `max_revotes` 回）の API。
+async fn built_revote(max_revotes: u32, now: u64, reveal: api::RevealPolicy) -> (Router, Sealer) {
+    let mut cfg = config(1);
+    cfg.reveal = reveal;
+    cfg.rules = ElectionRules {
+        allow_blank: true,
+        allow_revote: true,
+        max_revotes,
+    };
+    cfg.revote_key_path = Some(revote_key_file());
+    built_from(cfg, now, None).await
+}
+
+fn revote_body(candidate_id: &str, seen: u32) -> Option<Value> {
+    Some(json!({ "candidate_id": candidate_id, "revote": seen }))
+}
+
+async fn smd1_status(app: &Router, token: &str) -> (Value, Value) {
+    let (status, body) = send(app, "GET", "/api/v1/ballot-status", Some(token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    (body["ballots"][0].clone(), body["revote"].clone())
+}
+
+#[tokio::test]
+async fn a_then_b_then_blank_counts_only_the_last_ballot_and_the_limit_applies() {
+    let (app, mut sealer) = built_revote(2, 1_000, api::RevealPolicy::Always).await;
+    let token = login(&app, "voter-0").await;
+    // URI は、クロージャが返す Future より長く生きる変数に置く（`format!` の一時値を借りると、Future が
+    // 待たれる前に一時値が破棄されてしまう）。
+    let uri = format!("{SMD1}/vote");
+    let vote = |body| send(&app, "POST", &uri, Some(&token), body);
+
+    assert_eq!(
+        vote(vote_body(&candidate("shugiin_smd.13.01", 1))).await.0,
+        StatusCode::CREATED
+    );
+    let (smd1, revote) = smd1_status(&app, &token).await;
+    assert_eq!(
+        (smd1["voted"].clone(), smd1["ballots_cast"].clone()),
+        (json!(true), json!(1))
+    );
+    assert_eq!(revote, json!({ "max_revotes": 2, "open": true }));
+
+    // 再投票を明示しない 2 回目は、これまでどおり 409（二重送信で意図せずやり直さない）。
+    let (status, body) = vote(vote_body(&candidate("shugiin_smd.13.01", 2))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "already_voted");
+
+    // A → B → 白票。
+    assert_eq!(
+        vote(revote_body(&candidate("shugiin_smd.13.01", 2), 1))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(vote(revote_body("blank", 2)).await.0, StatusCode::CREATED);
+    // 上限（2 回）を超えると拒否する。文言は labels.revote_limit_reached。
+    let (status, body) = vote(revote_body(&candidate("shugiin_smd.13.01", 3), 3)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "revote_limit_reached");
+    assert_eq!(
+        body["message"],
+        json!("やり直しの上限（2回）に達しています")
+    );
+    // 画面が見た票の数が古い再投票は、競合として拒否する。
+    let (status, body) = vote(revote_body(&candidate("shugiin_smd.13.01", 3), 1)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "revote_conflict");
+    // まだ投票していない投票用紙の再投票。
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{PR}/vote"),
+        Some(&token),
+        revote_body(&candidate("shugiin_pr.tokyo", 1), 0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "not_voted");
+
+    // 状況には、票の数だけが出て、前回の投票内容（候補者）は出ない。
+    let (status, body) = send(&app, "GET", "/api/v1/ballot-status", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ballots"][0]["ballots_cast"], json!(3));
+    let text = body.to_string();
+    assert!(!text.contains(".c1") && !text.contains("blank"), "{text}");
+
+    // 封印したチェーン: 同じ slot の 3 票が seq 1・2・3 でつながり、最後の白票だけが数えられる。
+    assert!(sealer.close_flush().await.errors.is_empty());
+    let (chain, key) = fetch_chain(&app).await;
+    let verifier = Ed25519Verifier::from_public_key(&key).expect("key");
+    assert_eq!(verify_chain(&chain, &verifier), Ok(()));
+    let placed: Vec<domain::PlacedBallot<'_>> = chain
+        .iter()
+        .flat_map(|b| {
+            b.ballots.iter().map(|ballot| domain::PlacedBallot {
+                shard: 0,
+                height: b.header.height,
+                ballot,
+            })
+        })
+        .collect();
+    let rules = ElectionRules {
+        allow_blank: true,
+        allow_revote: true,
+        max_revotes: 2,
+    };
+    let analysis =
+        domain::analyze_revotes(&placed, rules, std::num::NonZeroU16::MIN).expect("valid revotes");
+    assert_eq!(analysis.slots, 1);
+    assert_eq!(analysis.counted.len(), 1);
+    assert_eq!(analysis.counted[0].candidate_id, CandidateId::Blank);
+    assert_eq!(analysis.replacements.len(), 2);
+    // ビューア: 最後の票は、前の票（B）を置き換えたことを示す。
+    let (_, _, block) = get_with_headers(&app, "/api/v1/chains/0/blocks/1").await;
+    let last = block["ballots"]
+        .as_array()
+        .expect("ballots")
+        .iter()
+        .find(|b| b["seq"] == json!(3))
+        .expect("seq 3")
+        .clone();
+    assert_eq!(
+        last["replaces"]["candidate_id"],
+        json!("shugiin_smd.13.01.c2")
+    );
+    assert_eq!(last["replaces"]["candidate_name"], json!("候補2"));
+    assert_eq!(last["replaces"]["height"], json!(1));
+    // 突合: participation は 1 人、受理した票は 3。
+    let (_, counts) = send(&app, "GET", "/api/v1/audit/counts", None, None).await;
+    let row = &counts["contests"][0];
+    assert_eq!(
+        (row["participation"].clone(), row["cast"].clone()),
+        (json!(1), json!(3))
+    );
+}
+
+#[tokio::test]
+async fn of_two_simultaneous_revotes_exactly_one_is_accepted() {
+    let (app, _sealer) = built_revote(5, 1_000, api::RevealPolicy::Always).await;
+    let token = login(&app, "voter-0").await;
+    let uri = format!("{SMD1}/vote");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // 同じ画面（票の数 1 を見た）から、2 つの再投票を同時に送る。
+    let (a, b) = tokio::join!(
+        send(
+            &app,
+            "POST",
+            &uri,
+            Some(&token),
+            revote_body(&candidate("shugiin_smd.13.01", 2), 1)
+        ),
+        send(
+            &app,
+            "POST",
+            &uri,
+            Some(&token),
+            revote_body(&candidate("shugiin_smd.13.01", 3), 1)
+        ),
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::CREATED, StatusCode::CONFLICT]);
+    let loser = if a.0 == StatusCode::CONFLICT {
+        a.1
+    } else {
+        b.1
+    };
+    assert_error(&loser, "revote_conflict");
+    assert_eq!(smd1_status(&app, &token).await.0["ballots_cast"], json!(2));
+}
+
+#[tokio::test]
+async fn without_revotes_a_second_vote_is_409_and_no_slot_is_recorded() {
+    let (app, mut sealer) = built(1, 1_000).await;
+    let token = login(&app, "voter-0").await;
+    let uri = format!("{SMD1}/vote");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 2)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "already_voted");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&token),
+        revote_body(&candidate("shugiin_smd.13.01", 2), 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "revote_not_allowed");
+    // 状況に、再投票の条件は出ない。
+    let (_, body) = send(&app, "GET", "/api/v1/ballot-status", Some(&token), None).await;
+    assert!(body.get("revote").is_none(), "{body}");
+    // 票に slot を記録しない。
+    assert!(sealer.close_flush().await.errors.is_empty());
+    let (_, _, block) = get_with_headers(&app, "/api/v1/chains/0/blocks/1").await;
+    let text = block["ballots"].to_string();
+    assert!(!text.contains("slot") && !text.contains("seq"), "{text}");
+}
+
+#[tokio::test]
+async fn a_revote_election_needs_the_revote_key_file_to_start() {
+    let mut cfg = config(1);
+    cfg.rules.allow_revote = true;
+    let error = match build(
+        &cfg,
+        Arc::new(FixedClock(1_000)),
+        Arc::new(ManualClock::new()),
+    )
+    .await
+    {
+        Ok(_) => panic!("鍵が無いのに起動しました"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(error.contains("revote_key"), "{error}");
+}
+
+#[tokio::test]
+async fn before_the_close_neither_candidates_nor_links_of_revotes_are_visible() {
+    let policy = api::RevealPolicy::AfterClose {
+        closes_at_unix: 5_000,
+    };
+    let (app, mut sealer) = built_revote(5, 4_999, policy).await;
+    let token = login(&app, "voter-0").await;
+    let uri = format!("{SMD1}/vote");
+    send(
+        &app,
+        "POST",
+        &uri,
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 1)),
+    )
+    .await;
+    let (status, _) = send(&app, "POST", &uri, Some(&token), revote_body("blank", 1)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(sealer.close_flush().await.errors.is_empty());
+    let (_, _, block) = get_with_headers(&app, "/api/v1/chains/0/blocks/1").await;
+    assert_eq!(block["ballots_revealed"], json!(false));
+    let text = block.to_string();
+    for secret in ["candidate", "supersedes", "slot", "replaces", "blank"] {
+        assert!(!text.contains(secret), "{secret}: {text}");
+    }
+    // 再投票の件数（受理した票の数）も、締切前は返さない。
+    let (_, counts) = send(&app, "GET", "/api/v1/audit/counts", None, None).await;
+    assert!(counts["contests"][0].get("cast").is_none(), "{counts}");
+    // 選挙のルールは公開（verifier が検証に使う）。
+    let (_, status) = send(&app, "GET", "/api/v1/election-status", None, None).await;
+    assert_eq!(
+        status["rules"],
+        json!({ "allow_blank": true, "allow_revote": true, "max_revotes": 5 })
+    );
 }

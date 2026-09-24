@@ -18,7 +18,8 @@ use std::process::ExitCode;
 use anyhow::Context;
 use shared_types::hex;
 use verify::{
-    AnchorCheck, AuditReport, ChainSource, HttpSource, ShardReport, ShardVerdict, audit, verify_all,
+    AnchorCheck, AuditReport, ChainSource, HttpSource, RevoteSummary, ShardReport, ShardVerdict,
+    audit, check_revotes, verify_all,
 };
 
 const USAGE: &str = "使い方:\n  verifier demo\n  verifier verify [--api URL] [--public-key HEX]\n  verifier tally [--api URL] [--public-key HEX] [--allow-interim] [--out DIR] [--all]\n  （--api の既定は http://localhost:<api.port>。api.port は config/*.toml か APP__API__PORT で決まる。\n   tally の --out の既定は out/tally。--allow-interim は選挙状態が closed になる前の中間集計を許す\n   （app.env=dev のときだけ）。--all は選挙区ごとの表を省略せず全件表示）";
@@ -164,6 +165,8 @@ struct Verified {
     verdicts: Vec<ShardVerdict>,
     /// 全シャードのチェーンが正しいときだけ `Some`（突合は、その後にだけ行う）。
     audit: Option<AuditReport>,
+    /// 再投票のつながりの検証に成功したときだけ `Some`（ADR 0022）。
+    revotes: Option<RevoteSummary>,
     /// 検証と突合のすべてが成功したか。
     ok: bool,
 }
@@ -221,11 +224,35 @@ fn verify_and_print(
         println!("注意: 公開鍵は API が提供した値を使っています（--public-key で固定できます）");
     }
 
-    // 全シャードのチェーンが正しいときだけ、突合・重複・アンカーを確認する。
+    // 全シャードのチェーンが正しいときだけ、再投票のつながり・突合・重複・アンカーを確認する。
     let mut audit_ok = true;
     let mut audit_report = None;
+    let mut revote_summary = None;
     let mut contests_checked = 0;
     if invalid == 0 {
+        let rules = source
+            .rules()
+            .with_context(|| format!("{api} から選挙のルールを取得できませんでした"))?;
+        match check_revotes(&reports, rules) {
+            Ok(summary) if rules.allow_revote => {
+                // 件数だけを表示する（再投票の件数は、締切後にしか検証できない: 票が公開されるのは締切後）。
+                println!(
+                    "再投票のつながり: slot {} 個・再投票 {} 件（上限 {} 回）OK",
+                    summary.slots,
+                    summary.revotes(),
+                    rules.max_revotes
+                );
+                revote_summary = Some(summary);
+            }
+            Ok(summary) => {
+                println!("再投票のつながり: 再投票を認めない選挙で、slot を持つ票はありません OK");
+                revote_summary = Some(summary);
+            }
+            Err(e) => {
+                println!("再投票のつながり: NG（{e}）");
+                audit_ok = false;
+            }
+        }
         let report = audit(source, &reports)
             .with_context(|| format!("{api} から突合に必要な情報を取得できませんでした"))?;
         println!("突合（{ballot_item}別: participation と、チェーン内の票数 + 封印待ち）:");
@@ -244,15 +271,20 @@ fn verify_and_print(
             let verdict = if row.is_consistent() {
                 "OK"
             } else {
-                "NG（participation が封印済み + 封印待ちと一致しません）"
+                "NG（participation が、封印済みの slot の数 + 封印待ちの最初の票の数と一致しません）"
             };
             let note = if row.pending > 0 {
                 "（封印待ちあり）"
             } else {
                 ""
             };
+            let revotes = if row.sealed_revotes > 0 {
+                format!(" revotes={}", row.sealed_revotes)
+            } else {
+                String::new()
+            };
             println!(
-                "  contest={} participation={} sealed={} pending={} {verdict}{note}",
+                "  contest={} participation={} sealed={}{revotes} pending={} {verdict}{note}",
                 row.contest_id, row.participation, row.sealed, row.pending
             );
         }
@@ -274,7 +306,7 @@ fn verify_and_print(
             }
             AnchorCheck::Invalid(reason) => println!("アンカー: NG（{reason}）"),
         }
-        audit_ok = report.is_ok();
+        audit_ok &= report.is_ok();
         audit_report = Some(report);
     }
 
@@ -295,6 +327,7 @@ fn verify_and_print(
     Ok(Verified {
         verdicts,
         audit: audit_report,
+        revotes: revote_summary,
         ok,
     })
 }
@@ -348,7 +381,11 @@ fn tally_flow(
     // 1. チェーン全体の検証と、投票済み記録との突合。失敗したら集計しない。
     let verified = verify_and_print(run.api, source, run.public_key, ballot_item)
         .with_context(|| format!("{} からチェーンを検証できませんでした", run.api))?;
-    let (true, Some(audit)) = (verified.ok, verified.audit.as_ref()) else {
+    let (true, Some(audit), Some(revotes)) = (
+        verified.ok,
+        verified.audit.as_ref(),
+        verified.revotes.as_ref(),
+    ) else {
         println!(
             "集計を中止しました: 検証または突合に失敗しました（改ざんされた可能性のあるデータは集計しません）"
         );
@@ -369,7 +406,7 @@ fn tally_flow(
 
     // 4. 集計。チェーンと選挙データの食い違いは、検証失敗と同じ扱い。
     let recon = tally::Reconciliation::new(&reports, audit);
-    let tallied = match tally::compute::compute(election, &reports, &audit.contests) {
+    let tallied = match tally::compute::compute(election, &reports, &audit.contests, revotes) {
         Ok(tallied) => tallied,
         Err(e) => {
             println!("\n集計を中止しました: {e}");
@@ -388,12 +425,36 @@ fn tally_flow(
         "{}",
         tally::render::render(&tallied, &meta, &recon, gate_phase, run.all_districts)
     );
+    // 再投票の件数と変更の内訳（A→B）は、締切後の集計だけで出力する（中間集計で、途中の心変わりの傾向を出さない）。
+    let revote_report = (gate_phase == tally::gate::Phase::Final)
+        .then(|| tally::compute::revote_report(election, revotes));
+    match &revote_report {
+        Some(report) => print!(
+            "\n{}",
+            tally::render::render_revotes(report, ballot_item, run.blank_name)
+        ),
+        None if revotes.revotes() > 0 || revotes.slots > 0 => {
+            println!("\n（再投票の件数・変更の内訳は、締切後の集計だけで出力します）");
+        }
+        None => {}
+    }
 
     // 5. CSV / JSON。
-    let dir = tally::export::write_all(run.out_base, &tallied, &recon, &meta)
-        .context("集計結果のファイル出力に失敗しました")?;
+    let dir = tally::export::write_all(
+        run.out_base,
+        &tallied,
+        &recon,
+        &meta,
+        revote_report.as_ref(),
+    )
+    .context("集計結果のファイル出力に失敗しました")?;
+    let revotes_csv = if revote_report.is_some() {
+        " revotes.csv,"
+    } else {
+        ""
+    };
     println!(
-        "出力: {}（districts.csv, candidates.csv, prefectures.csv, types.csv, reconciliation.csv, tally.json）",
+        "出力: {}（districts.csv, candidates.csv, prefectures.csv, types.csv, reconciliation.csv,{revotes_csv} tally.json）",
         dir.display()
     );
     Ok(Flow::Done(dir))
@@ -558,6 +619,7 @@ mod tests {
         use crate::tally::gate::Refusal;
         use crate::verify::tests::{FakeSource, chain, counts_for, reports, source};
         use domain::ElectionPhase;
+        use serde_json::json;
 
         /// `chain()` が作る票（2026-general の東京 1 区・2 区、候補者 c1〜c4）に合わせた選挙マスタ。
         /// `districts` が 1 のときは、東京 2 区を含まない（チェーンにだけ存在する投票用紙を作る）。
@@ -757,6 +819,80 @@ mod tests {
                 &run(&out, ElectionPhase::Closed, true),
             )
             .expect("flow");
+            assert_eq!(flow, Flow::Invalid);
+            assert!(!out.exists());
+        }
+
+        /// A → B → 白票（slot 1）と A（slot 2）の再投票のチェーン（ADR 0022）。
+        fn revote_fixture() -> FakeSource {
+            let mut src = source(vec![crate::verify::tests::a_b_blank()]);
+            src.rules = crate::verify::tests::revote_rules(2);
+            src.counts = shared_types::AuditCountsResponse {
+                contests: vec![shared_types::ContestCountsDto {
+                    contest_id: "2026-general/shugiin_smd.13.01".to_string(),
+                    participation: 2,
+                    pending: 0,
+                    cast: Some(4),
+                    pending_initial: Some(0),
+                }],
+            };
+            src
+        }
+
+        #[test]
+        fn revotes_count_only_the_last_ballot_and_the_changes_are_exported_after_the_close() {
+            let out = temp_out();
+            let Flow::Done(dir) = tally_flow(
+                &revote_fixture(),
+                &election(2),
+                &run(&out, ElectionPhase::Closed, false),
+            )
+            .expect("flow") else {
+                panic!("集計されるはず");
+            };
+            let json = json_of(&dir);
+            let d = &json["districts"][0];
+            // 4 票のうち、数えるのは slot ごとの最後の票（白票 1・候補1 1）だけ。
+            assert_eq!(
+                (d["total"].clone(), d["blank"].clone()),
+                (json!(2), json!(1))
+            );
+            assert_eq!(d["participation"], json!(2));
+            assert_eq!(json["revotes"]["revotes"], json!(2));
+            let changes = &json["revotes"]["contests"][0]["changes"];
+            assert_eq!(changes.as_array().expect("changes").len(), 2);
+            let csv = std::fs::read_to_string(dir.join("revotes.csv")).expect("revotes.csv");
+            assert!(
+                csv.contains("候補1-1") && csv.contains("候補1-2") && csv.contains("白票"),
+                "{csv}"
+            );
+            std::fs::remove_dir_all(&out).expect("cleanup");
+        }
+
+        #[test]
+        fn an_interim_tally_does_not_output_the_revote_changes() {
+            let out = temp_out();
+            let Flow::Done(dir) = tally_flow(
+                &revote_fixture(),
+                &election(2),
+                &run(&out, ElectionPhase::Open, true),
+            )
+            .expect("flow") else {
+                panic!("中間集計されるはず");
+            };
+            assert!(!dir.join("revotes.csv").exists());
+            assert!(json_of(&dir).get("revotes").is_none());
+            std::fs::remove_dir_all(&out).expect("cleanup");
+        }
+
+        #[test]
+        fn a_broken_revote_link_is_never_tallied() {
+            let out = temp_out();
+            let mut src = revote_fixture();
+            // 再投票を認めない選挙として検証すると、slot を持つ票があるので不整合。
+            src.rules = domain::ElectionRules::default();
+            let flow = tally_flow(&src, &election(2), &run(&out, ElectionPhase::Closed, false))
+                .expect("flow");
             assert_eq!(flow, Flow::Invalid);
             assert!(!out.exists());
         }
