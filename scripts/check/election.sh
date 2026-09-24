@@ -6,9 +6,12 @@
 #      壊れたデータ（重複 ID・存在しない参照・不正な ID など）の検出
 #   3. 選挙状態の遷移と投票の受付期間（原則17・18。ADR 0019）: schedule → 自動で open → 自動で closing →
 #      closed（アンカーのリースを持つ sealer、memory モードでは api 内蔵のスケジューラが駆動する）。
-#      期間の境界（開始前・終了後は拒否、期間内は受け付ける）、closing の直前に投じた票が最終ブロックまでに
-#      封印されること、closed の後の投票が拒否されること、公開用のポートから管理用のエンドポイントに
-#      届かないこと（逆方向も）を確認する
+#      期間の境界（開始時刻ちょうどは受け付け、終了時刻ちょうどは拒否する。固定の時計の単体テスト）、
+#      開始前・期間内・closing・closed の受付、closing の直前に投じた票が最終ブロックまでに封印されること、
+#      公開用のポートから管理用のエンドポイントに届かないこと（逆方向も）を確認する
+#   4. scripts/election.sh（status・schedule の拒否・close --now の確認と --yes）を通した締切: 投票を並列に
+#      投げている最中に close --now し、受理した票がすべて最終ブロックまでに封印されること（verifier tally の
+#      検証・突合）、tally が closed のときだけ実行できること、closed の後の投票が拒否されることを確認する
 # 設定は、手元の config/local.toml などの影響を受けないよう分離する（scripts/lib/common.sh）。
 set -euo pipefail
 
@@ -424,8 +427,16 @@ check_election_lifecycle() (
         date -u -d "+$1 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+"$1"S +%Y-%m-%dT%H:%M:%SZ
     }
 
-    echo "== 0. ビルド"
+    echo "== 0. ビルドと、期間の境界（開始時刻ちょうどは受け付け、終了時刻ちょうどは拒否する）"
+    # 境界は「秒ちょうど」の判定なので、実時間の HTTP では狙って当てられない（1 秒ずれると別の分岐を見てしまう）。
+    # 時計を固定できる単体テスト（domain::vote_gate・api の統合テスト。どちらも公開 API と同じ判定の経路）で確認する。
     cargo build -q -p api
+    out="$(cargo test -q -p domain vote_gate 2>&1)" || { echo "$out" >&2; fail "domain::vote_gate のテストが失敗しました"; }
+    grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" || { echo "$out" >&2; fail "domain::vote_gate のテストが 1 件も実行されていません"; }
+    out="$(cargo test -q -p api --test api_flow the_opening_instant_is_accepted_and_the_closing_instant_is_rejected 2>&1)" \
+        || { echo "$out" >&2; fail "api の境界テストが失敗しました"; }
+    grep -q 'test result: ok. 1 passed' <<<"$out" || { echo "$out" >&2; fail "api の境界テストが実行されていません"; }
+    echo "境界: 開始時刻ちょうど = 201、終了時刻ちょうど = 403 voting_closed（固定の時計）OK"
 
     echo "== 1. 起動直後は scheduled"
     spawn api "$LOG" ./target/debug/api
@@ -510,8 +521,179 @@ check_election_lifecycle() (
     echo "OK: election#3 選挙状態の遷移と投票の受付期間"
 )
 
+# ===========================================================================
+# 4. close --now（scripts/election.sh）の直前に投じた票が、すべて最終ブロックまでに封印される（原則17・18。ADR 0019）
+# ===========================================================================
+# 3 節は「時刻による自動の closing」を見る。ここでは、運用者が scripts/election.sh close --now で締め切る経路を、
+# スクリプトそのものを通して確認する。締切の手続きの待ち時間（state_cache_secs + request_timeout_secs）は、
+# 「各 api が古い状態（open）をキャッシュしている間に受理した票」と「処理中のリクエスト」を取りこぼさないための
+# ものなので、投票を並列に投げ続けている最中に close --now を実行し、201 を返した票の数と、closed 後の
+# チェーン上の票の数（verifier tally の突合。未封印 0 件・投票済み記録と一致）が等しいことを確かめる。
+check_close_now() (
+    set -euo pipefail
+    PORT="${CHECK_API_PORT:-18814}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18914}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="election4-check-admin-token-0123456789abcdef"
+    export BASE
+    export APP__SESSION__SECRET=election4-check-secret-0123456789abcdef
+    export APP__ADMIN__TOKEN="$ADMIN_TOKEN"
+    export APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}"
+    export APP__API__PORT="${PORT}"
+    export APP__SHARD__COUNT=4
+    # 件数・時間による封印はさせない（締切のフラッシュだけで、全件が最終ブロックに入ることを確かめるため）。
+    export APP__SEAL__MAX_BALLOTS=10000
+    export APP__SEAL__MAX_INTERVAL_SECS=600
+    # 開始は過去（起動直後に自動で open）、終了は遠い未来（締切は close --now だけが起こす）。
+    export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
+    export APP__ELECTION__VOTING_CLOSES_AT="2099-01-01T00:00:00+00:00"
+    export APP__ELECTION__STATE_CACHE_SECS=1
+    export APP__API__REQUEST_TIMEOUT_SECS=2
+
+    TMP="$(mktemp -d)"
+    LOG="$TMP/api.log"
+    CODES="$TMP/codes"
+    OUT="$TMP/tally"
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        rm -rf "$TMP"
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        echo "--- api log（末尾）---" >&2
+        tail -n 20 "$LOG" >&2
+        exit 1
+    }
+    election() { ./scripts/election.sh "$@"; }
+    admin_body() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null || true; }
+    phase_is() { [[ "$(admin_body)" == *"\"phase\":\"$1\""* ]]; }
+    RC=0
+    TALLY_OUT=""
+    run_tally() {
+        RC=0
+        TALLY_OUT="$(./scripts/tally.sh --api "$BASE" --out "$OUT" "$@" 2>&1)" || RC=$?
+    }
+
+    echo "== 0. ビルドと準備"
+    cargo build -q -p api
+    cargo build -q -p verifier
+    VOTERS=40
+    seed_generate "$TMP/seed" "$VOTERS"
+    spawn api "$LOG" ./target/debug/api
+    wait_healthz "$BASE" 10 api || fail "${BASE}/healthz が応答しません"
+    wait_election_open "$BASE" 10 || fail "自動で open になりませんでした"
+
+    echo "== 1. scripts/election.sh status: 状態・期間・残り時間・未封印・最後のブロック・監査ログ"
+    out="$(election status)" || fail "election.sh status が失敗しました: ${out}"
+    for must in "状態: open" "開始: " "終了: " "残り時間（終了まで）" "シャードごとの未封印: 0,0,0,0" \
+        "最後のブロック" "直近の監査ログ" "scheduled -> open"; do
+        [[ "$out" == *"$must"* ]] || fail "election.sh status の表示に「${must}」がありません:
+${out}"
+    done
+    echo "status: OK"
+
+    echo "== 2. schedule は open では実行できない（scheduled のときだけ）"
+    if out="$(election schedule --opens-at 2099-01-01T00:00:00+09:00 --closes-at 2099-01-02T00:00:00+09:00 2>&1)"; then
+        fail "open の間に schedule が成功しました: ${out}"
+    fi
+    [[ "$out" == *"409"* ]] || fail "open の間の schedule が 409 ではありません: ${out}"
+    echo "open 中の schedule: 拒否（409）OK"
+
+    echo "== 3. 集計（tally）は closed のときだけ（--allow-interim は app.env=dev のときだけ）"
+    run_tally
+    [[ "$RC" == 4 ]] || fail "open の間の tally が終了コード 4 ではありません（${RC}）: ${TALLY_OUT}"
+    run_tally --allow-interim
+    [[ "$RC" == 2 ]] || fail "app.env=test で --allow-interim が拒否されません（${RC}）: ${TALLY_OUT}"
+    echo "open 中の tally: 4・app.env=test の --allow-interim: 2 OK"
+
+    echo "== 4. close --now は確認を求める（yes 以外では何も変えない）"
+    if out="$(echo no | election close --now 2>&1)"; then
+        fail "確認に no と答えたのに、close --now が成功しました: ${out}"
+    fi
+    phase_is open || fail "確認で中止したのに、状態が変わっています: $(admin_body)"
+    echo "確認で中止: 状態は open のまま OK"
+
+    echo "== 5. 投票を並列に投げ続けている最中に close --now --yes"
+    TOKENS="$TMP/tokens"
+    for n in $(seq 1 "$VOTERS"); do
+        token="$(login "voter-${n}")"
+        [[ -n "$token" ]] || fail "voter-${n} がログインできません"
+        echo "${n} ${token}" >>"$TOKENS"
+    done
+    # 有権者ごとに、表示順 1〜6 枚目の投票用紙へ 0.5 秒おきに投票する（有権者どうしは並列。約 3 秒続く）。
+    # close --now は、その途中（最初の応答の直後）に実行する。api の状態のキャッシュ（state_cache_secs=1）の
+    # 間は受理され続け、その後は 403 になるので、締切の前後の両方に票が飛んでいる状態になる。
+    PER_VOTER=6
+    vote_all() {
+        local n token k
+        read -r n token <<<"$1"
+        for k in $(seq 1 "$PER_VOTER"); do
+            seed_vote "$n" "$k" "$token"
+            sleep 0.5
+        done
+    }
+    export PER_VOTER
+    export -f vote_all
+    xargs -P "$VOTERS" -I{} bash -c 'vote_all "$@"' _ {} <"$TOKENS" >"$CODES" &
+    VOTING_PID=$!
+    # 最初の票が受理されるのを待ってから締め切る（締切の前にも後にも、票が飛んでいる状態を作る）。
+    wait_until 5000 test -s "$CODES" || fail "投票の応答がありません"
+    election close --now --yes >"$TMP/close.out" 2>&1 || { cat "$TMP/close.out" >&2; fail "close --now --yes が失敗しました"; }
+    wait "$VOTING_PID" || true
+    accepted="$({ grep -c '^201$' "$CODES" || true; })"
+    rejected="$({ grep -c '^403$' "$CODES" || true; })"
+    total_lines="$(wc -l <"$CODES" | tr -d ' ')"
+    [[ "$total_lines" == $((VOTERS * PER_VOTER)) ]] || fail "応答の数が $((VOTERS * PER_VOTER)) 件ではありません（${total_lines}）"
+    [[ "$((accepted + rejected))" == "$total_lines" ]] || fail "201 / 403 以外の応答があります: $(sort "$CODES" | uniq -c | tr '\n' ' ')"
+    [[ "$accepted" -ge 1 && "$rejected" -ge 1 ]] \
+        || fail "締切の前後の両方に票が飛んでいません（受理 ${accepted}・拒否 ${rejected}。確認になりません）"
+    echo "close --now の前後: 受理 ${accepted} 票・拒否 ${rejected} 票（締切の手続き中・後）"
+    phase_is closing || phase_is closed || fail "close --now の後、closing になりません: $(admin_body)"
+
+    echo "== 6. 締切の手続き（自動）: 待ち時間 → 全シャードのフラッシュ → 最終アンカー → closed"
+    run_tally
+    if phase_is closing; then
+        [[ "$RC" == 4 ]] || fail "closing の間の tally が終了コード 4 ではありません（${RC}）: ${TALLY_OUT}"
+        echo "closing 中の tally: 4 OK"
+    fi
+    wait_until 20000 phase_is closed || fail "自動で closed になりませんでした: $(admin_body)"
+    body="$(admin_body)"
+    [[ "$body" == *'"pending_by_shard":[0,0,0,0]'* ]] || fail "closed の時点で未封印の票が残っています: ${body}"
+    out="$(election status)"
+    for must in "状態: closed" "open -> closing (admin" "closing -> closed"; do
+        [[ "$out" == *"$must"* ]] || fail "election.sh status の監査ログに「${must}」がありません:
+${out}"
+    done
+    echo "closed・未封印 0 件・監査ログ（open -> closing は admin、closing -> closed は自動）OK"
+
+    echo "== 7. 受理した票が、すべて最終ブロックまでに封印されている（tally の検証・突合）"
+    # 開票の区切りのために、公開用の election-status の短期キャッシュが入れ替わるのを待つ。
+    sleep "$((APP__ELECTION__STATE_CACHE_SECS + 1))"
+    run_tally
+    [[ "$RC" == 0 ]] || fail "closed 後の tally が終了コード 0 ではありません（${RC}）: ${TALLY_OUT}"
+    json="$(find "$OUT" -name tally.json | head -1)"
+    [[ -n "$json" ]] || fail "tally.json がありません"
+    sealed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reconciliation"]["ballots"])' "$json")"
+    [[ "$sealed" == "$accepted" ]] || fail "チェーン上の票（${sealed}）が、受理した票（${accepted}）と一致しません"
+    grep -q '"interim": false' "$json" || fail "closed 後の集計が中間集計になっています"
+    echo "受理 ${accepted} 票 = チェーン上 ${sealed} 票（未封印 0・投票済み記録と一致）OK"
+
+    echo "== 8. closed の後の投票は拒否される"
+    read -r n token < <(tail -n 1 "$TOKENS")
+    code="$(seed_vote "$n" $((PER_VOTER + 1)) "$token")"
+    [[ "$code" == 403 ]] || fail "closed 後の投票が 403 ではありません（${code}）"
+    echo "closed 後: 403 OK"
+
+    graceful_stop api
+    echo "OK: election#4 close --now の直前の票の封印（scripts/election.sh）"
+)
+
 check_voting_flow
 check_large_election_data
 check_election_lifecycle
+check_close_now
 
 echo "OK: check/election.sh"

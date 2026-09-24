@@ -7,7 +7,7 @@
 scripts/lib/common.sh      共通関数（設定 / DB / 専用キースペース / 選挙データ / 起動・停止・待ち合わせ / アサーション）
 scripts/check/core.sh      起動・設定・封印ポリシーの単体テスト・性能計測ツール
 scripts/check/chain.sh     ハッシュチェーン（封印・DB永続化・複数sealer・「更新がなければ追加しない」・集計・ビューア）
-scripts/check/election.sh  投票フローと選挙データ（投票・名簿・大規模データ・壊れたデータの検出・投票順）
+scripts/check/election.sh  投票フローと選挙データ（投票・名簿・大規模データ・壊れたデータの検出・投票順）・選挙状態の遷移
 scripts/check/auth.sh      ID・パスワードの事前登録（credgen）・DB 認証・DB のリセット
 scripts/check/web.sh       画面（flow・wasm ビルド・デザイントークン・ダークモード）
 scripts/check/docs.sh      呼び名・環境変数名の一貫性、スクリプトの構文（コード・設定・ドキュメントの照合）
@@ -149,6 +149,15 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 投票する項目）は、開始時刻を過去にして起動時に自動で `open` にする（`wait_election_open`。`scripts/lib/common.sh`）。
 `chain.sh#6`（tally）は、締切（時刻）による判定を、選挙状態（`closed` かどうか）による判定に置き換えた
 （`scripts/election.sh close --now` で `closing` にし、締切の手続き（自動）を待って `closed` にする）。
+
+その後、`election.sh` に次を追加した。
+
+| 項目 | 新 |
+|---|---|
+| 期間の境界: 開始時刻ちょうどは受け付け、終了時刻ちょうどは拒否する（`domain::vote_gate` と api の統合テスト `the_opening_instant_is_accepted_and_the_closing_instant_is_rejected`。秒ちょうどは実時間の HTTP では狙えないため、時計を固定したテストを実行する） | election.sh#3 |
+| `scripts/election.sh` を通した操作: `status` の表示（状態・期間・残り時間・シャードごとの未封印・最後のブロック・監査ログ）、open の間の `schedule` は 409、`close --now` は確認に yes 以外で中止 | election.sh#4 |
+| 投票を並列に投げている最中に `close --now --yes` → 締切の手続き（自動）→ `closed`。受理（201）した票の数 = closed 後のチェーン上の票の数（`verifier tally` の検証・突合。未封印 0 件） | election.sh#4 |
+| `tally` は `closed` のときだけ（open・closing は終了コード 4、`app.env=test` の `--allow-interim` は 2）、closed の後の投票は 403 | election.sh#4 |
 
 ## 再編前後の所要時間
 
