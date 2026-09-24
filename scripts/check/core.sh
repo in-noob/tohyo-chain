@@ -182,6 +182,8 @@ check_config() (
     done
     grep -qx '/config/local.toml' .gitignore || fail ".gitignore に /config/local.toml がありません"
     grep -qx '/secrets/' .gitignore || fail ".gitignore に /secrets/ がありません"
+    grep -qx '/crates/web/dist/' .gitignore || fail ".gitignore に /crates/web/dist/ がありません"
+    [[ -z "$(git ls-files crates/web/dist)" ]] || fail "画面のビルド成果物（crates/web/dist）が git の管理下にあります"
     [[ ! -e config/local.toml ]] || echo "注意: config/local.toml があります（このスイートは、手元の設定を使いません）"
 
     REQUIRED_KEYS=(
