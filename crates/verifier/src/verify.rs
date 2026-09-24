@@ -502,6 +502,7 @@ pub(crate) mod tests {
                     ballot_id: hex::encode(&x.ballot_id.0),
                     contest_id: x.contest_id.to_string(),
                     candidate_id: x.candidate_id.to_string(),
+                    blank: x.candidate_id.is_blank(),
                     district_name: None,
                     candidate_name: None,
                     party: None,

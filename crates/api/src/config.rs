@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use app_config::{AppConfig, AuthMode, DisplayTimezone, Mode, RevealBallots, Secret};
 use application::PasswordParams;
-use domain::Period;
 use domain::seal_policy::SealPolicy;
+use domain::{ElectionRules, Period};
 
 use crate::chain_view::RevealPolicy;
 
@@ -72,6 +72,9 @@ pub struct Config {
     pub admin_bind: String,
     /// 管理用エンドポイントのトークン（秘密情報）。未設定なら管理用リスナーは起動しない。
     pub admin_token: Option<Secret<String>>,
+    /// 選挙のルール（`vote.allow_blank`）。この api が open に遷移させる（memory モードの内蔵スケジューラ・
+    /// `open --now`）ときに固定する値で、固定した後は、選挙状態に保存した値を使う（原則19）。
+    pub rules: ElectionRules,
 }
 
 // 秘密情報がログに出ないよう、Debug では伏せる。
@@ -98,6 +101,7 @@ impl fmt::Debug for Config {
             .field("election_grace", &self.election_grace)
             .field("display_timezone", &self.display_timezone)
             .field("admin_bind", &self.admin_bind)
+            .field("rules", &self.rules)
             .field(
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
@@ -145,6 +149,7 @@ impl Config {
                 voting_not_started_message: app.labels.voting_not_started_message.clone(),
                 voting_closing_message: app.labels.voting_closing_message.clone(),
                 voting_closed_message: app.labels.voting_closed_message.clone(),
+                blank_name: app.labels.blank_name.clone(),
             },
             session_secret,
             session_ttl_secs: app.session.ttl_secs,
@@ -189,6 +194,9 @@ impl Config {
             display_timezone: app.election.display_timezone,
             admin_bind: app.admin.bind.clone(),
             admin_token: app.admin.token.clone(),
+            rules: ElectionRules {
+                allow_blank: app.vote.allow_blank,
+            },
         })
     }
 }
@@ -218,6 +226,14 @@ mod tests {
         assert_eq!(c.seal_policy, SealPolicy::default());
         assert_eq!(c.sealer_signing_seed, None);
         assert_eq!(c.reveal, RevealPolicy::Always);
+        assert_eq!(c.rules, ElectionRules { allow_blank: true });
+        assert_eq!(c.labels.blank_name, "白票");
+    }
+
+    #[test]
+    fn allow_blank_is_read_from_the_config() {
+        let c = config(&[SECRET, ("vote.allow_blank", "false")]).expect("valid");
+        assert_eq!(c.rules, ElectionRules { allow_blank: false });
     }
 
     #[test]

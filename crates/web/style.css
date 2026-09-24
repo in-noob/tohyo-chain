@@ -250,6 +250,13 @@ fieldset {
   font-weight: 700;
 }
 
+/* 白票: 候補者の最後に置き、候補者とは区切る（上の余白と破線の枠。色は他の選択肢と同じトークン）。 */
+.candidate.blank {
+  margin-top: var(--space-4);
+  border-style: dashed;
+}
+.candidate.blank.selected { border-style: solid; }
+
 .candidate input { width: 1.25rem; height: 1.25rem; }
 .candidate .party { color: var(--color-text-muted); font-size: var(--font-size-sm); font-weight: normal; }
 .candidate .check { margin-left: auto; color: var(--color-accent); font-size: var(--font-size-sm); }
@@ -296,6 +303,8 @@ table.ballots th, table.ballots td {
   border-top: var(--border-width) solid var(--color-border);
   text-align: left;
 }
+/* 白票の行: 候補者の行と見分けられるよう、色ではなく書式（斜体・破線の区切り）で示す。 */
+table.ballots tr.blank td { font-style: italic; border-top-style: dashed; }
 
 .verify-box pre {
   margin: var(--space-2) 0;

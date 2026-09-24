@@ -184,6 +184,19 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_ballot_embeds_the_reserved_value_in_the_same_format() {
+        // 白票は、candidate_id に予約値 "blank" を入れるだけ（形式の版は変わらない）。
+        let ballot = Ballot {
+            candidate_id: CandidateId::Blank,
+            ..sample_ballot()
+        };
+        let encoded = encode_ballot(&ballot);
+        let tail = [&[0x00, 5][..], b"blank"].concat();
+        assert!(encoded.ends_with(&tail));
+        assert_eq!(decode_ballot(&encoded), Ok(ballot));
+    }
+
+    #[test]
     fn ballot_decoding_rejects_malformed_bytes() {
         let bytes = encode_ballot(&sample_ballot());
         // 途中で切れている（どの位置で切っても失敗）。

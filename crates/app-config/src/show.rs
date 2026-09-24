@@ -6,7 +6,7 @@ use crate::load::{Loaded, SECRET_KEYS, display_value};
 use crate::secret::MASK;
 
 /// 表示するセクションの順。
-const SECTIONS: [&str; 14] = [
+const SECTIONS: [&str; 15] = [
     "app",
     "api",
     "web",
@@ -18,6 +18,7 @@ const SECTIONS: [&str; 14] = [
     "session",
     "credentials",
     "election",
+    "vote",
     "chain",
     "admin",
     "labels",
@@ -99,6 +100,9 @@ impl Loaded {
             ("APP_WEB_LOGIN_HEADING", &self.config.labels.login_heading),
             ("APP_WEB_BALLOT_ITEM", &self.config.labels.ballot_item),
             ("APP_WEB_PROGRESS", &self.config.labels.progress),
+            ("APP_WEB_BLANK_OPTION", &self.config.labels.blank_option),
+            ("APP_WEB_BLANK_CONFIRM", &self.config.labels.blank_confirm),
+            ("APP_WEB_BLANK_NAME", &self.config.labels.blank_name),
         ];
         labels
             .iter()

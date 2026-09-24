@@ -135,6 +135,10 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.cluster_config (
 -- opens_at / closes_at は UNIX 秒（NULL なら無期限・未指定）。opened_at は open に遷移した時刻
 -- （封印の経過時間の起点 = 投票開始時刻に使う。原則9。scheduled の間は NULL）。closing_started_at は
 -- closing に遷移した時刻（締切の手続きの待ち時間の起点。closing 以外では NULL）。
+-- allow_blank は、open に遷移した時点で固定した選挙のルール（白票の可否。設定 vote.allow_blank。原則19）。
+-- open への遷移と同じ LWT で書き、以降は変えない（scheduled の間は NULL）。
+-- この列を追加する前に作ったキースペースは、ALTER TABLE <keyspace>.election_state ADD allow_blank boolean; を
+-- 一度だけ実行するか、scripts/db_reset.sh --all で作り直す（CREATE TABLE IF NOT EXISTS は、既存の表に列を足さない）。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_state (
   scope              text,
   phase              text,
@@ -142,6 +146,7 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_state (
   closes_at          bigint,
   opened_at          bigint,
   closing_started_at bigint,
+  allow_blank        boolean,
   PRIMARY KEY (scope)
 );
 

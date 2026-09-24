@@ -11,7 +11,7 @@ use axum::http::{Request, StatusCode};
 use domain::seal_policy::SealPolicy;
 use domain::{
     Ballot, BallotId, Block, BlockHeader, CandidateId, ContestId, Ed25519Signer, Ed25519Verifier,
-    ElectionPhase, Period, Signer, verify_chain,
+    ElectionPhase, ElectionRules, Period, Signer, verify_chain,
 };
 use sealer::{ManualClock, Sealer};
 use serde_json::{Value, json};
@@ -121,6 +121,7 @@ fn config(shards: u16) -> Config {
         },
         admin_bind: "127.0.0.1:0".to_string(),
         admin_token: None,
+        rules: ElectionRules { allow_blank: true },
     }
 }
 
@@ -133,6 +134,27 @@ async fn built(shards: u16, now: u64) -> (Router, Sealer) {
 async fn built_with(shards: u16, now: u64, reveal: api::RevealPolicy) -> (Router, Sealer) {
     let mut cfg = config(shards);
     cfg.reveal = reveal;
+    built_from(cfg, now, None).await
+}
+
+/// 設定 `configured` の `vote.allow_blank` で起動し、open に進めるときに `frozen`（省略時は設定の値）を固定する
+/// （原則19: open にしたプロセスの設定が固定され、以降は、この api の設定より優先する）。
+async fn built_rules(configured: bool, frozen: bool) -> (Router, Sealer) {
+    let mut cfg = config(1);
+    cfg.rules = ElectionRules {
+        allow_blank: configured,
+    };
+    built_from(
+        cfg,
+        1_000,
+        Some(ElectionRules {
+            allow_blank: frozen,
+        }),
+    )
+    .await
+}
+
+async fn built_from(cfg: Config, now: u64, frozen: Option<ElectionRules>) -> (Router, Sealer) {
     let Built { state, sealer } = build(
         &cfg,
         Arc::new(FixedClock(now)),
@@ -144,7 +166,13 @@ async fn built_with(shards: u16, now: u64, reveal: api::RevealPolicy) -> (Router
     // scheduled → open へ進めておく（境界を検証するテストは、この関数を使わず個別に組み立てる）。
     state
         .election_state
-        .transition(ElectionPhase::Scheduled, ElectionPhase::Open, "test", 0)
+        .transition(
+            ElectionPhase::Scheduled,
+            ElectionPhase::Open,
+            frozen.unwrap_or(cfg.rules),
+            "test",
+            0,
+        )
         .await
         .expect("open for test");
     // app.mode=memory ではプロセス内 sealer がある（テストでは手動で `flush` / `anchor` を呼ぶ）。
@@ -1121,6 +1149,156 @@ async fn blocks_page_boundaries_and_query_handling() {
 }
 
 #[tokio::test]
+async fn a_blank_vote_is_accepted_and_sealed_as_a_blank_ballot() {
+    let (app, mut sealer) = built(1, 1_000).await;
+    let token = login(&app, "voter-0").await;
+    // 候補者一覧には白票を入れず、白票を選べることを allow_blank で示す。
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("{SMD1}/candidates"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["allow_blank"], json!(true));
+    let ids: Vec<&str> = body["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| c["candidate_id"].as_str().expect("id"))
+        .collect();
+    assert!(!ids.contains(&"blank"), "{ids:?}");
+    // 予約値 "blank" で白票を投じる。
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body("blank"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // 白票でも投票済みになる（同じ投票用紙に 2 回目は 409）。
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_error(&body, "already_voted");
+    // 大文字など、予約値と違う綴りは白票ではない（存在しない候補者）。
+    let token2 = login(&app, "voter-1").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token2),
+        vote_body("BLANK"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error(&body, "invalid_candidate");
+    // 封印すると、票の candidate_id は "blank"。ビューアでは白票の印が付き、候補者の表示名は付かない。
+    assert!(sealer.close_flush().await.errors.is_empty());
+    let (status, _, block) = get_with_headers(&app, "/api/v1/chains/0/blocks/1").await;
+    assert_eq!(status, StatusCode::OK);
+    let ballot = &block["ballots"][0];
+    assert_eq!(ballot["candidate_id"], json!("blank"));
+    assert_eq!(ballot["blank"], json!(true));
+    assert_eq!(ballot["district_name"], json!("東京1区"));
+    assert!(ballot.get("candidate_name").is_none(), "{ballot}");
+}
+
+#[tokio::test]
+async fn blank_is_rejected_when_the_election_does_not_allow_it() {
+    let (app, _sealer) = built_rules(false, false).await;
+    let token = login(&app, "voter-0").await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("{SMD1}/candidates"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["allow_blank"], json!(false));
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body("blank"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error(&body, "blank_not_allowed");
+    assert_eq!(body["message"], json!("この選挙では、白票は選べません。"));
+    // 拒否された投票は数えない（まだ投票できる）。
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body(&candidate("shugiin_smd.13.01", 2)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_rule_fixed_at_open_wins_over_the_current_config() {
+    // open の時点で「白票あり」に固定した後、設定を「白票なし」にして起動し直した api でも、白票を受け付ける。
+    let (app, _sealer) = built_rules(false, true).await;
+    let token = login(&app, "voter-0").await;
+    let (_, body) = send(
+        &app,
+        "GET",
+        &format!("{SMD1}/candidates"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(body["allow_blank"], json!(true));
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body("blank"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // 逆に「白票なし」で固定した後は、設定を「白票あり」にしても拒否する。
+    let (app, _sealer) = built_rules(true, false).await;
+    let token = login(&app, "voter-0").await;
+    let (_, body) = send(
+        &app,
+        "GET",
+        &format!("{SMD1}/candidates"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(body["allow_blank"], json!(false));
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{SMD1}/vote"),
+        Some(&token),
+        vote_body("blank"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_error(&body, "blank_not_allowed");
+}
+
+#[tokio::test]
 async fn block_detail_is_immutable_and_carries_display_names_when_ballots_are_public() {
     let (app, mut sealer) = built(1, 1_000).await;
     seal_one_by_one(&app, &mut sealer, 0..1).await;
@@ -1251,7 +1429,13 @@ async fn app_at_phase(now: u64, period: Period, phase: ElectionPhase) -> Router 
     for &next in steps {
         state
             .election_state
-            .transition(current, next, "test", 0)
+            .transition(
+                current,
+                next,
+                ElectionRules { allow_blank: true },
+                "test",
+                0,
+            )
             .await
             .expect("advance");
         current = next;

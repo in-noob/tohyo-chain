@@ -121,6 +121,13 @@ display_timezone = "Asia/Tokyo"
 # （この値 + api.request_timeout_secs）の計算に使う（原則17）。
 state_cache_secs = 5
 
+[vote]
+# 白票（どの候補者にも投票しない）を選べるか。true なら、画面の候補者一覧の最後に白票の選択肢（labels.blank_option）を置き、
+# API は candidate_id の予約値 "blank" を受け付ける。false なら、画面に出さず、API も拒否する（422 blank_not_allowed）。
+# 選挙のルールなので、選挙状態が open に移った時点の値を DB（memory モードではプロセス内）に固定し、それ以降は
+# 設定を変えても使わない（原則19。open に移すプロセス（sealer / api）の値が固定される）。
+allow_blank = true
+
 [chain]
 # チェーンの API（ブロックの詳細）が票（ballot_id・contest_id・candidate_id）を公開するタイミング。
 # always = 常に / after_close = election.voting_closes_at 以後だけ（election.voting_closes_at が必要）。
@@ -153,3 +160,9 @@ voting_not_started_message = "投票の受付はまだ開始していません"
 voting_closing_message = "投票の受付を締め切っています。しばらくお待ちください"
 # 終了後に投票しようとしたときのメッセージ。
 voting_closed_message = "投票の受付は終了しました"
+# 候補者一覧の最後に置く、白票の選択肢の表示名（vote.allow_blank = true のときだけ表示する）。
+blank_option = "白票（どの候補者にも投票しない）"
+# 確認画面で、白票を選んだときに表示する文言。
+blank_confirm = "白票として投票します。よろしいですか？"
+# 白票の呼び名。集計結果（候補者とは別の行）・ビューア（票の一覧）・API のエラーメッセージに使う。
+blank_name = "白票"

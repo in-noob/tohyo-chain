@@ -13,8 +13,8 @@ use application::{
 use async_trait::async_trait;
 use domain::seal_policy::SealPolicy;
 use domain::{
-    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ElectionPhase, Period, ShardId,
-    VoterId, verify_anchor, verify_anchor_link, verify_chain,
+    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ElectionPhase, ElectionRules,
+    Period, ShardId, VoterId, verify_anchor, verify_anchor_link, verify_chain,
 };
 use infra_memory::InMemoryStore;
 use sealer::{
@@ -195,6 +195,7 @@ impl World {
             // 締切のフラッシュは no-op）。原則17 のテストは、別途 `store.ensure_initialized` を呼ぶ。
             self.store.clone(),
             election_grace,
+            ElectionRules { allow_blank: true },
         )
     }
 

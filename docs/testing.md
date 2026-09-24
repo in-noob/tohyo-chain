@@ -5,11 +5,11 @@
 
 ```
 scripts/lib/common.sh      共通関数（設定 / DB / 専用キースペース / 選挙データ / 起動・停止・待ち合わせ / アサーション）
-scripts/check/core.sh      起動・設定・封印ポリシーの単体テスト・性能計測ツール
+scripts/check/core.sh      起動・設定・封印ポリシーの単体テスト・性能計測ツール・白票（API・封印・集計）
 scripts/check/chain.sh     ハッシュチェーン（封印・DB永続化・複数sealer・「更新がなければ追加しない」・集計・ビューア）
 scripts/check/election.sh  投票フローと選挙データ（投票・名簿・大規模データ・壊れたデータの検出・投票順）・選挙状態の遷移
 scripts/check/auth.sh      ID・パスワードの事前登録（credgen）・DB 認証・DB のリセット
-scripts/check/web.sh       画面（flow・wasm ビルド・デザイントークン・ダークモード）
+scripts/check/web.sh       画面（flow・wasm ビルド・デザイントークン・ダークモード・白票の選択肢）
 scripts/check/docs.sh      呼び名・環境変数名の一貫性、スクリプトの構文（コード・設定・ドキュメントの照合）
 scripts/check_all.sh       6 つのスイートを順番に実行し、成功・失敗と所要時間の表を表示する
 ```
@@ -173,6 +173,24 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 
 削除した確認: 「0 件で窓が満了したら窓だけリセット」（`ResetWindowOnly`。ルールが「窓のリセットはしない」に変わった）と、
 それを SIGTERM・クラッシュの直前の同期に使っていた「窓をリセットしました」のログ待ち（chain#2・#4）。
+
+## 追記: 白票（ADR 0021）
+
+白票（票の `candidate_id` の予約値 `blank`）と、選挙のルール `vote.allow_blank`（open の時点で固定。原則19）に合わせて、次を追加した。
+
+| 項目 | 新 |
+|---|---|
+| 白票・open の時点での固定の単体テスト（必須 12 件: 予約値・seed での拒否・`Contest::accepts`・`ElectionRules::effective`・memory ストアでの固定・api の統合テスト 3 件・memory スケジューラでの固定・集計） | core.sh#10 |
+| 白票で投票 → close --now の締切の手続きで封印（ブロックに `candidate_id=blank`・`blank=true`）→ `verifier tally` の選挙区ごとの白票の数・合計が投票した数と一致、候補者別の CSV に入らず、表では別の行 | core.sh#10 |
+| `vote.allow_blank=false`: 候補者の一覧は `allow_blank=false`、白票の投票は 422 `blank_not_allowed`、拒否した票は数えない | core.sh#10 |
+| 設定一式の必須項目に `vote.allow_blank`・`labels.blank_option`・`labels.blank_confirm`・`labels.blank_name`。白票の文言がビルド時に web へ渡る | core.sh#3・#8 |
+| 画面: 候補者一覧の最後に白票（`allow_blank=false` なら出さない）・確認画面は `labels.blank_confirm`・予約値で送信・ビューアは白票を別の書式と別の行で（`web::flow` / `web::chain` の必須テスト 6 件と、画面のコードが API の `allow_blank` と設定の文言を使っていること） | web.sh#4 |
+
+画面をブラウザで操作する確認は、ほかの画面と同じく手動（`docs/manual_check_step5.md` の「白票」）。
+
+削除した確認: `verifier` の単体テスト `a_vote_for_someone_outside_the_contest_is_a_blank_ballot`（「投票用紙の候補者ではない票を
+白票として数える」。白票の意味が変わり、そのような票は集計を中止するようになった。代わりに
+`a_vote_for_someone_outside_the_contest_stops_the_tally`）。
 
 ## 再編前後の所要時間
 

@@ -68,28 +68,92 @@ pub struct BallotRow {
     pub ballot_id: String,
     /// 選挙区の表示名。API が知らなければ、投票用紙の ID。
     pub district: String,
-    /// 候補者の表示名（政党つき）。API が知らなければ、候補者の ID。
+    /// 投票先の表示名: 候補者（政党つき。API が知らなければ候補者の ID）、または白票の呼び名。
     pub candidate: String,
+    /// 白票か（画面は、候補者と見分けられるよう、別の書式で表示する）。
+    pub blank: bool,
 }
 
-pub fn ballot_rows(ballots: &[BallotDto]) -> Vec<BallotRow> {
+fn district_label(b: &BallotDto) -> String {
+    b.district_name
+        .clone()
+        .unwrap_or_else(|| b.contest_id.clone())
+}
+
+/// 票の投票先の表示名。白票は `blank_name`（設定 `labels.blank_name`）。
+fn choice_label(b: &BallotDto, blank_name: &str) -> String {
+    if b.blank {
+        return blank_name.to_string();
+    }
+    match (&b.candidate_name, &b.party) {
+        (Some(name), Some(party)) if !party.is_empty() => format!("{name}（{party}）"),
+        (Some(name), _) => name.clone(),
+        (None, _) => b.candidate_id.clone(),
+    }
+}
+
+/// `blank_name` は、白票の呼び名（設定 `labels.blank_name`）。
+pub fn ballot_rows(ballots: &[BallotDto], blank_name: &str) -> Vec<BallotRow> {
     ballots
         .iter()
         .enumerate()
         .map(|(i, b)| BallotRow {
             index: i + 1,
             ballot_id: b.ballot_id.clone(),
-            district: b
-                .district_name
-                .clone()
-                .unwrap_or_else(|| b.contest_id.clone()),
-            candidate: match (&b.candidate_name, &b.party) {
-                (Some(name), Some(party)) if !party.is_empty() => format!("{name}（{party}）"),
-                (Some(name), _) => name.clone(),
-                (None, _) => b.candidate_id.clone(),
-            },
+            district: district_label(b),
+            candidate: choice_label(b, blank_name),
+            blank: b.blank,
         })
         .collect()
+}
+
+/// ブロック内の票の、投票先別の件数の 1 行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceCount {
+    pub district: String,
+    /// 投票先の表示名（候補者、または白票の呼び名）。
+    pub choice: String,
+    pub count: usize,
+    pub blank: bool,
+}
+
+/// ブロック内の票を、選挙区（投票用紙）ごとに、投票先別に数える。選挙区は投票用紙の ID 順、その中は候補者
+/// （票の多い順、同数は表示名の順）の後に、**白票を候補者とは別の行**で置く（白票が無い選挙区には、白票の行を出さない）。
+pub fn choice_counts(ballots: &[BallotDto], blank_name: &str) -> Vec<ChoiceCount> {
+    use std::collections::BTreeMap;
+    // 投票用紙の ID → (選挙区の表示名, 候補者の表示名 → 件数, 白票の件数)。
+    let mut by_contest: BTreeMap<&str, (String, BTreeMap<String, usize>, usize)> = BTreeMap::new();
+    for b in ballots {
+        let entry = by_contest
+            .entry(b.contest_id.as_str())
+            .or_insert_with(|| (district_label(b), BTreeMap::new(), 0));
+        if b.blank {
+            entry.2 += 1;
+        } else {
+            *entry.1.entry(choice_label(b, blank_name)).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for (district, candidates, blank) in by_contest.into_values() {
+        let mut rows: Vec<(String, usize)> = candidates.into_iter().collect();
+        // 安定ソート: 同数なら、表示名の順（BTreeMap の順）のまま。
+        rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        out.extend(rows.into_iter().map(|(choice, count)| ChoiceCount {
+            district: district.clone(),
+            choice,
+            count,
+            blank: false,
+        }));
+        if blank > 0 {
+            out.push(ChoiceCount {
+                district,
+                choice: blank_name.to_string(),
+                count: blank,
+                blank: true,
+            });
+        }
+    }
+    out
 }
 
 /// 票の一覧の代わりに出す案内（締切前など、API が票を返さないとき）。票を返しているときは `None`。
@@ -158,6 +222,7 @@ mod tests {
             ballot_id: "aa".repeat(16),
             contest_id: "2026-general/smd.13.01".to_string(),
             candidate_id: "smd.13.01.c1".to_string(),
+            blank: false,
             district_name: with_names.then(|| "東京1区".to_string()),
             candidate_name: with_names.then(|| "甲".to_string()),
             party: with_names.then(|| "党".to_string()),
@@ -214,9 +279,19 @@ mod tests {
         );
     }
 
+    fn blank_ballot() -> BallotDto {
+        BallotDto {
+            candidate_id: "blank".to_string(),
+            blank: true,
+            candidate_name: None,
+            party: None,
+            ..ballot(true)
+        }
+    }
+
     #[test]
     fn ballot_rows_use_display_names_and_fall_back_to_ids() {
-        let rows = ballot_rows(&[ballot(true), ballot(false)]);
+        let rows = ballot_rows(&[ballot(true), ballot(false)], "白票");
         assert_eq!(rows[0].index, 1);
         assert_eq!(rows[0].district, "東京1区");
         assert_eq!(rows[0].candidate, "甲（党）");
@@ -226,8 +301,50 @@ mod tests {
         // 政党が空なら、氏名だけ。
         let mut b = ballot(true);
         b.party = Some(String::new());
-        assert_eq!(ballot_rows(&[b])[0].candidate, "甲");
-        assert!(ballot_rows(&[]).is_empty());
+        assert_eq!(ballot_rows(&[b], "白票")[0].candidate, "甲");
+        assert!(ballot_rows(&[], "白票").is_empty());
+        assert!(!rows[0].blank);
+    }
+
+    #[test]
+    fn a_blank_ballot_is_shown_with_the_blank_name_not_as_a_candidate() {
+        let rows = ballot_rows(&[blank_ballot()], "白票");
+        assert_eq!(rows[0].candidate, "白票");
+        assert!(rows[0].blank);
+        assert_eq!(rows[0].district, "東京1区");
+    }
+
+    #[test]
+    fn choice_counts_put_blank_on_its_own_row_after_the_candidates() {
+        let mut other = ballot(true);
+        other.candidate_id = "smd.13.01.c2".to_string();
+        other.candidate_name = Some("乙".to_string());
+        let ballots = [
+            blank_ballot(),
+            ballot(true),
+            other.clone(),
+            other,
+            blank_ballot(),
+            blank_ballot(),
+        ];
+        let rows: Vec<(String, usize, bool)> = choice_counts(&ballots, "白票")
+            .into_iter()
+            .map(|r| (r.choice, r.count, r.blank))
+            .collect();
+        // 白票が最多でも、候補者の後の、別の行。
+        assert_eq!(
+            rows,
+            [
+                ("乙（党）".to_string(), 2, false),
+                ("甲（党）".to_string(), 1, false),
+                ("白票".to_string(), 3, true),
+            ]
+        );
+        // 白票が無ければ、白票の行は出さない。
+        let rows = choice_counts(&[ballot(true)], "白票");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].blank);
+        assert!(choice_counts(&[], "白票").is_empty());
     }
 
     #[test]

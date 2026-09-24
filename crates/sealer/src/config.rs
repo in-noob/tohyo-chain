@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use app_config::{AppConfig, Mode};
-use domain::Period;
 use domain::seal_policy::SealPolicy;
+use domain::{ElectionRules, Period};
 use shared_types::hex;
 
 pub struct SealerConfig {
@@ -30,6 +30,8 @@ pub struct SealerConfig {
     pub period: Period,
     /// 締切の手続きの待ち時間（`election.state_cache_secs + api.request_timeout_secs`）。
     pub election_grace: Duration,
+    /// open に遷移させるときに固定する選挙のルール（`vote.allow_blank`。原則19）。
+    pub rules: ElectionRules,
 }
 
 // 署名鍵の種がログに出ないよう、Debug では伏せる。
@@ -43,6 +45,7 @@ impl std::fmt::Debug for SealerConfig {
             .field("signing_seed", &"<redacted>")
             .field("sealer_id", &self.sealer_id)
             .field("lease_ttl", &self.lease_ttl)
+            .field("rules", &self.rules)
             .finish()
     }
 }
@@ -102,6 +105,9 @@ impl SealerConfig {
             election_grace: Duration::from_secs(
                 app.election.state_cache_secs + app.api.request_timeout_secs,
             ),
+            rules: ElectionRules {
+                allow_blank: app.vote.allow_blank,
+            },
         })
     }
 }
@@ -128,6 +134,7 @@ mod tests {
         assert_eq!(c.lease_ttl, Duration::from_secs(30));
         assert_eq!(c.signing_seed, [7u8; 32]);
         assert!(c.sealer_id.starts_with("sealer-"), "{}", c.sealer_id);
+        assert_eq!(c.rules, ElectionRules { allow_blank: true });
     }
 
     #[test]
@@ -141,6 +148,7 @@ mod tests {
             ("sealer.lease_ttl_secs", "6"),
             ("db.nodes", "db1:9042,db2:9042"),
             ("db.keyspace", "vote_test"),
+            ("vote.allow_blank", "false"),
         ]);
         let c = config(&pairs).expect("valid");
         assert_eq!(c.shard_count.get(), 4);
@@ -149,6 +157,7 @@ mod tests {
         assert_eq!(c.lease_ttl, Duration::from_secs(6));
         assert_eq!(c.nodes.len(), 2);
         assert_eq!(c.keyspace, "vote_test");
+        assert_eq!(c.rules, ElectionRules { allow_blank: false });
     }
 
     #[test]

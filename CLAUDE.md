@@ -56,6 +56,7 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    （serde_json等でハッシュ対象を作らない）。SHA-256を使用。
    ブロックの形式の版 2 から、票の contest_id / candidate_id（文字列 ID）は、2 バイトの固定幅の
    長さ接頭辞つき（ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id。ADR 0013）。
+   白票の票は、candidate_id に予約値 "blank" をそのまま入れる（形式の版は変えない。ADR 0021）。
 5. 分離: crates/web は crates/shared-types 以外のワークスペースクレートに依存しない。
    crates/domain は IO・async ランタイム・DBクレートに依存しない。
 6. api はステートレス。セッションは HMAC 署名トークン。サーバメモリに状態を持たない
@@ -97,14 +98,16 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
 12. 利用者に見える文言（画面・エラーメッセージ・集計結果の表示名）はコードに直接書かず、
     設定の labels から読む。コード内部の型名や API のパスは contest のまま残す。
     投票用紙 1 枚の呼び名は labels.ballot_item（既定「投票用紙」）、進捗の表示は labels.progress
-    （既定「{total}枚中{current}枚目」）。画面・API のエラー・集計に、旧来の呼び名（contest を片仮名にした語）は
+    （既定「{total}枚中{current}枚目」）。白票は、選択肢が labels.blank_option、確認画面が labels.blank_confirm、
+    集計・ビューア・API のエラーでの呼び名が labels.blank_name（原則20）。画面・API のエラー・集計に、旧来の呼び名（contest を片仮名にした語）は
     使わない（crates/・config/・seed/・scripts/・README・CLAUDE.md を scripts/check/docs.sh が確認する）。
 13. ID は変更されない文字列コードにする。区割り変更など、将来変わり得る意味を ID に埋め込まない。
     都道府県は JIS X 0401 の2桁コード（01〜47）を使う。
     ID 体系（crates/domain/src/ids.rs。読み込み時に、形式・文字種・最大長を検証する）:
     election_id（例 2026-general）、election_type（例 shugiin_smd）、district_id（例 shugiin_smd.13.01。
     先頭のセグメントが選挙の種類）、contest_id = {election_id}/{district_id}、candidate_id =
-    {district_id}.c{連番}。文字種は小文字の英数字・_・-（区切りは . と /）。1 つの選挙区が複数の都道府県に
+    {district_id}.c{連番}（型は domain::CandidateCode。票の投票先は domain::CandidateId = Blank | Candidate(CandidateCode)。
+    予約値 "blank" は白票で、選挙データの候補者コードには使えない＝読み込み時にエラー）。文字種は小文字の英数字・_・-（区切りは . と /）。1 つの選挙区が複数の都道府県に
     またがる場合（合区）も、ID は変えず、選挙区の属性 prefectures（リスト）で持つ。
     選挙データは seed/<election_id>/（election.toml・districts.csv・candidates/<選挙の種類>.csv・voters.csv）。
     読み込みと検証は crates/seed、ダミーデータの生成と検証は seedgen（ADR 0014）。
@@ -120,7 +123,8 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     票なしの版を保持する）。エラーも no-store。票が非公開の間は、verifier の検証・集計もできない（終了コード 4）。
     scripts/check/chain.sh が確認する（ブラウザでの確認は docs/manual_check_step14.md）。
     集計は verifier tally（scripts/tally.sh。ADR 0016）: 集計の前に、チェーン全体の検証と投票済み記録との突合を必ず
-    行い、失敗したら集計しない（終了コード 3）。未封印の票が残っていたら、件数を表示して中止する（4。残りの票は締切の
+    行い、失敗したら集計しない（終了コード 3。投票用紙の候補者でも白票でもない票がチェーンにあるときも 3。白票は候補者とは別に数え、
+    表では候補者の後の別の行、CSV では白票の列に出す。ADR 0021）。未封印の票が残っていたら、件数を表示して中止する（4。残りの票は締切の
     手続き（closing）の中でだけ封印されるので、closed を待ってから再実行）。選挙状態が closed より前は --allow-interim が
     なければ集計しない（4。原則18。--allow-interim は app.env=dev のときだけ）。出力は、表と out/tally/{日時（UTC）}/ の CSV・JSON（scripts/check/chain.sh が確認する）。
 15. パスワードは Argon2id でハッシュ化して保存する。平文はログにもDBにも残さない。
@@ -166,8 +170,17 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     進捗画面にも、期間と今の状態を表示する（GET /api/v1/election-status。認証不要）。verifier tally は、
     選挙状態が closed のときだけ実行できる（app.env=dev のときだけ --allow-interim を許可）。
 19. 選挙のルール（再投票の可否、再投票の上限、封印ルール）は、open に移った時点で固定し、
-    それ以降は変更できない。（未実装。原則17・18〔ADR 0019〕の実装時点では、封印ルール・再投票ルールの
-    スナップショットと固定化は行っていない。再投票の可否・上限自体も、この版ではまだ実装していない。）
+    それ以降は変更できない。
+    実装（ADR 0021）: 固定しているのは白票の可否（vote.allow_blank）だけ。domain::ElectionRules を、open への遷移と同じ
+    条件付き書き込み（DB は election_state.allow_blank の LWT、memory はプロセス内）で保存し（ElectionStateStore::transition の
+    引数。open 以外の遷移では無視）、以後は ElectionRules::effective で固定した値を使う。固定するのは、open に遷移させた
+    プロセス（sealer / api 内蔵のスケジューラ / open --now の api）の設定の値。設定と食い違っていたら起動時に警告する。
+    （封印ルール・再投票ルールの固定は未実装。再投票の可否・上限自体も、この版ではまだ実装していない。）
+20. 白票（どの候補者にも投票しない）を選べる。API は candidate_id の予約値 "blank"（小文字の完全一致）を受け付ける。
+    実装（ADR 0021）: 候補者の一覧 API は、白票を含めず allow_blank（固定した vote.allow_blank）を返し、画面は真のときだけ
+    候補者一覧の最後に白票の選択肢を置く（web::flow::choices）。確認画面は候補者名の型に当てはめず labels.blank_confirm を出す。
+    vote.allow_blank=false なら、画面に出さず、API は 422 blank_not_allowed で拒否する。ビューアは白票を別の書式・別の行で、
+    集計は候補者とは別の行で表示する。scripts/check/core.sh#10（API・封印・集計）と web.sh#4（画面）が確認する。
 
 ## 技術スタック
 - Rust stable, edition 2024, tokio

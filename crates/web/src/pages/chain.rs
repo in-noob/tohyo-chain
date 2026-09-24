@@ -11,6 +11,7 @@ use shared_types::{BlockSummaryDto, HeaderDto};
 use crate::api;
 use crate::chain::{self, ANCHORS_PATH, CHAIN_HOME};
 use crate::error::{self, ApiFailure};
+use crate::labels;
 
 /// この画面を配信しているオリジン（検証コマンドの `--api` に使う）。取得できなければ空。
 fn origin() -> String {
@@ -266,13 +267,15 @@ fn block_detail(shard: u16, block: shared_types::BlockDto) -> impl IntoView {
     let genesis = chain::is_genesis(&h);
     let minute = shared_types::time::format_minute_utc(h.sealed_at_minute);
     let notice = chain::hidden_ballots_notice(&block);
-    let rows = chain::ballot_rows(&block.ballots);
+    let rows = chain::ballot_rows(&block.ballots, labels::blank_name());
+    let counts = chain::choice_counts(&block.ballots, labels::blank_name());
     let ballots = if block.ballots_revealed {
+        // 白票は候補者ではないので、別の書式（class "blank"）で表示する。
         let body = rows
             .into_iter()
             .map(|r| {
                 view! {
-                    <tr>
+                    <tr class=r.blank.then_some("blank")>
                         <td>{r.index}</td>
                         <td>{r.district}</td>
                         <td>{r.candidate}</td>
@@ -281,13 +284,33 @@ fn block_detail(shard: u16, block: shared_types::BlockDto) -> impl IntoView {
                 }
             })
             .collect_view();
+        // 投票先別の件数。白票は、候補者の後の別の行。
+        let summary = counts
+            .into_iter()
+            .map(|c| {
+                view! {
+                    <tr class=c.blank.then_some("blank")>
+                        <td>{c.district}</td>
+                        <td>{c.choice}</td>
+                        <td>{c.count}</td>
+                    </tr>
+                }
+            })
+            .collect_view();
         view! {
             <h2>{format!("票の一覧（{} 票。ballot_id のハッシュ順）", block.ballots.len())}</h2>
             {(block.ballots.is_empty()).then(|| view! { <p>"このブロックに票はありません（ジェネシスなど）。"</p> })}
             <table class="ballots">
-                <thead><tr><th>"#"</th><th>"選挙区"</th><th>"候補者"</th><th>"ballot_id"</th></tr></thead>
+                <thead><tr><th>"#"</th><th>"選挙区"</th><th>"投票先"</th><th>"ballot_id"</th></tr></thead>
                 <tbody>{body}</tbody>
             </table>
+            {(!block.ballots.is_empty()).then(|| view! {
+                <h2>"このブロックの投票先別の票数"</h2>
+                <table class="ballots counts">
+                    <thead><tr><th>"選挙区"</th><th>"投票先"</th><th>"票数"</th></tr></thead>
+                    <tbody>{summary}</tbody>
+                </table>
+            })}
         }
         .into_any()
     } else {

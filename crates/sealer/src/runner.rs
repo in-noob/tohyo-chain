@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use application::{ElectionStateSnapshot, ElectionStateStore, StoreError};
-use domain::{ElectionPhase, automatic_transition, voting_started_at};
+use domain::{ElectionPhase, ElectionRules, automatic_transition, voting_started_at};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -44,12 +44,14 @@ impl SealerHandle {
 /// `election` / `election_grace`: 選挙状態（scheduled → open → closing → closed）の自動遷移と
 /// 締切の手続きを、このプロセス内のスケジューラが行う（原則17。memory モードにはリース・複数プロセスが
 /// 無いので、Coordinator の「アンカー担当」に相当する役割を、この唯一の sealer タスクがそのまま担う）。
+/// `rules` は、open に遷移させるときに選挙状態へ固定する選挙のルール（設定 `vote.allow_blank`。原則19）。
 pub fn spawn(
     mut sealer: Sealer,
     tick: Duration,
     anchor_interval: Duration,
     election: Arc<dyn ElectionStateStore>,
     election_grace: Duration,
+    rules: ElectionRules,
 ) -> SealerHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -74,7 +76,7 @@ pub fn spawn(
                         tracing::error!(error = %e, "アンカーの作成に失敗しました");
                     }
                     if let Some(snapshot) = snapshot {
-                        election_tick(&mut sealer, &election, snapshot, election_grace, &mut closing_deadline).await;
+                        election_tick(&mut sealer, &election, snapshot, election_grace, rules, &mut closing_deadline).await;
                     }
                 }
                 // 停止指示、または送信側の破棄。
@@ -111,6 +113,7 @@ async fn election_tick(
     election: &Arc<dyn ElectionStateStore>,
     snapshot: ElectionStateSnapshot,
     grace: Duration,
+    rules: ElectionRules,
     closing_deadline: &mut Option<Duration>,
 ) {
     let wall_now = i64::try_from(sealer.wall_now_unix_secs()).unwrap_or(i64::MAX);
@@ -123,7 +126,7 @@ async fn election_tick(
                 return;
             };
             match election
-                .transition(snapshot.phase, next, ACTOR, wall_now)
+                .transition(snapshot.phase, next, rules, ACTOR, wall_now)
                 .await
             {
                 Ok(true) => {
@@ -154,6 +157,7 @@ async fn election_tick(
                         .transition(
                             ElectionPhase::Closing,
                             ElectionPhase::Closed,
+                            rules,
                             ACTOR,
                             wall_now,
                         )

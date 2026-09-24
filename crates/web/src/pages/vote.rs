@@ -4,12 +4,16 @@
 //! 共有状態には置かない。投票を受理されたら段階を初期化して捨て、完了画面へ履歴を置き換えて移る。
 //!
 //! この画面に入れるのは「今」の投票用紙（表示順で先頭の未投票）だけ。順番は選べない（`flow::guard`）。
+//!
+//! 白票: API が `allow_blank`（open の時点で固定した選挙のルール）を返したときだけ、候補者一覧の最後に白票の選択肢
+//! （設定 `labels.blank_option`）を置く（`flow::choices`）。確認画面では「白票として投票します」
+//! （`labels.blank_confirm`）と、候補者とは違う文言で示す（`flow::confirm_message`）。
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_params};
 use leptos_router::params::Params;
-use shared_types::CandidateDto;
+use shared_types::CandidatesResponse;
 
 use crate::api;
 use crate::app::{AppState, replace, use_guard};
@@ -95,7 +99,7 @@ pub fn VotePage() -> impl IntoView {
     use_guard(Page::Ballot(contest_id.clone()));
     let navigate = use_navigate();
 
-    let candidates = RwSignal::new(None::<Vec<CandidateDto>>);
+    let candidates = RwSignal::new(None::<CandidatesResponse>);
     let load_error = RwSignal::new(None::<String>);
     let phase = RwSignal::new(VotePhase::default());
 
@@ -108,7 +112,7 @@ pub fn VotePage() -> impl IntoView {
             let (navigate, contest_id) = (navigate.clone(), contest_id.clone());
             leptos::task::spawn_local(async move {
                 match api::candidates(&token, &contest_id).await {
-                    Ok(response) => candidates.set(Some(response.candidates)),
+                    Ok(response) => candidates.set(Some(response)),
                     Err(ApiFailure::Unauthorized) => {
                         state.notice.set(flow::outcome_notice(
                             VoteOutcome::SessionExpired,
@@ -147,12 +151,12 @@ pub fn VotePage() -> impl IntoView {
             })
         })
     };
-    let candidate_name = move |candidate_id: &str| {
-        candidates.with(|list| {
-            list.as_ref()
-                .and_then(|l| l.iter().find(|c| c.candidate_id == candidate_id))
-                .map(|c| c.name.clone())
-                .unwrap_or_default()
+    let confirm_text = move |candidate_id: &str| {
+        candidates.with(|response| {
+            let list = response
+                .as_ref()
+                .map_or(&[][..], |r| r.candidates.as_slice());
+            flow::confirm_message(candidate_id, list, labels::blank_confirm())
         })
     };
 
@@ -168,20 +172,32 @@ pub fn VotePage() -> impl IntoView {
             {move || {
                 let navigate = navigate.clone();
                 let contest_id = contest_id.clone();
-                let Some(list) = candidates.get() else {
+                let Some(response) = candidates.get() else {
                     return view! { <p>"読み込み中…"</p> }.into_any();
                 };
                 match phase.get() {
                     VotePhase::Choosing { selected } => {
                         let has_selection = selected.is_some();
-                        let options = list
+                        // 候補者の最後に、白票（allow_blank のときだけ）。
+                        let options = flow::choices(
+                            &response.candidates,
+                            response.allow_blank,
+                            labels::blank_option(),
+                        )
                             .into_iter()
                             .map(|c| {
                                 let id = c.candidate_id.clone();
                                 let checked = selected.as_deref() == Some(c.candidate_id.as_str());
-                                let party = (!c.party.is_empty()).then(|| c.party.clone());
+                                let party = c.party;
+                                // 白票は候補者と区切って表示する（class に blank を足す。区切りの余白と破線の枠は style.css）。
+                                let class = match (c.blank, checked) {
+                                    (false, false) => "candidate",
+                                    (false, true) => "candidate selected",
+                                    (true, false) => "candidate blank",
+                                    (true, true) => "candidate blank selected",
+                                };
                                 view! {
-                                    <label class=if checked { "candidate selected" } else { "candidate" }>
+                                    <label class=class>
                                         <input
                                             type="radio"
                                             name="candidate"
@@ -191,7 +207,7 @@ pub fn VotePage() -> impl IntoView {
                                                 phase.update(|p| *p = flow::pick(std::mem::take(p), id))
                                             }
                                         />
-                                        <span>{c.name}</span>
+                                        <span>{c.label}</span>
                                         {party.map(|p| view! { <span class="party">{p}</span> })}
                                         // 選択中は、色（枠）だけでなく、太い枠・太字と、この「✓ 選択中」の文字でも示す。
                                         <span class="check" aria-hidden="true">{checked.then_some("✓ 選択中")}</span>
@@ -215,7 +231,7 @@ pub fn VotePage() -> impl IntoView {
                     }
                     VotePhase::Confirming { candidate_id } => view! {
                         <p class="confirm">
-                            {format!("「{}」に投票します。よろしいですか？", candidate_name(&candidate_id))}
+                            {confirm_text(&candidate_id)}
                         </p>
                         <p class="hint">"投票の取り消し・やり直しはできません。"</p>
                         <div class="actions">

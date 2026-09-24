@@ -313,6 +313,8 @@ struct TallyRun<'a> {
     api: &'a str,
     public_key: Option<&'a str>,
     ballot_item: &'a str,
+    /// 設定の `labels.blank_name`（白票の表示名）。
+    blank_name: &'a str,
     /// api から取得した、今の選挙状態（原則17）。
     phase: domain::ElectionPhase,
     /// 表示用（api から取得した締切。未設定なら `None`）。
@@ -376,6 +378,7 @@ fn tally_flow(
     };
     let meta = tally::Meta {
         ballot_item,
+        blank_name: run.blank_name,
         generated_at_unix: run.now_unix,
         phase: gate_phase,
         voting_closes_at: run.closes_at_display.as_deref(),
@@ -425,6 +428,7 @@ fn tally_command(args: TallyArgs) -> anyhow::Result<ExitCode> {
         api: &api,
         public_key: args.public_key.as_deref(),
         ballot_item: &config.labels.ballot_item,
+        blank_name: &config.labels.blank_name,
         phase,
         closes_at_display: status.closes_at.map(|secs| {
             shared_types::time::format_offset(secs, status.display_timezone_offset_secs)
@@ -548,7 +552,7 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use domain::election::{Candidate, District, Election, ElectionType, VotingMethod};
-        use domain::{CandidateId, DistrictId, ElectionId, ElectionTypeCode};
+        use domain::{CandidateCode, DistrictId, ElectionId, ElectionTypeCode};
 
         use super::super::*;
         use crate::tally::gate::Refusal;
@@ -572,7 +576,7 @@ mod tests {
                 });
                 for c in 1..=4 {
                     cs.push(Candidate {
-                        id: CandidateId::parse(&format!("{id}.c{c}")).expect("candidate"),
+                        id: CandidateCode::parse(&format!("{id}.c{c}")).expect("candidate"),
                         name: format!("候補{n}-{c}"),
                         party: "党".to_string(),
                         profile: String::new(),
@@ -615,6 +619,7 @@ mod tests {
                 api: "http://fake",
                 public_key: None,
                 ballot_item: "投票用紙",
+                blank_name: "白票",
                 phase,
                 closes_at_display: Some("2026-10-01T09:00:00+09:00".to_string()),
                 now_unix: 2_000,

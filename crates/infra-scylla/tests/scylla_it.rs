@@ -920,3 +920,42 @@ async fn registry_and_roll_round_trip() {
     );
     db.teardown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires ScyllaDB"]
+async fn election_rules_are_fixed_by_the_open_transition() {
+    use application::ElectionStateStore;
+    use domain::{ElectionPhase, ElectionRules, Period};
+
+    let db = setup(1).await;
+    let s = &db.store;
+    let on = ElectionRules { allow_blank: true };
+    let off = ElectionRules { allow_blank: false };
+    let initial = s.ensure_initialized(Period::default()).await.expect("init");
+    assert_eq!(initial.rules, None, "scheduled の間は、まだ固定しない");
+    // open への遷移（LWT）と同じ書き込みで固定する。遅れて来た 2 つ目の遷移は失敗し、値を変えない。
+    assert_eq!(
+        s.transition(ElectionPhase::Scheduled, ElectionPhase::Open, off, "a", 10)
+            .await,
+        Ok(true)
+    );
+    assert_eq!(
+        s.transition(ElectionPhase::Scheduled, ElectionPhase::Open, on, "b", 11)
+            .await,
+        Ok(false)
+    );
+    assert_eq!(s.get().await.expect("get").rules, Some(off));
+    // 後の遷移に別のルールを渡しても、固定した値のまま。別の接続（再起動）からも同じ値が見える。
+    assert_eq!(
+        s.transition(ElectionPhase::Open, ElectionPhase::Closing, on, "a", 20)
+            .await,
+        Ok(true)
+    );
+    let reopened = ScyllaStore::connect(&config(&db.keyspace, 1), db.clock.clone())
+        .await
+        .expect("reconnect");
+    let snapshot = reopened.get().await.expect("get");
+    assert_eq!(snapshot.phase, ElectionPhase::Closing);
+    assert_eq!(snapshot.rules, Some(off));
+    db.teardown().await;
+}

@@ -52,6 +52,24 @@ impl fmt::Display for ElectionPhase {
     }
 }
 
+/// 選挙のルール（原則19）。open に遷移する時点で、遷移させたプロセスの設定の値を選挙状態に保存し（固定し）、
+/// それ以降は変更しない（設定ファイルを書き換えて再起動しても、保存した値を使う）。
+///
+/// 今あるのは白票の可否（設定 `vote.allow_blank`）だけ。再投票の可否・上限、封印ルールの固定は未実装。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElectionRules {
+    /// 白票（どの候補者にも投票しない）を受け付けるか。
+    pub allow_blank: bool,
+}
+
+impl ElectionRules {
+    /// 実際に使うルール: open の時点で固定した値（`frozen`）があればそれ、無ければ（open の前、または
+    /// ルールを記録する前の版で open にした選挙なら）このプロセスの設定の値（`configured`）。
+    pub fn effective(frozen: Option<Self>, configured: Self) -> Self {
+        frozen.unwrap_or(configured)
+    }
+}
+
 /// 投票の受付期間（両方 `None` なら無期限）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Period {
@@ -129,6 +147,18 @@ pub fn vote_gate(phase: ElectionPhase, period: Period, now: i64) -> VoteGate {
 mod tests {
     use super::*;
     use ElectionPhase::{Closed, Closing, Open, Scheduled};
+
+    #[test]
+    fn frozen_rules_win_over_the_configured_ones() {
+        let on = ElectionRules { allow_blank: true };
+        let off = ElectionRules { allow_blank: false };
+        // open の前（固定前）は設定の値。
+        assert_eq!(ElectionRules::effective(None, off), off);
+        assert_eq!(ElectionRules::effective(None, on), on);
+        // 固定した後は、設定を変えても固定した値。
+        assert_eq!(ElectionRules::effective(Some(on), off), on);
+        assert_eq!(ElectionRules::effective(Some(off), on), off);
+    }
 
     #[test]
     fn phase_round_trips_through_text() {

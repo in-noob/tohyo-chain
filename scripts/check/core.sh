@@ -9,6 +9,8 @@
 #   7. 不正な設定では、api/sealer/verifier/bench が理由つきで起動に失敗する
 #   8. labels.* がビルド時に web へ渡る（web は app-config に依存しない）
 #   9. 性能計測ツール一式（scripts/bench.sh と crates/bench）
+#  10. 白票: 白票で投票 → 封印 → tally の白票の数が一致する。vote.allow_blank=false では API が拒否する
+#      （open の時点での固定は cargo test の必須テスト。画面の確認は web.sh#4）
 # 設定は、手元の config/local.toml などの影響を受けないよう分離する（scripts/lib/common.sh）。
 set -euo pipefail
 
@@ -195,7 +197,7 @@ check_config() (
         election.display_timezone election.state_cache_secs
         chain.reveal_ballots admin.bind labels.site_title labels.done_message labels.login_heading
         labels.ballot_item labels.progress labels.voting_not_started_message labels.voting_closing_message
-        labels.voting_closed_message
+        labels.voting_closed_message vote.allow_blank labels.blank_option labels.blank_confirm labels.blank_name
     )
     for key in "${REQUIRED_KEYS[@]}"; do
         with_config /nonexistent "$EMPTY_SECRETS" -- "$CFG" get "$key" >/dev/null 2>&1 \
@@ -466,8 +468,13 @@ check_config() (
     LABEL_DONE="設定確認用の完了文言-$RANDOM"
     LABEL_ITEM="設定確認用の呼び名-$RANDOM"
     LABEL_PROGRESS="全{total}件のうち{current}件目-$RANDOM"
+    LABEL_BLANK_OPTION="設定確認用の白票の選択肢-$RANDOM"
+    LABEL_BLANK_CONFIRM="設定確認用の白票の確認-$RANDOM"
+    LABEL_BLANK_NAME="設定確認用の白票-$RANDOM"
     web_env="$(with_config /nonexistent "$EMPTY_SECRETS" APP__LABELS__SITE_TITLE="$LABEL_TITLE" APP__LABELS__DONE_MESSAGE="$LABEL_DONE" \
-        APP__LABELS__BALLOT_ITEM="$LABEL_ITEM" APP__LABELS__PROGRESS="$LABEL_PROGRESS" -- "$CFG" web-env)"
+        APP__LABELS__BALLOT_ITEM="$LABEL_ITEM" APP__LABELS__PROGRESS="$LABEL_PROGRESS" \
+        APP__LABELS__BLANK_OPTION="$LABEL_BLANK_OPTION" APP__LABELS__BLANK_CONFIRM="$LABEL_BLANK_CONFIRM" \
+        APP__LABELS__BLANK_NAME="$LABEL_BLANK_NAME" -- "$CFG" web-env)"
     DIST="$TMP/dist"
     if ! build_log="$(cd crates/web && eval "$web_env" && trunk build --dist "$DIST" 2>&1)"; then
         echo "$build_log" >&2
@@ -479,7 +486,10 @@ check_config() (
     grep -aFq "$LABEL_DONE" "$wasm_file" || fail "labels.done_message が web のビルドに反映されていません"
     grep -aFq "$LABEL_ITEM" "$wasm_file" || fail "labels.ballot_item が web のビルドに反映されていません"
     grep -aFq "$LABEL_PROGRESS" "$wasm_file" || fail "labels.progress が web のビルドに反映されていません"
-    echo "labels.site_title / done_message / ballot_item / progress が、ビルド時の環境変数で web に渡る: OK"
+    grep -aFq "$LABEL_BLANK_OPTION" "$wasm_file" || fail "labels.blank_option が web のビルドに反映されていません"
+    grep -aFq "$LABEL_BLANK_CONFIRM" "$wasm_file" || fail "labels.blank_confirm が web のビルドに反映されていません"
+    grep -aFq "$LABEL_BLANK_NAME" "$wasm_file" || fail "labels.blank_name が web のビルドに反映されていません"
+    echo "labels.site_title / done_message / ballot_item / progress / blank_option / blank_confirm / blank_name が、ビルド時の環境変数で web に渡る: OK"
     if cargo tree -p web --edges normal,build 2>/dev/null | grep -q 'app-config'; then
         fail "web が app-config に依存しています（原則 5）"
     fi
@@ -545,9 +555,164 @@ check_bench_tool() (
     echo "OK: core#9 bench ツール"
 )
 
+# ===========================================================================
+# 10. 白票（vote.allow_blank。原則19: open の時点で固定）
+# ===========================================================================
+check_blank() (
+    set -euo pipefail
+    cfg_init
+    PORT="${CHECK_API_PORT:-18833}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18933}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="core10-check-admin-token-0123456789abcdef"
+    export BASE
+    TMP="$(mktemp -d)"
+    LOG="$TMP/api.log"
+    OUT="$TMP/tally"
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        rm -rf "$TMP"
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        if [[ -s "$LOG" ]]; then
+            echo "--- api log（末尾）---" >&2
+            tail -n 20 "$LOG" >&2
+        fi
+        exit 1
+    }
+
+    echo "== 10-1. 白票・open の時点での固定の単体テスト（必須ケース）"
+    # 消す・改名すると失敗する。
+    REQUIRED=(
+        "domain ids::tests::blank_is_a_reserved_value_of_the_vote_but_never_a_candidate_code"
+        "domain election::tests::a_contest_accepts_its_own_candidates_and_blank_only_when_allowed"
+        "domain election_state::tests::frozen_rules_win_over_the_configured_ones"
+        "seed tests::the_reserved_blank_value_cannot_be_a_candidate_code"
+        "infra-memory store::tests::election_rules_are_fixed_when_the_election_opens"
+        "application voting::tests::a_blank_vote_is_stored_as_blank_only_when_blank_is_allowed"
+        "api the_rule_fixed_at_open_wins_over_the_current_config"
+        "api blank_is_rejected_when_the_election_does_not_allow_it"
+        "api a_blank_vote_is_accepted_and_sealed_as_a_blank_ballot"
+        "sealer memory_scheduler_advances_through_the_full_lifecycle"
+        "verifier tally::compute::tests::blank_votes_are_counted_apart_from_the_candidates"
+        "verifier tally::compute::tests::a_vote_for_someone_outside_the_contest_stops_the_tally"
+    )
+    for entry in "${REQUIRED[@]}"; do
+        read -r crate name <<<"$entry"
+        out="$(cargo test -q -p "$crate" -- --exact "$name" 2>&1)" || { echo "$out" >&2; fail "${crate}: ${name} が失敗しました"; }
+        grep -Eq '^test result: ok\. 1 passed' <<<"$out" || { echo "$out" >&2; fail "${crate}: 必須テスト ${name} がありません"; }
+    done
+    echo "必須テスト ${#REQUIRED[@]} 件: OK"
+
+    # start_api [NAME=VALUE...]: memory モードで起動し、開始時刻を過去にして open にする（その時点の vote.allow_blank が固定される）。
+    start_api() {
+        cargo build -q -p api
+        spawn api "$LOG" env APP__API__PORT="$PORT" APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}" APP__ADMIN__TOKEN="$ADMIN_TOKEN" \
+            APP__SESSION__SECRET="core10-check-secret-0123456789abcdef" APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00" \
+            APP__ELECTION__STATE_CACHE_SECS=0 APP__API__REQUEST_TIMEOUT_SECS=2 "$@" ./target/debug/api
+        wait_healthz "$BASE" 20 api || fail "api が応答しません"
+        wait_election_open "$BASE" 10 || fail "自動で open になりませんでした"
+    }
+    # vote_as N K CANDIDATE_ID: voter-N が K 番目の投票用紙に投票し、STATUS / BODY を設定する。
+    vote_as() {
+        local token district
+        token="$(login "voter-$1")"
+        [[ -n "$token" ]] || fail "voter-$1 がログインできません"
+        district="$(seed_district "$1" "$2")"
+        request POST "/api/v1/contests/${SEED_ID}/${district}/vote" "$token" "{\"candidate_id\":\"$3\"}"
+    }
+    candidates_of() {
+        local token district
+        token="$(login "voter-$1")"
+        district="$(seed_district "$1" 1)"
+        request GET "/api/v1/contests/${SEED_ID}/${district}/candidates" "$token"
+    }
+    admin_phase() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null || true; }
+    phase_is() { [[ "$(admin_phase)" == *"\"phase\":\"$1\""* ]]; }
+
+    VOTERS=12
+    seed_generate "$TMP/seed" "$VOTERS"
+    cargo build -q -p verifier
+
+    echo "== 10-2. 白票で投票 → 封印 → tally の白票の数が、投票した数と一致する（既定 vote.allow_blank=true）"
+    start_api
+    candidates_of 1
+    expect_status 200 "候補者の一覧"
+    [[ "$BODY" == *'"allow_blank":true'* ]] || fail "候補者の一覧に allow_blank=true がありません: ${BODY}"
+    [[ "$BODY" != *'"candidate_id":"blank"'* ]] || fail "候補者の一覧に白票が入っています（候補者とは別に allow_blank で示す）: ${BODY}"
+    # 有権者 n: 奇数は 1 枚目に白票、偶数は候補者に投票する。
+    declare -A EXP_BLANK=() EXP_TOTAL=()
+    blank_total=0
+    for n in $(seq 1 "$VOTERS"); do
+        d="$(seed_district "$n" 1)"
+        if ((n % 2 == 1)); then
+            vote_as "$n" 1 blank
+            EXP_BLANK["$d"]=$((${EXP_BLANK["$d"]:-0} + 1))
+            blank_total=$((blank_total + 1))
+        else
+            vote_as "$n" 1 "${d}.c1"
+        fi
+        expect_status 201 "voter-${n} の投票"
+        EXP_TOTAL["$d"]=$((${EXP_TOTAL["$d"]:-0} + 1))
+    done
+    echo "投票: ${VOTERS} 票（うち白票 ${blank_total} 票）"
+    # 締切（close --now → 締切の手続きで、残りを封印 → closed）。
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election/close")"
+    [[ "$code" == 200 ]] || fail "close --now が 200 ではありません（${code}）"
+    wait_until 20000 phase_is closed || fail "closed になりません: $(admin_phase)"
+    grep -aq 'trigger=close' "$LOG" || fail "締切の手続きで封印されていません"
+    # 封印された票: ブロックの詳細（ビューアの API）に、白票の印つきで入っている。
+    request GET /api/v1/chains/0/blocks/1
+    expect_status 200 "封印したブロック"
+    sealed_blank="$(count '"candidate_id":"blank","blank":true')"
+    [[ "$sealed_blank" == "$blank_total" ]] || fail "封印したブロックの白票が ${sealed_blank} 票です（期待 ${blank_total}）: ${BODY}"
+    echo "封印: ブロックの白票 ${sealed_blank} 票（candidate_id=blank, blank=true）: OK"
+
+    tally_out="$(APP__API__PORT="$PORT" ./target/debug/verifier tally --out "$OUT" 2>&1)" || { echo "$tally_out" >&2; fail "tally が失敗しました"; }
+    DIR="$(find "$OUT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
+    [[ -s "$DIR/districts.csv" ]] || fail "districts.csv がありません"
+    head -1 "$DIR/districts.csv" | grep -q ',白票,' || fail "districts.csv の見出しに、labels.blank_name（白票）の列がありません: $(head -1 "$DIR/districts.csv")"
+    sum_blank=0
+    while IFS=, read -r _contest district _name _type _prefs valid blank total voted; do
+        want_blank="${EXP_BLANK["$district"]:-0}"
+        want_total="${EXP_TOTAL["$district"]:-0}"
+        [[ "$blank" == "$want_blank" ]] || fail "${district}: 白票が ${blank}（期待 ${want_blank}）"
+        [[ "$total" == "$want_total" && "$voted" == "$want_total" && $((valid + blank)) == "$total" ]] \
+            || fail "${district}: 有効票=${valid} 白票=${blank} 合計=${total} 投票済み=${voted}（期待 合計 ${want_total}）"
+        sum_blank=$((sum_blank + blank))
+    done < <(tail -n +2 "$DIR/districts.csv")
+    [[ "$sum_blank" == "$blank_total" ]] || fail "tally の白票の合計が ${sum_blank}（期待 ${blank_total}）"
+    if grep -q ',blank,' "$DIR/candidates.csv"; then fail "candidates.csv（候補者別）に白票の行があります"; fi
+    grep -Eq "^ +白票 +[0-9]+$" <<<"$tally_out" || { echo "$tally_out" >&2; fail "tally の表に、候補者とは別の白票の行がありません"; }
+    echo "tally: 選挙区ごとの白票が期待値と一致・合計 ${sum_blank} 票・候補者別には入らず別の行: OK"
+    graceful_stop api
+
+    echo "== 10-3. vote.allow_blank=false: 候補者の一覧は allow_blank=false、白票の投票は 422 で拒否される"
+    start_api APP__VOTE__ALLOW_BLANK=false
+    candidates_of 1
+    expect_status 200 "候補者の一覧"
+    [[ "$BODY" == *'"allow_blank":false'* ]] || fail "allow_blank=false になっていません: ${BODY}"
+    vote_as 1 1 blank
+    expect_status 422 "allow_blank=false での白票"
+    [[ "$BODY" == *'"error":"blank_not_allowed"'* && "$BODY" == *'白票は選べません'* ]] || fail "拒否の理由がありません: ${BODY}"
+    # 拒否された票は数えない（同じ投票用紙に、候補者へは投票できる）。
+    d="$(seed_district 1 1)"
+    vote_as 1 1 "${d}.c1"
+    expect_status 201 "拒否の後の候補者への投票"
+    graceful_stop api
+    echo "allow_blank=false: 一覧で allow_blank=false・白票は 422 blank_not_allowed・拒否は数えない: OK"
+
+    echo "OK: core#10 白票"
+)
+
 check_healthz
 check_seal_policy
 check_config
 check_bench_tool
+check_blank
 
 echo "OK: check/core.sh"

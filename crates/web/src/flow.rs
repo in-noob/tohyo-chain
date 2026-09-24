@@ -10,7 +10,7 @@
 //! 秘密投票の観点で、ここが保持する候補者 ID は「投票を送信し終えるまで」の一時的な状態
 //! （[`VotePhase`]）だけで、送信が終わると必ず捨てる。
 
-use shared_types::BallotStatusDto;
+use shared_types::{BLANK_CANDIDATE_ID, BallotStatusDto, CandidateDto};
 
 use crate::error::ApiFailure;
 
@@ -316,6 +316,63 @@ pub fn submit(phase: &VotePhase) -> Option<(VotePhase, String)> {
         )),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 選択肢（候補者と白票）
+// ---------------------------------------------------------------------------
+
+/// 投票画面の選択肢 1 つ。候補者か、白票（どの候補者にも投票しない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// 送信する `candidate_id`。白票は予約値 [`BLANK_CANDIDATE_ID`]。
+    pub candidate_id: String,
+    /// 表示名。白票は設定 `labels.blank_option`。
+    pub label: String,
+    /// 政党（白票・無所属で空のときは `None`）。
+    pub party: Option<String>,
+    /// 白票か（画面は、候補者と区切って表示する）。
+    pub blank: bool,
+}
+
+/// 投票画面の選択肢: 候補者（API の並び順）の**最後に**、`allow_blank` のときだけ白票を置く。
+/// `allow_blank` は API が返す、open の時点で固定した選挙のルール（`vote.allow_blank`）。偽なら白票を出さない。
+pub fn choices(candidates: &[CandidateDto], allow_blank: bool, blank_option: &str) -> Vec<Choice> {
+    let mut out: Vec<Choice> = candidates
+        .iter()
+        .map(|c| Choice {
+            candidate_id: c.candidate_id.clone(),
+            label: c.name.clone(),
+            party: (!c.party.is_empty()).then(|| c.party.clone()),
+            blank: false,
+        })
+        .collect();
+    if allow_blank {
+        out.push(Choice {
+            candidate_id: BLANK_CANDIDATE_ID.to_string(),
+            label: blank_option.to_string(),
+            party: None,
+            blank: true,
+        });
+    }
+    out
+}
+
+/// 確認画面の文言。白票なら設定 `labels.blank_confirm`（「白票として投票します。…」）を**そのまま**出し、候補者名の
+/// 型に当てはめない（「「白票」に投票します」のように、候補者の一人のように見せない）。
+pub fn confirm_message(
+    candidate_id: &str,
+    candidates: &[CandidateDto],
+    blank_confirm: &str,
+) -> String {
+    if candidate_id == BLANK_CANDIDATE_ID {
+        return blank_confirm.to_string();
+    }
+    let name = candidates
+        .iter()
+        .find(|c| c.candidate_id == candidate_id)
+        .map_or(candidate_id, |c| c.name.as_str());
+    format!("「{name}」に投票します。よろしいですか？")
 }
 
 /// 投票 API の結果を UI が扱う種類にまとめたもの。
@@ -810,6 +867,68 @@ mod tests {
         assert_eq!(route, Some(Route::Done));
         // 画面を離れるとき、選んだ候補者は保持されない。
         assert_eq!(phase, VotePhase::default());
+    }
+
+    fn candidates() -> Vec<CandidateDto> {
+        (1..=3)
+            .map(|n| CandidateDto {
+                candidate_id: cand(n),
+                name: format!("候補{n}"),
+                party: if n == 3 {
+                    String::new()
+                } else {
+                    format!("党{n}")
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blank_option_is_listed_last_only_when_allowed() {
+        let list = choices(&candidates(), true, "白票（どの候補者にも投票しない）");
+        let ids: Vec<&str> = list.iter().map(|c| c.candidate_id.as_str()).collect();
+        assert_eq!(ids, [cand(1), cand(2), cand(3), "blank".to_string()]);
+        let last = list.last().expect("blank");
+        assert!(last.blank);
+        assert_eq!(last.label, "白票（どの候補者にも投票しない）");
+        assert_eq!(last.party, None);
+        assert!(list[..3].iter().all(|c| !c.blank));
+        assert_eq!(list[0].party.as_deref(), Some("党1"));
+        assert_eq!(list[2].party, None, "空の政党は出さない");
+        // allow_blank=false: 白票の選択肢は画面に出さない。
+        let list = choices(&candidates(), false, "白票（どの候補者にも投票しない）");
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|c| !c.blank && c.candidate_id != "blank"));
+        // 候補者の並びは API のまま。
+        assert_eq!(list[0].candidate_id, cand(1));
+    }
+
+    #[test]
+    fn confirming_a_blank_vote_says_so_explicitly() {
+        let list = candidates();
+        assert_eq!(
+            confirm_message("blank", &list, "白票として投票します。よろしいですか？"),
+            "白票として投票します。よろしいですか？"
+        );
+        assert_eq!(
+            confirm_message(&cand(2), &list, "白票として投票します。よろしいですか？"),
+            "「候補2」に投票します。よろしいですか？"
+        );
+    }
+
+    #[test]
+    fn a_blank_vote_goes_through_pick_confirm_submit_with_the_reserved_id() {
+        let phase = confirm(pick(VotePhase::default(), BLANK_CANDIDATE_ID.to_string()));
+        assert_eq!(
+            phase,
+            VotePhase::Confirming {
+                candidate_id: "blank".to_string()
+            }
+        );
+        let (phase, sent) = submit(&phase).expect("submit");
+        assert_eq!(sent, "blank");
+        let (phase, route) = apply_outcome(phase, VoteOutcome::Accepted);
+        assert_eq!((phase, route), (VotePhase::default(), Some(Route::Done)));
     }
 
     #[test]

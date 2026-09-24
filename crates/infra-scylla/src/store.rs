@@ -14,7 +14,8 @@ use application::{
 };
 use async_trait::async_trait;
 use domain::{
-    Anchor, Ballot, Block, ContestId, DistrictId, ElectionPhase, Period, ShardId, VoterId,
+    Anchor, Ballot, Block, ContestId, DistrictId, ElectionPhase, ElectionRules, Period, ShardId,
+    VoterId,
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -406,14 +407,14 @@ impl ScyllaStore {
             )
             .await?,
             insert_election_state: p(
-                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, opened_at, closing_started_at) \
-                 VALUES (?, 'scheduled', ?, ?, null, null) IF NOT EXISTS"
+                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank) \
+                 VALUES (?, 'scheduled', ?, ?, null, null, null) IF NOT EXISTS"
                     .into(),
                 quorum,
             )
             .await?,
             select_election_state: p(
-                "SELECT phase, opens_at, closes_at, opened_at, closing_started_at FROM {ks}.election_state WHERE scope = ?"
+                "SELECT phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank FROM {ks}.election_state WHERE scope = ?"
                     .into(),
                 serial,
             )
@@ -430,7 +431,7 @@ impl ScyllaStore {
             )
             .await?,
             update_election_phase_open: p(
-                "UPDATE {ks}.election_state SET phase = ?, opened_at = ? WHERE scope = ? IF phase = ?"
+                "UPDATE {ks}.election_state SET phase = ?, opened_at = ?, allow_blank = ? WHERE scope = ? IF phase = ?"
                     .into(),
                 quorum,
             )
@@ -1162,17 +1163,18 @@ impl LeaseStore for ScyllaStore {
 // 選挙状態（scheduled → open → closing → closed。原則17）
 // ---------------------------------------------------------------------------
 
-/// `election_state` の 1 行（phase, opens_at, closes_at, opened_at, closing_started_at）。
+/// `election_state` の 1 行（phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank）。
 type ElectionStateRow = (
     Option<String>,
     Option<i64>,
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<bool>,
 );
 
 fn election_state_row(row: ElectionStateRow) -> Result<ElectionStateSnapshot, StoreError> {
-    let (phase, opens_at, closes_at, opened_at, closing_started_at) = row;
+    let (phase, opens_at, closes_at, opened_at, closing_started_at, allow_blank) = row;
     let phase = phase
         .as_deref()
         .and_then(ElectionPhase::parse)
@@ -1185,6 +1187,8 @@ fn election_state_row(row: ElectionStateRow) -> Result<ElectionStateSnapshot, St
         },
         opened_at,
         closing_started_at,
+        // open の時点で固定した選挙のルール（原則19）。open 前と、ルールを記録する前の版で open にした選挙は NULL。
+        rules: allow_blank.map(|allow_blank| ElectionRules { allow_blank }),
     })
 }
 
@@ -1207,6 +1211,7 @@ impl ElectionStateStore for ScyllaStore {
                 period,
                 opened_at: None,
                 closing_started_at: None,
+                rules: None,
             });
         }
         self.get_election_state().await
@@ -1231,6 +1236,7 @@ impl ElectionStateStore for ScyllaStore {
         &self,
         from: ElectionPhase,
         to: ElectionPhase,
+        rules: ElectionRules,
         actor: &str,
         at_unix_secs: i64,
     ) -> Result<bool, StoreError> {
@@ -1239,10 +1245,18 @@ impl ElectionStateStore for ScyllaStore {
             return Ok(false);
         }
         let updated = if to == ElectionPhase::Open {
+            // 原則19: 選挙のルールは、open への遷移と同じ条件付き書き込みで固定する（別の書き込みにすると、
+            // 遷移だけが成功して、ルールが記録されない瞬間ができる）。
             with_retry("election_state transition", || {
                 self.session.execute_unpaged(
                     &self.stmts.update_election_phase_open,
-                    (to.as_str(), at_unix_secs, ELECTION_SCOPE, from.as_str()),
+                    (
+                        to.as_str(),
+                        at_unix_secs,
+                        rules.allow_blank,
+                        ELECTION_SCOPE,
+                        from.as_str(),
+                    ),
                 )
             })
             .await?

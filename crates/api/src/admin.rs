@@ -257,7 +257,8 @@ async fn transition_now(
     let now = i64::try_from(state.clock.now_unix_secs()).unwrap_or(i64::MAX);
     let ok = state
         .election_state
-        .transition(from, to, actor, now)
+        // open --now のときは、この api の設定の選挙のルールを固定する（原則19）。
+        .transition(from, to, state.configured_rules, actor, now)
         .await
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "選挙状態を更新できません"))?;
     if ok {

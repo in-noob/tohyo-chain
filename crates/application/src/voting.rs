@@ -22,6 +22,9 @@ pub enum ServiceError {
     ContestNotFound,
     #[error("指定した候補者は対象にいません")]
     InvalidCandidate,
+    /// 白票を受け付けない選挙（open の時点で固定した `vote.allow_blank` が偽）で、白票が指定された。
+    #[error("この選挙では白票を受け付けていません")]
+    BlankNotAllowed,
     #[error("投票済みです")]
     AlreadyVoted,
     /// 名簿で、この有権者に属さない選挙区（名簿に無い有権者を含む）。
@@ -146,19 +149,27 @@ impl VotingService {
     }
 
     /// 1 票を投じる。`ballot_id` はここで新規に採番し、`voter` とは無関係な乱数にする。
+    ///
+    /// `candidate` が白票（[`CandidateId::Blank`]）のときは、`allow_blank`（open の時点で固定した選挙のルール）が
+    /// 真のときだけ受け付ける。
     pub async fn cast_vote(
         &self,
         voter: &VoterId,
         contest: ContestId,
         candidate: CandidateId,
+        allow_blank: bool,
     ) -> Result<(), ServiceError> {
         let election = self.elections.election().await?;
         let found = election
             .contest(&contest)
             .ok_or(ServiceError::ContestNotFound)?;
         self.ensure_eligible(voter, found).await?;
-        if !found.has_candidate(&candidate) {
-            return Err(ServiceError::InvalidCandidate);
+        if !found.accepts(&candidate, allow_blank) {
+            return Err(if candidate.is_blank() {
+                ServiceError::BlankNotAllowed
+            } else {
+                ServiceError::InvalidCandidate
+            });
         }
 
         let ballot = Ballot {
@@ -283,7 +294,7 @@ mod tests {
     fn candidate(district: &str, seq: u64) -> Candidate {
         let district = DistrictId::new(district).expect("valid");
         Candidate {
-            id: CandidateId::new(&district, seq).expect("valid"),
+            id: domain::CandidateCode::new(&district, seq).expect("valid"),
             name: format!("候補 {seq}"),
             party: String::new(),
             profile: String::new(),
@@ -357,6 +368,7 @@ mod tests {
             &alice(),
             contest_id("shugiin_smd.13.01"),
             cand("shugiin_smd.13.01", 2),
+            true,
         )
         .await
         .expect("cast");
@@ -376,15 +388,21 @@ mod tests {
     async fn rejects_unknown_contest_foreign_candidate_and_other_districts() {
         let svc = service(Arc::new(RecordingStore::default()));
         assert_eq!(
-            svc.cast_vote(&alice(), contest_id("governor.99"), cand("governor.99", 1))
-                .await,
+            svc.cast_vote(
+                &alice(),
+                contest_id("governor.99"),
+                cand("governor.99", 1),
+                true
+            )
+            .await,
             Err(ServiceError::ContestNotFound)
         );
         assert_eq!(
             svc.cast_vote(
                 &alice(),
                 contest_id("shugiin_smd.13.01"),
-                cand("shugiin_smd.13.01", 9)
+                cand("shugiin_smd.13.01", 9),
+                true
             )
             .await,
             Err(ServiceError::InvalidCandidate)
@@ -394,7 +412,8 @@ mod tests {
             svc.cast_vote(
                 &alice(),
                 contest_id("shugiin_smd.13.01"),
-                cand("shugiin_smd.13.02", 1)
+                cand("shugiin_smd.13.02", 1),
+                true
             )
             .await,
             Err(ServiceError::InvalidCandidate)
@@ -403,6 +422,37 @@ mod tests {
             svc.candidates(&alice(), &contest_id("governor.99")).await,
             Err(ServiceError::ContestNotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn a_blank_vote_is_stored_as_blank_only_when_blank_is_allowed() {
+        let store = Arc::new(RecordingStore::default());
+        let svc = service(store.clone());
+        // 白票を受け付けない選挙: 拒否して、何も保存しない。
+        assert_eq!(
+            svc.cast_vote(
+                &alice(),
+                contest_id("governor.13"),
+                CandidateId::Blank,
+                false
+            )
+            .await,
+            Err(ServiceError::BlankNotAllowed)
+        );
+        assert!(store.casts.lock().expect("test lock").is_empty());
+        // 受け付ける選挙: 候補者とは別の、白票の票として保存する。
+        svc.cast_vote(
+            &alice(),
+            contest_id("governor.13"),
+            CandidateId::Blank,
+            true,
+        )
+        .await
+        .expect("blank vote");
+        let casts = store.casts.lock().expect("test lock");
+        assert_eq!(casts.len(), 1);
+        assert_eq!(casts[0].1.candidate_id, CandidateId::Blank);
+        assert_eq!(casts[0].1.contest_id, contest_id("governor.13"));
     }
 
     #[tokio::test]
@@ -418,7 +468,7 @@ mod tests {
             (&stranger, "governor.13"),
         ] {
             assert_eq!(
-                svc.cast_vote(voter, contest_id(district), cand(district, 1))
+                svc.cast_vote(voter, contest_id(district), cand(district, 1), true)
                     .await,
                 Err(ServiceError::NotEligible),
                 "{voter:?} {district}"
@@ -446,8 +496,13 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(
-            svc.cast_vote(&alice(), contest_id("governor.13"), cand("governor.13", 1))
-                .await,
+            svc.cast_vote(
+                &alice(),
+                contest_id("governor.13"),
+                cand("governor.13", 1),
+                true
+            )
+            .await,
             Err(ServiceError::Unavailable)
         );
     }
