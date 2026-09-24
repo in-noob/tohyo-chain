@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application::{ElectionStateStore, LeaseStore, StoreError};
-use domain::{Anchor, ElectionPhase, ShardId, automatic_transition};
+use application::{ElectionStateSnapshot, ElectionStateStore, LeaseStore, StoreError};
+use domain::{Anchor, ElectionPhase, ShardId, automatic_transition, voting_started_at};
 
 use crate::clock::MonotonicClock;
 use crate::schedule::AnchorSchedule;
@@ -74,7 +74,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// `anchor_interval`: アンカーを作るかどうかを判定する間隔（`seal.max_interval_secs` に連動させる）。
+    /// `anchor_interval`: アンカーを作るかどうかを判定する間隔（`seal.interval_secs` に連動させる）。
     /// 判定のたびに、直前のアンカー以降に先頭ブロックが変わっていなければ、作らない。
     ///
     /// `election` / `election_grace`: アンカーのリースを持っている間だけ、選挙状態（scheduled → open →
@@ -128,17 +128,39 @@ impl Coordinator {
         }
     }
 
-    /// 1 周期分の処理: リースの更新 → 新規取得（1 周期 1 シャードまで）→ 担当シャードの封印 →
-    /// closing なら担当シャードを直ちにフラッシュ → アンカー → 選挙状態の遷移・締切の手続き。
+    /// 1 周期分の処理: 選挙状態の読み込み（投票開始時刻 = 経過時間の起点）→ リースの更新 → 新規取得
+    /// （1 周期 1 シャードまで）→ 担当シャードの封印 → closing なら担当シャードを直ちにフラッシュ → アンカー →
+    /// 選挙状態の遷移・締切の手続き。
     pub async fn step(&mut self) -> StepOutcome {
         let mut out = StepOutcome::default();
         let now = self.mono.elapsed();
+        let snapshot = match self.election.get().await {
+            Ok(snapshot) => Some(snapshot),
+            // 未初期化（`ensure_initialized` が呼ばれていない）: この選挙は状態機械を使わない。
+            Err(StoreError::Unavailable) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "選挙状態の取得に失敗しました");
+                out.errors.push(e.into());
+                None
+            }
+        };
+        if let Some(snapshot) = &snapshot {
+            self.sealer
+                .set_voting_started_at(voting_started_at(snapshot.period, snapshot.opened_at));
+        }
         self.renew_leases(now, &mut out).await;
         self.acquire_round(now, &mut out).await;
         self.seal_held(&mut out).await;
-        self.flush_if_closing(&mut out).await;
+        if snapshot
+            .as_ref()
+            .is_some_and(|s| s.phase == ElectionPhase::Closing)
+        {
+            self.close_flush_held(&mut out).await;
+        }
         self.anchor_duty(now, &mut out).await;
-        self.election_duty(now, &mut out).await;
+        if let Some(snapshot) = snapshot {
+            self.election_duty(now, snapshot, &mut out).await;
+        }
         out
     }
 
@@ -297,13 +319,9 @@ impl Coordinator {
         }
     }
 
-    /// 選挙状態が closing なら、担当（アンカー担当かどうかを問わない）シャードを直ちにフラッシュする
-    /// （原則17: 締切の手続き中は、残っている票を持っているシャードごとに封印する）。
-    async fn flush_if_closing(&mut self, out: &mut StepOutcome) {
-        match self.election.get().await {
-            Ok(snapshot) if snapshot.phase == ElectionPhase::Closing => {}
-            _ => return,
-        }
+    /// 選挙状態が closing のときに呼ぶ: 担当（アンカー担当かどうかを問わない）シャードを直ちにフラッシュする
+    /// （原則9・17: 投票終了の手続きの中でだけ、残っている票を、持っているシャードごとに封印する）。
+    async fn close_flush_held(&mut self, out: &mut StepOutcome) {
         for shard in self.held_shards() {
             let Some(held) = self.held.get(&shard).copied() else {
                 continue;
@@ -313,7 +331,7 @@ impl Coordinator {
             let guard = move || mono.elapsed() < until;
             match self
                 .sealer
-                .flush_shard(ShardId(shard), &guard, &mut out.events)
+                .close_flush_shard(ShardId(shard), &guard, &mut out.events)
                 .await
             {
                 Ok(()) => {}
@@ -330,20 +348,15 @@ impl Coordinator {
 
     /// アンカーのリースを持っている間だけ: 選挙状態の自動遷移（scheduled→open、open→closing）と、
     /// closing→closed の締切の手続き（原則17）。
-    async fn election_duty(&mut self, now: Duration, out: &mut StepOutcome) {
+    async fn election_duty(
+        &mut self,
+        now: Duration,
+        snapshot: ElectionStateSnapshot,
+        out: &mut StepOutcome,
+    ) {
         if self.anchor_lease.is_none() {
             return;
         }
-        let snapshot = match self.election.get().await {
-            Ok(snapshot) => snapshot,
-            // 未初期化（`ensure_initialized` が呼ばれていない）: この選挙は状態機械を使わない。
-            Err(StoreError::Unavailable) => return,
-            Err(e) => {
-                tracing::warn!(error = %e, "選挙状態の取得に失敗しました");
-                out.errors.push(e.into());
-                return;
-            }
-        };
         let wall_now = i64::try_from(self.sealer.wall_now_unix_secs()).unwrap_or(i64::MAX);
         let actor = format!("sealer:{}", self.config.owner);
 
@@ -443,32 +456,13 @@ impl Coordinator {
         }
     }
 
-    /// 正常停止: 保持しているシャードを締切フラッシュ（残りをすべて封印）し、アンカー担当なら最終アンカー
-    /// （変化がなければ確認するだけ）を済ませて、リースを解放する（別の sealer がすぐ引き継げるように）。
+    /// 正常停止（SIGTERM）: 票のフラッシュはしない（原則9。未封印の票はストアに残り、引き継いだ sealer が
+    /// 封印ルールに従って封印する）。アンカー担当なら最終アンカー（変化がなければ確認するだけ）を済ませて、
+    /// リースを解放する（別の sealer がすぐ引き継げるように）。
     pub async fn shutdown(&mut self) -> StepOutcome {
         let mut out = StepOutcome::default();
         let owner = self.config.owner.clone();
         for shard in self.held_shards() {
-            let Some(held) = self.held.get(&shard).copied() else {
-                continue;
-            };
-            let mono = self.mono.clone();
-            let until = held.valid_until;
-            let guard = move || mono.elapsed() < until;
-            match self
-                .sealer
-                .flush_shard(ShardId(shard), &guard, &mut out.events)
-                .await
-            {
-                Ok(()) => {}
-                Err(SealerError::LeaseLost(_)) => {
-                    tracing::warn!(shard, "フラッシュの直前にリースの有効期限が切れました");
-                }
-                Err(e) => {
-                    tracing::error!(shard, error = %e, "フラッシュに失敗しました");
-                    out.errors.push(e);
-                }
-            }
             if let Err(e) = self.leases.release(&shard_lease(shard), &owner).await {
                 tracing::warn!(shard, error = %e, "リースの解放に失敗しました");
             } else {
@@ -476,7 +470,7 @@ impl Coordinator {
             }
             self.held.remove(&shard);
         }
-        // 最終アンカー: フラッシュの後の最新の状態を、最後のアンカーが指している状態にする。変化がなければ、
+        // 最終アンカー: 停止時点の最新の状態を、最後のアンカーが指している状態にする。変化がなければ、
         // 確認するだけで、新しいアンカーは作らない。
         if self.anchor_lease.is_some() {
             match self.sealer.finalize_anchor().await {

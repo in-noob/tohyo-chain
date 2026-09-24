@@ -79,6 +79,20 @@ pub fn automatic_transition(
     }
 }
 
+/// 投票が実際に始まった時刻（UNIX 秒）。封印の経過時間の起点に使う（原則9。ADR 0020）。
+///
+/// 票を受け付けるのは「状態が open」かつ「開始時刻 <= 現在時刻」のときだけ（[`vote_gate`]）なので、
+/// 実際の開始は、open に遷移した時刻（`opened_at`）と設定の開始時刻（`period.opens_at`）の遅い方。
+/// まだ open になっていなければ `None`。
+pub fn voting_started_at(period: Period, opened_at: Option<i64>) -> Option<i64> {
+    let opened_at = opened_at?;
+    Some(
+        period
+            .opens_at
+            .map_or(opened_at, |opens_at| opens_at.max(opened_at)),
+    )
+}
+
 /// 投票を受け付けてよいかの判定結果（原則18）。理由ごとに画面・API のメッセージを分ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoteGate {
@@ -198,6 +212,27 @@ mod tests {
         assert_eq!(vote_gate(Open, period, 1_999), VoteGate::Accept);
         // 終了時刻は含まない。
         assert_eq!(vote_gate(Open, period, 2_000), VoteGate::Ended);
+    }
+
+    #[test]
+    fn voting_starts_at_the_later_of_the_transition_and_the_configured_time() {
+        let period = Period {
+            opens_at: Some(1_000),
+            closes_at: Some(2_000),
+        };
+        // まだ open になっていない。
+        assert_eq!(voting_started_at(period, None), None);
+        // 開始時刻ちょうどに自動で open になった。
+        assert_eq!(voting_started_at(period, Some(1_000)), Some(1_000));
+        // open --now で期間前に開けても、受付は開始時刻から（vote_gate）なので、起点も開始時刻。
+        assert_eq!(voting_started_at(period, Some(900)), Some(1_000));
+        // 自動遷移が遅れた（sealer の周期の分）: 起点は実際に open になった時刻。
+        assert_eq!(voting_started_at(period, Some(1_001)), Some(1_001));
+        // 期間の指定がなく、open --now で開けた。
+        assert_eq!(
+            voting_started_at(Period::default(), Some(1_234)),
+            Some(1_234)
+        );
     }
 
     #[test]

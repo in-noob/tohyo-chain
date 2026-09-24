@@ -100,6 +100,7 @@ struct Statements {
     select_election_state: PreparedStatement,
     update_election_period: PreparedStatement,
     update_election_phase: PreparedStatement,
+    update_election_phase_open: PreparedStatement,
     update_election_phase_closing: PreparedStatement,
     insert_election_audit: PreparedStatement,
     select_election_audit: PreparedStatement,
@@ -405,14 +406,14 @@ impl ScyllaStore {
             )
             .await?,
             insert_election_state: p(
-                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, closing_started_at) \
-                 VALUES (?, 'scheduled', ?, ?, null) IF NOT EXISTS"
+                "INSERT INTO {ks}.election_state (scope, phase, opens_at, closes_at, opened_at, closing_started_at) \
+                 VALUES (?, 'scheduled', ?, ?, null, null) IF NOT EXISTS"
                     .into(),
                 quorum,
             )
             .await?,
             select_election_state: p(
-                "SELECT phase, opens_at, closes_at, closing_started_at FROM {ks}.election_state WHERE scope = ?"
+                "SELECT phase, opens_at, closes_at, opened_at, closing_started_at FROM {ks}.election_state WHERE scope = ?"
                     .into(),
                 serial,
             )
@@ -425,6 +426,12 @@ impl ScyllaStore {
             .await?,
             update_election_phase: p(
                 "UPDATE {ks}.election_state SET phase = ? WHERE scope = ? IF phase = ?".into(),
+                quorum,
+            )
+            .await?,
+            update_election_phase_open: p(
+                "UPDATE {ks}.election_state SET phase = ?, opened_at = ? WHERE scope = ? IF phase = ?"
+                    .into(),
                 quorum,
             )
             .await?,
@@ -1155,10 +1162,17 @@ impl LeaseStore for ScyllaStore {
 // 選挙状態（scheduled → open → closing → closed。原則17）
 // ---------------------------------------------------------------------------
 
-fn election_state_row(
-    row: (Option<String>, Option<i64>, Option<i64>, Option<i64>),
-) -> Result<ElectionStateSnapshot, StoreError> {
-    let (phase, opens_at, closes_at, closing_started_at) = row;
+/// `election_state` の 1 行（phase, opens_at, closes_at, opened_at, closing_started_at）。
+type ElectionStateRow = (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn election_state_row(row: ElectionStateRow) -> Result<ElectionStateSnapshot, StoreError> {
+    let (phase, opens_at, closes_at, opened_at, closing_started_at) = row;
     let phase = phase
         .as_deref()
         .and_then(ElectionPhase::parse)
@@ -1169,6 +1183,7 @@ fn election_state_row(
             opens_at,
             closes_at,
         },
+        opened_at,
         closing_started_at,
     })
 }
@@ -1190,6 +1205,7 @@ impl ElectionStateStore for ScyllaStore {
             return Ok(ElectionStateSnapshot {
                 phase: ElectionPhase::Scheduled,
                 period,
+                opened_at: None,
                 closing_started_at: None,
             });
         }
@@ -1222,7 +1238,15 @@ impl ElectionStateStore for ScyllaStore {
             // 原則17: 1 段の順序どおりの遷移だけを許す（呼び出し側の不具合を、ここで止める）。
             return Ok(false);
         }
-        let updated = if to == ElectionPhase::Closing {
+        let updated = if to == ElectionPhase::Open {
+            with_retry("election_state transition", || {
+                self.session.execute_unpaged(
+                    &self.stmts.update_election_phase_open,
+                    (to.as_str(), at_unix_secs, ELECTION_SCOPE, from.as_str()),
+                )
+            })
+            .await?
+        } else if to == ElectionPhase::Closing {
             with_retry("election_state transition", || {
                 self.session.execute_unpaged(
                     &self.stmts.update_election_phase_closing,
@@ -1307,7 +1331,7 @@ impl ScyllaStore {
         })
         .await?;
         let row = rows(result)?
-            .maybe_first_row::<(Option<String>, Option<i64>, Option<i64>, Option<i64>)>()
+            .maybe_first_row::<ElectionStateRow>()
             .map_err(|e| decode_error("選挙状態", e))?
             .ok_or(StoreError::Unavailable)?;
         election_state_row(row)

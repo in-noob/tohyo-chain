@@ -23,21 +23,30 @@ use sealer::{
 };
 
 /// 選挙状態の判定に使う、明示的に進める壁時計。
-struct ManualWall(std::sync::atomic::AtomicU64);
+/// 壁時計。単調時計（`ManualClock`）と一緒に進み（封印の経過時間は壁時計で測るため）、`set` で飛ばせる。
+struct ManualWall {
+    clock: Arc<ManualClock>,
+    offset: std::sync::atomic::AtomicU64,
+}
 
 impl ManualWall {
-    fn new(now: u64) -> Self {
-        Self(std::sync::atomic::AtomicU64::new(now))
+    fn new(clock: Arc<ManualClock>, now: u64) -> Self {
+        let offset = now - clock.elapsed().as_secs();
+        Self {
+            clock,
+            offset: std::sync::atomic::AtomicU64::new(offset),
+        }
     }
 
     fn set(&self, now: u64) {
-        self.0.store(now, Ordering::SeqCst);
+        let offset = now - self.clock.elapsed().as_secs();
+        self.offset.store(offset, Ordering::SeqCst);
     }
 }
 
 impl Clock for ManualWall {
     fn now_unix_secs(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.offset.load(Ordering::SeqCst) + self.clock.elapsed().as_secs()
     }
 }
 
@@ -143,8 +152,8 @@ fn world(shards: u16) -> World {
             NonZeroU16::new(shards).expect("non-zero"),
         )),
         leases: Arc::new(FakeLeases::new(clock.clone())),
+        wall: Arc::new(ManualWall::new(clock.clone(), 1_800_000_000)),
         clock,
-        wall: Arc::new(ManualWall::new(1_800_000_000)),
         signer: Arc::new(Ed25519Signer::from_seed(&[9u8; 32])),
         shards,
     }
@@ -157,7 +166,9 @@ impl World {
             self.signer.clone(),
             self.wall.clone(),
             self.clock.clone(),
-            SealPolicy::new(100, 10).expect("valid policy"),
+            // 最小件数 1: リース・アンカーのテストで、少ない票を時間で封印させるため（最小件数そのものは
+            // domain::seal_policy と sealer のテストが確認する）。
+            SealPolicy::new(100, 10, 1).expect("valid policy"),
             NonZeroU16::new(self.shards).expect("non-zero"),
         )
     }
@@ -181,7 +192,7 @@ impl World {
             },
             anchor_interval,
             // 既存のテストは `ensure_initialized` していないので `Unavailable`（election_duty /
-            // flush_if_closing は no-op）。原則17 のテストは、別途 `store.ensure_initialized` を呼ぶ。
+            // 締切のフラッシュは no-op）。原則17 のテストは、別途 `store.ensure_initialized` を呼ぶ。
             self.store.clone(),
             election_grace,
         )
@@ -463,7 +474,7 @@ async fn another_sealer_takes_over_after_expiry_and_the_chain_stays_linear() {
     assert!(b.step().await.acquired.is_empty());
     w.advance(S(1)); // t=6（以降、b は 2 秒ごとに step する）
     let mut all = Vec::new();
-    let outcomes = drive(&w, &mut [&mut b], 24).await;
+    let outcomes = drive(&w, &mut [&mut b], 70).await;
     for out in &outcomes {
         all.extend(summary(out));
     }
@@ -472,7 +483,8 @@ async fn another_sealer_takes_over_after_expiry_and_the_chain_stays_linear() {
         vec![0, 1],
         "期限切れの後、b が両方のシャードを引き継ぐ"
     );
-    // 引き継いだ（t=10 と t=12）後、窓（10 秒）が満了して、未封印の 40 票が封印される。
+    // 引き継いだ（t=10 と t=12）b は、前回の封印の正確な時刻を知らないので、先頭ブロックの分の最後の秒
+    // （t=59。早くは封印しない側）から 10 秒経った後に、未封印の 40 票を時間で封印する。
     assert_eq!(
         all,
         vec![(0, 2, 40, Trigger::Time), (1, 2, 40, Trigger::Time)]
@@ -498,19 +510,21 @@ async fn another_sealer_takes_over_after_expiry_and_the_chain_stays_linear() {
 // --- 正常停止 ---
 
 #[tokio::test]
-async fn graceful_shutdown_flushes_and_releases_the_leases() {
+async fn graceful_shutdown_releases_the_leases_without_flushing() {
     let w = world(2);
     let (mut a, mut b) = (
         w.coordinator("sealer-a", S(600)),
         w.coordinator("sealer-b", S(600)),
     );
     a.step().await; // shard 0 とアンカー担当
-    w.cast(0, 0, 37).await; // 窓は満了しておらず、件数にも達していない
+    w.cast(0, 0, 37).await; // 間隔は経っておらず、件数にも達していない
 
+    // SIGTERM 相当の停止: フラッシュしない（原則9）。票はストアに残る。
     let out = a.shutdown().await;
-    assert_eq!(summary(&out), vec![(0, 1, 37, Trigger::Flush)]);
+    assert_eq!(summary(&out), vec![]);
     assert!(a.held_shards().is_empty() && !a.holds_anchor_lease());
-    assert_eq!(w.pending(0).await, 0);
+    assert_eq!(w.pending(0).await, 37);
+    assert_eq!(w.head_height(0).await, Some(0));
 
     // 解放されたので、別の sealer が期限を待たずにすぐ取得できる。
     let out = b.step().await;
@@ -721,10 +735,11 @@ async fn the_anchor_chain_continues_when_the_holder_changes() {
     // 正常停止: 解放する。変化がないので、最終アンカーは作らない（最後のアンカーが最新の状態を指している）。
     let out = a.shutdown().await;
     assert!(out.anchors.is_empty());
-    // 新しい票が届くと、担当を引き継いだ b が、続きのアンカーを作る。
+    // 新しい票が届くと、担当を引き継いだ b が（前回の封印を、先頭ブロックの分の最後の秒とみなして、
+    // その 10 秒後に）封印し、続きのアンカーを作る。
     w.cast(0, 3, 2).await;
     let mut second = Vec::new();
-    for out in drive(&w, &mut [&mut b], 24).await {
+    for out in drive(&w, &mut [&mut b], 70).await {
         second.extend(out.anchors);
     }
     assert!(b.holds_anchor_lease(), "アンカー担当を引き継ぐ");
@@ -737,12 +752,14 @@ async fn the_anchor_chain_continues_when_the_holder_changes() {
 async fn shutdown_of_the_anchor_holder_finalizes_only_when_something_changed() {
     let w = world(1);
     let mut a = w.coordinator("sealer-a", S(600));
-    // 間隔（600 秒）はまだ来ない。停止時のフラッシュで封印された票は、最終アンカーで指される。
-    w.cast(0, 0, 4).await;
+    // アンカーの間隔（600 秒）はまだ来ない。件数で封印したブロックを、停止時の最終アンカーが指す。
+    // 残りの 4 票は、停止時にフラッシュしない（原則9）。
+    w.cast(0, 0, 104).await;
     drive(&w, &mut [&mut a], 4).await;
-    assert_eq!(w.head_height(0).await, Some(0), "窓は満了していない");
+    assert_eq!(w.head_height(0).await, Some(1));
     let out = a.shutdown().await;
-    assert_eq!(summary(&out), vec![(0, 1, 4, Trigger::Flush)]);
+    assert_eq!(summary(&out), vec![]);
+    assert_eq!(w.pending(0).await, 4);
     assert_eq!(out.anchors.len(), 1, "変化があったので、最終アンカーを作る");
     let latest = w
         .store

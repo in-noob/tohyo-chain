@@ -35,7 +35,9 @@ check_credgen_and_db_auth() (
     export APP__AUTH__MODE=db
     export APP__DB__NODES="127.0.0.1:${DB_PORT}"
     export APP__SHARD__COUNT=1
-    export APP__SEAL__MAX_INTERVAL_SECS=10
+    # 少ない票（6 票）を時間で封印させて、db_reset の前に「ブロックがある」状態を作るため、最小件数を 1 にする。
+    export APP__SEAL__INTERVAL_SECS=10
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1
     export APP__SEALER__LEASE_TTL_SECS=6
     export APP__SEALER__SIGNING_SEED="0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
     export APP__SESSION__SECRET="auth1-check-secret-0123456789abcdef"
@@ -291,7 +293,7 @@ check_credgen_and_db_auth() (
             -H "Authorization: Bearer ${tok}" -H 'Content-Type: application/json' -d "{\"candidate_id\":\"${c#*/}.c1\"}")"
         [[ "$code" == 201 ]] || fail "投票が 201 ではありません（${code}）"
     done
-    sleep 12 # 窓（10 秒）の満了で封印される
+    sleep 12 # 間隔（10 秒）が経ち、1 件以上あるので封印される
     stop_procs
     [[ "$(count participation)" -ge 6 && "$(count ballot_pool)" != "" ]] || fail "投票データがありません"
     blocks_before="$(count blocks)"

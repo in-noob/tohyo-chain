@@ -20,7 +20,8 @@ keyspace = "vote"
 
 [seal]
 max_ballots = 100
-max_interval_secs = 600
+interval_secs = 600
+min_ballots_after_interval = 10
 
 [sealer]
 lease_ttl_secs = 30

@@ -26,7 +26,7 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 |---|---|---|
 | check_step0.sh | api 起動、GET /healthz が 200 で `{"status":"ok"}`、リクエストログが出る | core.sh#1 |
 | check_step1.sh | verifier demo: 正常チェーンの検証 OK・改ざん検出（MerkleRootMismatch・包含証明失敗）・表（0/100/100/50）・未知のサブコマンドは exit 2 | chain.sh#1 |
-| check_step2.sh | domain::seal_policy の単体テスト（必須ケース 7 件を含む） | core.sh#2 |
+| check_step2.sh | domain::seal_policy の単体テスト（必須ケース 9 件を含む。ADR 0020 で入れ替え） | core.sh#2 |
 | check_step3.sh | dev-tools 無効で /debug/pool が 404 | election.sh#1 |
 | check_step3.sh | ログイン・状態（表示順・固定）・候補者取得・投票 201・再投票 409・対象外 403・名簿にない有権者は空 | election.sh#1 |
 | check_step3.sh | 並列 100 リクエスト（同一 voter・同一投票用紙）で成功ちょうど 1 件（メモリのミューテックス） | election.sh#1 |
@@ -34,16 +34,16 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | check_step4.sh | clippy/test（--features dev-tools）、起動・ジェネシス確認 | chain.sh#2 |
 | check_step4.sh | 250 票投入 → count トリガーで height=1,2（各 100 件）、time トリガーで height=3（50 件）、以降ブロックが増えない | chain.sh#2 |
 | check_step4.sh | verify OK（blocks=4 ballots=250）、/debug/tamper 後は verify NG | chain.sh#2 |
-| check_step4.sh | 30 票投入 → SIGTERM で trigger=flush の 1 ブロック、ログに投票者 ID が出ない | chain.sh#2 |
+| check_step4.sh | 30 票投入 → SIGTERM ではフラッシュしない（ブロックが増えない。ADR 0020 で反転）、ログに投票者 ID が出ない | chain.sh#2 |
 | check_step5.sh | flow モジュールの単体テスト（必須ケース 19 件を含む）、折り返し（wrap-around）が無いことの grep | web.sh#1 |
 | check_step5.sh | flow / error が UI・ブラウザ API に依存しない（原則5） | web.sh#1 |
 | check_step5.sh | wasm 向け clippy | web.sh#1 |
 | check_step5.sh | trunk build --release の成功、dist/ のサイズ | web.sh#3（step15 と統合。下記「除外」参照） |
 | check_step6.sh | DB 起動、専用キースペースへのスキーマ投入（2 回流して冪等性を確認） | chain.sh#4 |
 | check_step6.sh | infra-scylla の統合テスト | chain.sh#4 |
-| check_step6.sh | 起動 1: ジェネシス確認・投票 1 件・並列 100（DB の LWT）・SIGTERM でフラッシュ | chain.sh#4（一部除外。下記参照） |
-| check_step6.sh | 起動 2: 再起動後も投票状態とチェーンが保持される、250 票投入・封印・verify OK | chain.sh#4 |
-| check_step6.sh | 起動 3: 5 票を残して SIGKILL（クラッシュ）→ 再起動 → リース期限切れを待って引き継ぎ → 保持・復旧・verify OK | chain.sh#4 |
+| check_step6.sh | 起動 1: ジェネシス確認・投票 1 件・並列 100（DB の LWT）・SIGTERM ではフラッシュしない（ADR 0020） | chain.sh#4（一部除外。下記参照） |
+| check_step6.sh | 起動 2: 再起動後も投票状態・未封印の票・チェーンが保持される、10 件目で時間による封印（起点は DB の投票開始時刻）、100 件で件数による封印・verify OK | chain.sh#4 |
+| check_step6.sh | 起動 3: 5 票を残して SIGKILL（クラッシュ）→ 再起動 → 5 票を追加 → リース期限切れを待って引き継ぎ → 10 件を時間で封印・保持・復旧・verify OK | chain.sh#4 |
 | check_step7.sh | DB 起動・スキーマ投入、ビルド | chain.sh#5 |
 | check_step7.sh | sealer 2 プロセスで 4 シャードのリースを排他的に取得 | chain.sh#5 |
 | check_step7.sh | api（app.mode=db）起動 → 全シャードのジェネシスが読める | chain.sh#5 |
@@ -65,9 +65,9 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | check_step9.sh | CLAUDE.md に原則 11 の記載がある | docs.sh#2 |
 | check_step9.sh | 全スクリプトの構文（bash -n） | docs.sh#3 |
 | check_step10.sh | 投票 0 件で 60 秒待ってもブロック・アンカーが増えない（skip ログを含む） | chain.sh#3 |
-| check_step10.sh | 1 票投票 → ブロック・アンカーが 1 つ増える、さらに 60 秒待っても増えない・verify OK | chain.sh#3 |
+| check_step10.sh | 10 票（最小件数）投票 → ブロック・アンカーが 1 つ増える、さらに 60 秒待っても増えない・verify OK | chain.sh#3 |
 | check_step10.sh | 変化なしで SIGTERM → 最終アンカーは確認するだけ（作らない） | chain.sh#3 |
-| check_step10.sh | 封印前に SIGTERM → 停止時のフラッシュで封印され、最終アンカーが 1 つ作られる | chain.sh#3 |
+| check_step10.sh | 封印前に SIGTERM → フラッシュしない（ブロックもアンカーも作らない。ADR 0020 で反転） | chain.sh#3 |
 | check_step11.sh | 47 都道府県規模データ（候補者 1 万人以上）の生成・読み込み、合区・比例ブロックの表現 | election.sh#2 |
 | check_step11.sh | 東京 1 区の有権者に、関係する 9 枚だけが表示順で見える、対象外は 403、他県も同様 | election.sh#2 |
 | check_step11.sh | 投票の順番が表示順どおり（先頭の未投票へ進む）、flow の該当テスト、verify | election.sh#2 |
@@ -79,7 +79,7 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | check_step12.sh | db_reset --votes（動作中は拒否・確認なしでは消えない・投票データのみ削除） | auth.sh#1 |
 | check_step12.sh | db_reset --all（認証情報も消える）、production では拒否、memory では案内のみ | auth.sh#1 |
 | check_step13.sh | 決まった投票の投入、未封印が残っていると中止（--allow-interim でも） | chain.sh#6 |
-| check_step13.sh | 締切フラッシュ→締切後の tally が期待値と一致（候補者別・選挙区別・都道府県別・種類別・順位・白票・突合） | chain.sh#6 |
+| check_step13.sh | close --now（締切の手続きのフラッシュ）→締切後の tally が期待値と一致（候補者別・選挙区別・都道府県別・種類別・順位・白票・突合） | chain.sh#6 |
 | check_step13.sh | 締切前は --allow-interim がないと拒否、ありなら中間集計 | chain.sh#6 |
 | check_step13.sh | 改ざんされたブロックは集計を拒否 | chain.sh#6 |
 | check_step14.sh | 30 票投入・3 票ごとに封印、ブロックの一覧のページ送り（新しい順・欠落なし・limit・before_height の境界） | chain.sh#7 |
@@ -98,7 +98,7 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 1. **check_step6.sh「起動 1」の状態一覧・候補者一覧の詳細検証**（有権者に関係する 9 枚だけが表示順で見える・候補者 4 名など）。
    この検証は、api のハンドラ層（`application::VotingService` とルーティング）のロジックで、保存先（メモリ / DB）に依存しない。
    `election.sh`（旧 check_step3）で、メモリ実装に対してすでに同じ内容を検証している。DB 固有の価値がある部分
-   （並列 100 リクエストでの LWT の排他制御、投票 201・再投票 409、SIGTERM でのフラッシュ、再起動後の永続化）は、
+   （並列 100 リクエストでの LWT の排他制御、投票 201・再投票 409、SIGTERM でフラッシュしないこと、再起動後の永続化）は、
    `chain.sh#4` にそのまま残した。
 2. **check_step14.sh の `trunk build --release`**（項目 6）。`web.sh`（旧 check_step5・check_step15）が、
    `crates/web` 全体（ビューアの画面を含む）を 1 回 `trunk build --release` でビルドし、成功を確認している。
@@ -158,6 +158,21 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | `scripts/election.sh` を通した操作: `status` の表示（状態・期間・残り時間・シャードごとの未封印・最後のブロック・監査ログ）、open の間の `schedule` は 409、`close --now` は確認に yes 以外で中止 | election.sh#4 |
 | 投票を並列に投げている最中に `close --now --yes` → 締切の手続き（自動）→ `closed`。受理（201）した票の数 = closed 後のチェーン上の票の数（`verifier tally` の検証・突合。未封印 0 件） | election.sh#4 |
 | `tally` は `closed` のときだけ（open・closing は終了コード 4、`app.env=test` の `--allow-interim` は 2）、closed の後の投票は 403 | election.sh#4 |
+
+## 追記: 封印ルールの改定（ADR 0020）
+
+原則9 の改定（最小件数・投票開始からの経過時間・締切の手続きだけのフラッシュ）に合わせて、次を変えた。
+
+| 項目 | 新 |
+|---|---|
+| 封印ルール（dev の設定 interval=10 秒・min=10）: 9 票は 20 秒待ってもブロックができない → 10 票目ですぐに封印（trigger=time）→ 5 票 → `scripts/election.sh close --now` → trigger=close の 5 件のブロック → closed | chain.sh#8（新規） |
+| `domain::seal_policy` の必須ケースを、新しいルールの 9 件に入れ替え（時刻は引数。実際には待たない） | core.sh#2 |
+| SIGTERM でのフラッシュを前提にした確認（chain#2 の 8、chain#3 の 5、chain#4 の起動 1）を、「SIGTERM ではフラッシュしない」確認に反転 | chain.sh#2・#3・#4 |
+| 「1 票でも時間で封印」を前提にした確認（chain#3 の 2、chain#4 の起動 2・3）を、最小件数（10 票）に合わせて変更 | chain.sh#3・#4 |
+| リースの引き継ぎ（chain#5）・db_reset（auth#1）は、封印ルールそのものを見る確認ではないので、`seal.min_ballots_after_interval=1` にして、少ない票・端数も時間で封印させる | chain.sh#5・auth.sh#1 |
+
+削除した確認: 「0 件で窓が満了したら窓だけリセット」（`ResetWindowOnly`。ルールが「窓のリセットはしない」に変わった）と、
+それを SIGTERM・クラッシュの直前の同期に使っていた「窓をリセットしました」のログ待ち（chain#2・#4）。
 
 ## 再編前後の所要時間
 

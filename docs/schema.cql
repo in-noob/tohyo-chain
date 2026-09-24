@@ -132,13 +132,15 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.cluster_config (
 -- 選挙状態（scheduled → open → closing → closed。原則17）。単一行（scope 固定）。
 -- 初回接続時（スキーマ投入後の init）に、設定の期間を取り込む（INSERT IF NOT EXISTS）。
 -- その後は、この行が正（設定ファイルの期間と食い違っていたら、起動時に警告してこちらを使う）。
--- opens_at / closes_at は UNIX 秒（NULL なら無期限・未指定）。closing_started_at は
+-- opens_at / closes_at は UNIX 秒（NULL なら無期限・未指定）。opened_at は open に遷移した時刻
+-- （封印の経過時間の起点 = 投票開始時刻に使う。原則9。scheduled の間は NULL）。closing_started_at は
 -- closing に遷移した時刻（締切の手続きの待ち時間の起点。closing 以外では NULL）。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.election_state (
   scope              text,
   phase              text,
   opens_at           bigint,
   closes_at          bigint,
+  opened_at          bigint,
   closing_started_at bigint,
   PRIMARY KEY (scope)
 );

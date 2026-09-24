@@ -61,6 +61,7 @@ mod tests {
             Ok(ElectionStateSnapshot {
                 phase: ElectionPhase::Scheduled,
                 period,
+                opened_at: None,
                 closing_started_at: None,
             })
         }
@@ -70,6 +71,7 @@ mod tests {
             Ok(ElectionStateSnapshot {
                 phase: ElectionPhase::Open,
                 period: Period::default(),
+                opened_at: None,
                 closing_started_at: None,
             })
         }

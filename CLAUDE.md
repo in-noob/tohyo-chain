@@ -71,6 +71,13 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    - 上の2つに当てはまらなければ待つ（0件のときも待つ。窓のリセットはしない）
    - 投票終了の手続きの中でだけ、残りを件数に関係なく封印する（1件以上ある場合）。
      SIGTERM で停止するときはフラッシュしない
+   実装（ADR 0020）: 判定は domain::seal_policy の純粋関数（時刻は引数）。結果は SealCount(100) / SealAll / Wait /
+   CloseFlush の 4 つ（decide は投票期間中、decide_close は締切の手続きの中。250 件なら 100・100（count）・50（close））。
+   経過時間の起点 = max(前回の封印時刻, 投票開始時刻)（window_start）。投票開始時刻は domain::voting_started_at
+   （open に遷移した時刻 election_state.opened_at と election.voting_opens_at の遅い方）。時刻は壁時計の UNIX 秒で測る。
+   引き継ぎ・再起動の後は、前回の封印時刻を先頭ブロックの sealed_at_minute の分の最後の秒とみなす（早くは封印しない）。
+   ログの trigger は count | time | close の 3 種類。設定の最小件数が max_ballots より大きい場合は、時間では封印されない。
+   scripts/check/chain.sh#8 が、dev の設定（interval=10 秒・min=10）で確認する。
 10. 確認は scripts/check/<スイート名>.sh にまとめ、scripts/check_all.sh ですべて実行する。
     共通の処理は scripts/lib/common.sh に置く。新しい機能を追加するときは、関係するスイートに
     確認項目を追加する。
@@ -113,9 +120,9 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     票なしの版を保持する）。エラーも no-store。票が非公開の間は、verifier の検証・集計もできない（終了コード 4）。
     scripts/check/chain.sh が確認する（ブラウザでの確認は docs/manual_check_step14.md）。
     集計は verifier tally（scripts/tally.sh。ADR 0016）: 集計の前に、チェーン全体の検証と投票済み記録との突合を必ず
-    行い、失敗したら集計しない（終了コード 3）。未封印の票が残っていたら、件数を表示して中止する（4。締切フラッシュ =
-    sealer の SIGTERM 停止をしてから再実行）。election.voting_closes_at より前（未設定を含む）は --allow-interim がなければ
-    集計しない（4。開発用の設定でだけ使う）。出力は、表と out/tally/{日時（UTC）}/ の CSV・JSON（scripts/check/chain.sh が確認する）。
+    行い、失敗したら集計しない（終了コード 3）。未封印の票が残っていたら、件数を表示して中止する（4。残りの票は締切の
+    手続き（closing）の中でだけ封印されるので、closed を待ってから再実行）。選挙状態が closed より前は --allow-interim が
+    なければ集計しない（4。原則18。--allow-interim は app.env=dev のときだけ）。出力は、表と out/tally/{日時（UTC）}/ の CSV・JSON（scripts/check/chain.sh が確認する）。
 15. パスワードは Argon2id でハッシュ化して保存する。平文はログにもDBにも残さない。
     ログインが失敗したとき、「IDが存在しない」と「パスワードが違う」を応答内容でも
     応答時間でも区別できないようにする。

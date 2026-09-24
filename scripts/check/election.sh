@@ -394,7 +394,7 @@ check_election_lifecycle() (
     # request_timeout_secs は 1 以上）。
     export APP__API__REQUEST_TIMEOUT_SECS=1
     export APP__ELECTION__STATE_CACHE_SECS=1
-    export APP__SEAL__MAX_INTERVAL_SECS=2
+    export APP__SEAL__INTERVAL_SECS=2
 
     LOG="$(mktemp)"
     ADMIN_TMP="$(mktemp)"
@@ -544,7 +544,7 @@ check_close_now() (
     export APP__SHARD__COUNT=4
     # 件数・時間による封印はさせない（締切のフラッシュだけで、全件が最終ブロックに入ることを確かめるため）。
     export APP__SEAL__MAX_BALLOTS=10000
-    export APP__SEAL__MAX_INTERVAL_SECS=600
+    export APP__SEAL__INTERVAL_SECS=600
     # 開始は過去（起動直後に自動で open）、終了は遠い未来（締切は close --now だけが起こす）。
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
     export APP__ELECTION__VOTING_CLOSES_AT="2099-01-01T00:00:00+00:00"

@@ -17,7 +17,7 @@
   export APP__SESSION__SECRET=dev-secret-0123456789abcdef
   export APP__ELECTION__SEED_DIR=/tmp/seed-demo
   export APP__SEAL__MAX_BALLOTS=3            # 3 票ごとにブロックが増える
-  export APP__SEAL__MAX_INTERVAL_SECS=10     # アンカーも 10 秒ごと（変化があれば）
+  export APP__SEAL__INTERVAL_SECS=10         # アンカーも 10 秒ごと（変化があれば）
   export APP__CHAIN__REVEAL_BALLOTS=after_close
   export APP__ELECTION__VOTING_CLOSES_AT=$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)
   cargo run -p api

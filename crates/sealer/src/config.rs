@@ -17,7 +17,7 @@ pub struct SealerConfig {
     pub keyspace: String,
     /// `shard.count`。api と同じ値にする（食い違うと DB が接続を拒否する）。
     pub shard_count: NonZeroU16,
-    /// `seal.max_ballots` / `seal.max_interval_secs`（アンカーの判定の間隔も同じ値）
+    /// `seal.max_ballots` / `seal.interval_secs` / `seal.min_ballots_after_interval`（アンカーの判定の間隔も同じ値）
     pub policy: SealPolicy,
     /// `sealer.signing_seed`（秘密情報。必須、64 桁の hex）。全 sealer で同じ値にする。
     pub signing_seed: [u8; 32],
@@ -85,9 +85,13 @@ impl SealerConfig {
             shard_count: app.shard.count,
             policy: SealPolicy::new(
                 usize::try_from(app.seal.max_ballots).context("seal.max_ballots が大きすぎます")?,
-                app.seal.max_interval_secs,
+                app.seal.interval_secs,
+                usize::try_from(app.seal.min_ballots_after_interval)
+                    .context("seal.min_ballots_after_interval が大きすぎます")?,
             )
-            .context("seal.max_ballots / seal.max_interval_secs が不正です")?,
+            .context(
+                "seal.max_ballots / seal.interval_secs / seal.min_ballots_after_interval が不正です",
+            )?,
             signing_seed,
             sealer_id,
             lease_ttl: Duration::from_secs(app.sealer.lease_ttl_secs),
@@ -132,7 +136,7 @@ mod tests {
         pairs.extend([
             ("shard.count", "4"),
             ("seal.max_ballots", "50"),
-            ("seal.max_interval_secs", "10"),
+            ("seal.interval_secs", "10"),
             ("sealer.id", "sealer-a"),
             ("sealer.lease_ttl_secs", "6"),
             ("db.nodes", "db1:9042,db2:9042"),
@@ -140,7 +144,7 @@ mod tests {
         ]);
         let c = config(&pairs).expect("valid");
         assert_eq!(c.shard_count.get(), 4);
-        assert_eq!(c.policy, SealPolicy::new(50, 10).expect("valid"));
+        assert_eq!(c.policy, SealPolicy::new(50, 10, 10).expect("valid"));
         assert_eq!(c.sealer_id, "sealer-a");
         assert_eq!(c.lease_ttl, Duration::from_secs(6));
         assert_eq!(c.nodes.len(), 2);
@@ -167,7 +171,7 @@ mod tests {
         for extra in [
             ("shard.count", "0"),
             ("seal.max_ballots", "0"),
-            ("seal.max_interval_secs", "x"),
+            ("seal.interval_secs", "x"),
             ("sealer.lease_ttl_secs", "2"),
             ("db.keyspace", "a-b"),
         ] {

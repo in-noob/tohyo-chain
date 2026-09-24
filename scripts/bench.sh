@@ -7,19 +7,19 @@
 #   scripts/bench.sh trickle ...                                             低負荷（time トリガー）の計測
 #
 # 1 構成の流れ: DB を初期化 → sealer・api を起動 → ウォームアップ（低レート）→ 定常負荷測定（固定レート。
-#   sealer が追いつけるレート）→ ドレイン（未封印が 0 になるまで待つ。窓が 600 秒なので最長 約 10 分。
-#   構成に :nodrain を付けると省略）→ 飽和測定（クローズドループ。最後に実施）→ 集計。
+#   sealer が追いつけるレート）→ ドレイン（どのシャードの未封印も seal.min_ballots_after_interval 件未満になる
+#   （= 時間では、もう封印されない）まで待つ。間隔が 600 秒なので最長 約 10 分。構成に :nodrain を付けると省略）→ 飽和測定（クローズドループ。最後に実施）→ 集計。
 #   飽和測定は sealer が追いつけず未封印が積み上がるため、必ず最後に行う（定常・ドレインの計測を壊さない）。
 #   構成の書式: S:sealer数:api数[:nodrain]（例: 4:2:1 は shard.count=4, sealer 2 プロセス, api 1 台）。
 #
 #   scripts/bench.sh trickle [--config S:sealer数:api数] [--rate 件/秒] [--minutes N] [--out DIR]
-#     時間満了（time）トリガーが支配的になる低負荷（1 シャードあたり 100 件/600 秒 未満）の計測。
+#     時間による封印（time）が支配的になる低負荷（1 シャードあたり 100 件/600 秒 未満）の計測。
 #
 # 環境変数（既定値）:
 #   BENCH_WARMUP_SECONDS=20  BENCH_RATE_SECONDS=180（定常）  BENCH_SAT_SECONDS=30  BENCH_STORE_SECONDS=30
 #   BENCH_STEADY_RATE=400  定常負荷のレート（全 api の合計、件/秒）  BENCH_WARMUP_RATE=100
 #   BENCH_CONCURRENCY=128        負荷生成の同時接続数（全 api の合計）
-#   BENCH_MAX_BALLOTS=100  BENCH_INTERVAL_SECS=600  BENCH_LEASE_TTL_SECS=30   （本番相当の封印設定）
+#   BENCH_MAX_BALLOTS=100  BENCH_INTERVAL_SECS=600  BENCH_MIN_BALLOTS=10  BENCH_LEASE_TTL_SECS=30   （本番相当の封印設定）
 #   BENCH_DRAIN_MAX_SECONDS=900  ドレインの待ち時間の上限
 #   CASSANDRA_MAX_HEAP=4G  CASSANDRA_HEAP_NEW=1G     （ペアで指定。計測用の既定）
 #   APP__DB__BACKEND / KEEP_KEYSPACE は scripts/lib/common.sh を参照。設定は、手元の config/local.toml などから分離し、
@@ -58,6 +58,7 @@ STORE_SECS="${BENCH_STORE_SECONDS:-30}"
 CONCURRENCY="${BENCH_CONCURRENCY:-128}"
 MAX_BALLOTS="${BENCH_MAX_BALLOTS:-100}"
 INTERVAL="${BENCH_INTERVAL_SECS:-600}"
+MIN_BALLOTS="${BENCH_MIN_BALLOTS:-10}"
 LEASE_TTL="${BENCH_LEASE_TTL_SECS:-30}"
 DRAIN_MAX="${BENCH_DRAIN_MAX_SECONDS:-900}"
 API_BASE_PORT="${BENCH_API_BASE_PORT:-18100}"
@@ -185,6 +186,15 @@ pending_total() {
     curl -s -m 10 "$1/debug/pool" | sed -n 's/.*"total":\([0-9]*\).*/\1/p'
 }
 
+# どのシャードの未封印も seal.min_ballots_after_interval 件未満か（= 時間では、もう封印されない。原則9）。
+# 残りは締切の手続きの中でだけ封印されるので、ドレインはここまでを待つ。
+pending_drained() {
+    local body
+    body="$(curl -s -m 10 "$1/debug/pool")" || return 1
+    [[ "$body" == *'"shards"'* ]] || return 1
+    ! grep -o '"pending":[0-9]*' <<<"$body" | cut -d: -f2 | awk -v min="$MIN_BALLOTS" '$1 >= min { found = 1 } END { exit !found }'
+}
+
 json_num() { sed -n "s/.*\"$1\": *\\([0-9.]*\\).*/\\1/p" "$2" | head -1; }
 
 # ---------------------------------------------------------------------------
@@ -201,7 +211,7 @@ run_config() {
 {"shards":${shards},"sealers":${sealers},"apis":${apis},"concurrency":${CONCURRENCY},
  "drain":$([[ "$drain_mode" == drain ]] && echo true || echo false),
  "steady_rate":${rate},"warmup_rate":${WARMUP_RATE},
- "max_ballots":${MAX_BALLOTS},"interval_secs":${INTERVAL},"lease_ttl_secs":${LEASE_TTL},
+ "max_ballots":${MAX_BALLOTS},"interval_secs":${INTERVAL},"min_ballots_after_interval":${MIN_BALLOTS},"lease_ttl_secs":${LEASE_TTL},
  "warmup_secs":${WARMUP},"steady_secs":${steady_secs},"sat_secs":${SAT},
  "cassandra_max_heap":"${CASSANDRA_MAX_HEAP}","cassandra_heap_new":"${CASSANDRA_HEAP_NEW}"}
 JSON
@@ -216,7 +226,8 @@ JSON
     dbpid="$(docker inspect -f '{{.State.Pid}}' "$("${COMPOSE[@]}" ps -q "$DB_SERVICE")")"
 
     export APP__APP__MODE=db APP__DB__NODES="$DB_NODE" APP__DB__KEYSPACE="$KS"
-    export APP__SHARD__COUNT="$shards" APP__SEAL__MAX_BALLOTS="$MAX_BALLOTS" APP__SEAL__MAX_INTERVAL_SECS="$INTERVAL"
+    export APP__SHARD__COUNT="$shards" APP__SEAL__MAX_BALLOTS="$MAX_BALLOTS" APP__SEAL__INTERVAL_SECS="$INTERVAL"
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL="$MIN_BALLOTS"
     export APP__SEALER__LEASE_TTL_SECS="$LEASE_TTL" APP__SEALER__SIGNING_SEED="$SEED" APP__SESSION__SECRET="$SECRET"
     # 開始時刻を過去にして、アンカーのリースを持つ sealer が起動直後に自動で open にする（原則17・18）。
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
@@ -275,12 +286,11 @@ JSON
     "${COMPOSE[@]}" exec -T "$DB_SERVICE" nodetool proxyhistograms >"$dir/proxyhistograms-after-steady.txt" 2>&1 || true
 
     if [[ "$drain_mode" == drain ]]; then
-        echo "-- ドレイン（未封印が 0 になるまで。最長 ${DRAIN_MAX} 秒。窓は ${INTERVAL} 秒）"
-        local drain_start drain_end drained=false pending
+        echo "-- ドレイン（どのシャードの未封印も ${MIN_BALLOTS} 件未満になるまで。最長 ${DRAIN_MAX} 秒。間隔は ${INTERVAL} 秒）"
+        local drain_start drain_end drained=false
         drain_start="$(now_ms)"
         while (($(now_ms) - drain_start < DRAIN_MAX * 1000)); do
-            pending="$(pending_total "$first_api")"
-            if [[ "$pending" == 0 ]]; then
+            if pending_drained "$first_api"; then
                 drained=true
                 break
             fi
@@ -301,15 +311,12 @@ JSON
         "${COMPOSE[@]}" exec -T "$DB_SERVICE" nodetool proxyhistograms >"$dir/proxyhistograms-after-sat.txt" 2>&1 || true
     fi
 
-    # 停止: サンプラー → api → sealer。未封印が残っている場合、sealer の正常停止（SIGTERM）は残りを
-    # すべて封印しようとして非常に長くかかるので、SIGKILL で止める（DB はこの後破棄する）。
+    # 停止: サンプラー → api → sealer。sealer の正常停止（SIGTERM）は未封印の票をフラッシュしない（原則9）ので、
+    # 未封印が残っていてもすぐに終わる（DB はこの後破棄する）。
     for pid in "${SAMPLERS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
     SAMPLERS=()
-    local pid left
-    left="$(pending_total "$first_api" || echo 0)"
-    for pid in "${PIDS[@]}"; do
-        if [[ "${left:-0}" -gt 1000 ]]; then kill -KILL "$pid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi
-    done
+    local pid
+    for pid in "${PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
     for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
     PIDS=()
 
@@ -336,7 +343,7 @@ write_environment() {
         echo "docker: $(docker --version)"
         echo "db_backend: ${DB_BACKEND}"
         echo "cassandra_heap: ${CASSANDRA_MAX_HEAP} / ${CASSANDRA_HEAP_NEW}"
-        echo "settings: seal.max_ballots=${MAX_BALLOTS} seal.max_interval_secs=${INTERVAL} sealer.lease_ttl_secs=${LEASE_TTL}"
+        echo "settings: seal.max_ballots=${MAX_BALLOTS} seal.interval_secs=${INTERVAL} seal.min_ballots_after_interval=${MIN_BALLOTS} sealer.lease_ttl_secs=${LEASE_TTL}"
         echo "git: $(git rev-parse --short HEAD 2>/dev/null || echo 'no commits')"
     } >"$out/environment.txt"
 }

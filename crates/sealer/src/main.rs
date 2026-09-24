@@ -1,7 +1,8 @@
 //! 独立した sealer プロセス。リース（TTL 付きの LWT）を取ったシャードだけを封印し、アンカーを作る。
 //!
 //! 複数のプロセスを起動でき、1 つが落ちても、残りがリースの期限切れ後にそのシャードを引き継ぐ。
-//! SIGTERM / SIGINT では、保持しているシャードをフラッシュしてリースを解放してから終了する。
+//! SIGTERM / SIGINT では、票をフラッシュせずに（原則9。残りの封印は締切の手続きの中でだけ行う）、
+//! アンカー担当なら最終アンカーを済ませ、リースを解放してから終了する。
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -75,9 +76,9 @@ async fn main() -> anyhow::Result<()> {
             owner: config.sealer_id.clone(),
             ttl: config.lease_ttl,
         },
-        // アンカーは seal.max_interval_secs ごとに、作るかどうかを判定する（既定 600 秒 = 10 分）。
+        // アンカーは seal.interval_secs ごとに、作るかどうかを判定する（既定 600 秒 = 10 分）。
         // 直前のアンカー以降にどのシャードの先頭ブロックも変わっていなければ、作らない。
-        Duration::from_secs(config.policy.max_interval_secs()),
+        Duration::from_secs(config.policy.interval_secs()),
         store as Arc<dyn ElectionStateStore>,
         config.election_grace,
     );
@@ -86,7 +87,8 @@ async fn main() -> anyhow::Result<()> {
         shards = config.shard_count.get(),
         lease_ttl_secs = config.lease_ttl.as_secs(),
         max_ballots = config.policy.max_ballots(),
-        max_interval_secs = config.policy.max_interval_secs(),
+        interval_secs = config.policy.interval_secs(),
+        min_ballots_after_interval = config.policy.min_ballots_after_interval(),
         "sealer を起動しました"
     );
     let handle = spawn_coordinator(coordinator, DEFAULT_TICK);

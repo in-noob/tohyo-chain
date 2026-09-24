@@ -1,7 +1,10 @@
-//! 封印ロジック本体。判定は `domain::seal_policy` の純粋関数に委ね、ここは状態（窓）と
-//! ストア操作だけを担う。
+//! 封印ロジック本体。判定は `domain::seal_policy` の純粋関数に委ね、ここは状態（前回の封印時刻・
+//! 投票開始時刻）とストア操作だけを担う。
 //!
-//! シャードごとに独立した窓を持ち、シャードごとに**単一の** `Sealer` だけが書き込む前提。
+//! シャードごとに独立して判定し、シャードごとに**単一の** `Sealer` だけが書き込む前提。
+//!
+//! 経過時間の起点は max(前回の封印時刻, 投票開始時刻)（原則9。ADR 0020）。時刻は壁時計の UNIX 秒で測る
+//! （投票開始時刻は、DB の選挙状態に記録された壁時計の時刻なので、同じ時計で比べる）。
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -10,7 +13,7 @@ use std::time::Duration;
 
 use application::{Clock, SealStore, StoreError};
 use domain::anchor::GENESIS_ANCHOR_PREV;
-use domain::seal_policy::{SealDecision, SealPolicy, decide, decide_flush};
+use domain::seal_policy::{SealDecision, SealPolicy, decide, decide_close, window_start};
 use domain::types::unix_minutes;
 use domain::{
     Anchor, AnchorError, HeadsChange, SealError, ShardHead, ShardId, Signer, build_anchor,
@@ -25,10 +28,11 @@ use crate::clock::MonotonicClock;
 pub enum Trigger {
     /// 未封印が `seal.max_ballots` 件に達した。
     Count,
-    /// 窓が `seal.max_interval_secs` 秒経過した。
+    /// 前回の封印（または投票開始）から `seal.interval_secs` 秒以上経ち、未封印が
+    /// `seal.min_ballots_after_interval` 件以上ある。
     Time,
-    /// 選挙締切・正常停止による残りの一括封印。
-    Flush,
+    /// 投票終了（締切の手続き）の中での、残りの封印。
+    Close,
 }
 
 impl fmt::Display for Trigger {
@@ -36,7 +40,7 @@ impl fmt::Display for Trigger {
         f.write_str(match self {
             Self::Count => "count",
             Self::Time => "time",
-            Self::Flush => "flush",
+            Self::Close => "close",
         })
     }
 }
@@ -87,7 +91,7 @@ fn always_valid() -> bool {
     true
 }
 
-/// `tick` / `flush` の結果。一部のシャードが失敗しても、他のシャードの処理は続ける。
+/// `tick` / `close_flush` の結果。一部のシャードが失敗しても、他のシャードの処理は続ける。
 #[derive(Debug, Default)]
 pub struct TickOutcome {
     pub events: Vec<SealEvent>,
@@ -97,13 +101,25 @@ pub struct TickOutcome {
 pub struct Sealer {
     store: Arc<dyn SealStore>,
     signer: Arc<dyn Signer + Send + Sync>,
-    /// ブロックの `sealed_at_minute` 用の壁時計。
+    /// 封印の経過時間の判定と、ブロックの `sealed_at_minute` 用の壁時計（UNIX 秒）。
     wall: Arc<dyn Clock>,
-    /// 窓の経過を測る単調時計。
+    /// リース・アンカーの周期・締切の待ち時間を測る単調時計。
     mono: Arc<dyn MonotonicClock>,
     policy: SealPolicy,
-    /// シャードごとの窓の開始時刻（`mono` の経過時間）。添字がシャード番号。
-    windows: Vec<Duration>,
+    /// シャードごとの、経過時間の起点の材料。添字がシャード番号。
+    shards: Vec<ShardClock>,
+    /// 投票開始時刻（UNIX 秒）。選挙状態が open になるまでは `None`（[`Sealer::set_voting_started_at`]）。
+    voting_started_at: Option<u64>,
+}
+
+/// 1 つのシャードの、経過時間の起点の材料。
+#[derive(Debug, Clone, Copy)]
+struct ShardClock {
+    /// 前回、票を封印した時刻（UNIX 秒）。まだ封印していなければ `None`。
+    last_sealed_at: Option<u64>,
+    /// このシャードを担当し始めた時刻（UNIX 秒）。投票開始時刻が分からない（選挙状態を使わない実行）ときの、
+    /// 投票開始時刻の代わり。
+    taken_at: u64,
 }
 
 impl Sealer {
@@ -115,19 +131,32 @@ impl Sealer {
         policy: SealPolicy,
         shard_count: NonZeroU16,
     ) -> Self {
-        let now = mono.elapsed();
+        let now = wall.now_unix_secs();
         Self {
             store,
             signer,
             wall,
             mono,
             policy,
-            windows: vec![now; usize::from(shard_count.get())],
+            shards: vec![
+                ShardClock {
+                    last_sealed_at: None,
+                    taken_at: now,
+                };
+                usize::from(shard_count.get())
+            ],
+            voting_started_at: None,
         }
     }
 
     fn shards(&self) -> impl Iterator<Item = ShardId> + use<> {
-        (0..self.windows.len() as u16).map(ShardId)
+        (0..self.shards.len() as u16).map(ShardId)
+    }
+
+    /// 投票開始時刻（UNIX 秒）を設定する。呼び出し側（runner / Coordinator）が、選挙状態を読むたびに
+    /// `domain::voting_started_at` の結果を渡す（まだ open でなければ `None`）。
+    pub fn set_voting_started_at(&mut self, started_at: Option<i64>) {
+        self.voting_started_at = started_at.and_then(|t| u64::try_from(t).ok());
     }
 
     /// 現在の単調時計の値。
@@ -142,7 +171,7 @@ impl Sealer {
 
     /// 担当するシャード数。
     pub fn shard_count(&self) -> u16 {
-        self.windows.len() as u16
+        self.shards.len() as u16
     }
 
     /// 壁時計（`wall.now_unix_secs()`）。選挙状態の自動遷移の判定に使う。
@@ -167,7 +196,7 @@ impl Sealer {
     }
 
     /// 全シャードの復旧とジェネシスの作成を行う（プロセス内で全シャードを扱う実行用）。
-    /// 署名鍵も登録する。窓もここから数え始める。
+    /// 署名鍵も登録する。
     pub async fn init(&mut self) -> Result<(), SealerError> {
         self.register_signer().await?;
         for shard in self.shards() {
@@ -179,9 +208,14 @@ impl Sealer {
     /// 1 つのシャードを担当し始めるときの初期化（リースを取得した直後に呼ぶ）。
     ///
     /// 前回の封印の途中（ブロック追加後、プール削除前）で落ちていれば `recover` が票の二重封印を
-    /// 防ぎ、チェーンが既にあればジェネシスは作らない。封印窓もここから数え直す。
+    /// 防ぎ、チェーンが既にあればジェネシスは作らない。
+    ///
+    /// 前回の封印時刻は、チェーンの先頭ブロック（票を含むもの）の `sealed_at_minute` から求める（別のプロセスが
+    /// 封印した後に引き継いだ場合や、再起動した場合）。時刻は分単位に丸めて保存しているので、その分の最後の秒
+    /// （`分 * 60 + 59`）を使う。実際の封印時刻より遅い側に寄せることで、`seal.interval_secs` より早く時間による
+    /// 封印をすることはない（遅れは最大 59 秒）。
     pub async fn init_shard(&mut self, shard: ShardId) -> Result<(), SealerError> {
-        if usize::from(shard.0) >= self.windows.len() {
+        if usize::from(shard.0) >= self.shards.len() {
             return Err(StoreError::InvalidShard.into());
         }
         self.store.recover(shard).await?;
@@ -195,8 +229,21 @@ impl Sealer {
                 Err(e) => return Err(e.into()),
             }
         }
-        let now = self.mono.elapsed();
-        self.reset_window(shard, now);
+        let head = self
+            .store
+            .head(shard)
+            .await?
+            .ok_or(SealerError::NotInitialized(shard.0))?;
+        let last_sealed_at = (head.header.height > 0).then(|| {
+            head.header
+                .sealed_at_minute
+                .saturating_mul(60)
+                .saturating_add(59)
+        });
+        self.shards[usize::from(shard.0)] = ShardClock {
+            last_sealed_at,
+            taken_at: self.wall.now_unix_secs(),
+        };
         Ok(())
     }
 
@@ -215,12 +262,12 @@ impl Sealer {
         outcome
     }
 
-    /// 締切・正常停止時の一括封印（全シャード）。
-    pub async fn flush(&mut self) -> TickOutcome {
+    /// 投票終了（締切の手続き）の中での、残りの封印（全シャード）。SIGTERM での停止では呼ばない（原則9）。
+    pub async fn close_flush(&mut self) -> TickOutcome {
         let mut outcome = TickOutcome::default();
         for shard in self.shards() {
             if let Err(e) = self
-                .flush_shard(shard, &always_valid, &mut outcome.events)
+                .close_flush_shard(shard, &always_valid, &mut outcome.events)
                 .await
             {
                 tracing::error!(shard = shard.0, error = %e, "フラッシュに失敗しました");
@@ -237,60 +284,60 @@ impl Sealer {
         guard: LeaseGuard<'_>,
         events: &mut Vec<SealEvent>,
     ) -> Result<(), SealerError> {
-        if usize::from(shard.0) >= self.windows.len() {
+        let index = usize::from(shard.0);
+        let Some(clock) = self.shards.get(index).copied() else {
             return Err(StoreError::InvalidShard.into());
-        }
-        let now = self.mono.elapsed();
+        };
+        let now = self.wall.now_unix_secs();
+        // 投票開始時刻が分からない（選挙状態を使わない実行）ときは、担当し始めた時刻で代用する。
+        let started_at = self.voting_started_at.unwrap_or(clock.taken_at);
         loop {
             let pending = self.store.pending_len(shard).await?;
-            let elapsed = now.saturating_sub(self.windows[usize::from(shard.0)]);
-            // 経過は Duration の精度で測り、切り捨てた秒を渡す。10 秒の設定なら、
-            // 実際に 10 秒経つまで満了しない（早く満了することはない）。
-            match decide(pending, 0, elapsed.as_secs(), &self.policy) {
+            let start = window_start(self.shards[index].last_sealed_at, started_at);
+            let decision = decide(pending, start, now, &self.policy);
+            let (count, trigger) = match decision {
+                // 0 件のときも待つ。起点（前回の封印時刻）は動かさない（原則9）。
                 SealDecision::Wait => return Ok(()),
-                SealDecision::SealCount(n) => {
-                    events.push(self.seal(shard, n, Trigger::Count, guard).await?);
-                    self.reset_window(shard, now);
-                }
-                SealDecision::SealAll => {
-                    events.push(self.seal(shard, pending, Trigger::Time, guard).await?);
-                    self.reset_window(shard, now);
-                }
-                SealDecision::ResetWindowOnly => {
-                    // 0 件で満了: ブロックは作らず窓だけをリセットする（到着時刻を漏らさない）。
-                    tracing::debug!(shard = shard.0, "窓をリセットしました（未封印 0 件）");
-                    self.reset_window(shard, now);
-                    return Ok(());
-                }
-            }
+                SealDecision::SealCount(n) => (n, Trigger::Count),
+                SealDecision::SealAll => (pending, Trigger::Time),
+                // `decide` は返さない（投票終了の手続きの `decide_close` だけが返す）。
+                SealDecision::CloseFlush => (pending, Trigger::Close),
+            };
+            events.push(self.seal(shard, count, trigger, guard).await?);
+            self.shards[index].last_sealed_at = Some(now);
         }
     }
 
-    /// 1 つのシャードの締切・正常停止時の一括封印。まず通常の判定で件数到達分を封印し、残りを 1 ブロック
-    /// にする（ブロックの票数が `seal.max_ballots` を超えないようにするため）。
-    pub async fn flush_shard(
+    /// 1 つのシャードの、投票終了（締切の手続き）の中での封印。件数や経過時間に関係なく、残りをすべて封印する。
+    /// `seal.max_ballots` 件以上残っていれば、その件数ずつ（trigger=count）、最後の残りを 1 ブロック（trigger=close）
+    /// にする（ブロックの票数が `seal.max_ballots` を超えないようにするため）。0 件なら何もしない。
+    pub async fn close_flush_shard(
         &mut self,
         shard: ShardId,
         guard: LeaseGuard<'_>,
         events: &mut Vec<SealEvent>,
     ) -> Result<(), SealerError> {
-        self.tick_shard(shard, guard, events).await?;
-        let pending = self.store.pending_len(shard).await?;
-        match decide_flush(pending) {
-            SealDecision::SealAll => {
-                events.push(self.seal(shard, pending, Trigger::Flush, guard).await?);
-                let now = self.mono.elapsed();
-                self.reset_window(shard, now);
-            }
-            // 0 件: 空ブロックは作らない。
-            SealDecision::ResetWindowOnly | SealDecision::Wait | SealDecision::SealCount(_) => {}
+        let index = usize::from(shard.0);
+        if index >= self.shards.len() {
+            return Err(StoreError::InvalidShard.into());
         }
-        Ok(())
+        loop {
+            let pending = self.store.pending_len(shard).await?;
+            let (count, trigger) = match decide_close(pending, &self.policy) {
+                SealDecision::Wait => return Ok(()),
+                SealDecision::SealCount(n) => (n, Trigger::Count),
+                SealDecision::CloseFlush => (pending, Trigger::Close),
+                // `decide_close` は返さない。
+                SealDecision::SealAll => (pending, Trigger::Close),
+            };
+            events.push(self.seal(shard, count, trigger, guard).await?);
+            self.shards[index].last_sealed_at = Some(self.wall.now_unix_secs());
+        }
     }
 
     /// 全シャードの head。全シャードにチェーン（head）が揃っていなければ `None`。
     async fn current_heads(&self) -> Result<Option<Vec<ShardHead>>, SealerError> {
-        let mut heads = Vec::with_capacity(self.windows.len());
+        let mut heads = Vec::with_capacity(self.shards.len());
         for shard in self.shards() {
             let Some(block) = self.store.head(shard).await? else {
                 tracing::debug!(
@@ -335,7 +382,7 @@ impl Sealer {
         }
     }
 
-    /// 締切・停止時の最終アンカー。フラッシュの後に呼ぶ。
+    /// 最終アンカー。締切の手続き（フラッシュの後）と、停止時に呼ぶ。
     ///
     /// - 直前のアンカー以降に変化がなければ、「最後のアンカーが最新の状態を指している」ことを確認するだけで、
     ///   新しいアンカーは作らない（[`FinalAnchor::UpToDate`]）。
@@ -406,10 +453,6 @@ impl Sealer {
             "アンカーを作成しました"
         );
         Ok(Some(anchor))
-    }
-
-    fn reset_window(&mut self, shard: ShardId, now: Duration) {
-        self.windows[usize::from(shard.0)] = now;
     }
 
     /// プール先頭（到着順）の `n` 件を 1 ブロックに封印し、プールから削除する。

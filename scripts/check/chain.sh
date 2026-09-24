@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # chain スイート: ハッシュチェーン全般（対応表: docs/testing.md）。
 #   1. verifier demo（正常チェーンの検証・改ざん検出。オフライン）
-#   2. in-process sealer（memory）: 封印トリガー（count/time/flush）・verify・tamper 検出・SIGTERM
+#   2. in-process sealer（memory）: 封印トリガー（count/time）・verify・tamper 検出・SIGTERM ではフラッシュしない
 #   3. 「データに更新がない場合は、ブロックチェーンに何も追加しない」（memory）
 #   4. DB 永続化・復旧: スキーマ投入・infra-scylla の統合テスト・再起動をまたいだ保持・クラッシュからの復旧
 #   5. 複数 sealer のリース引き継ぎ・分岐なし・アンカー
 #   6. verifier tally（集計）
 #   7. ブロックチェーンのビューア API（ページ送り・Cache-Control・reveal_ballots）
+#   8. 封印ルール（原則9。dev の設定 interval=10 秒・min=10）: 9 票は 20 秒待っても封印されない → 10 票目で
+#      すぐに封印 → 5 票 → close --now → trigger=close で 5 件のブロック
 # 4・5・6 は DB（Cassandra/ScyllaDB）を使う。専用のキースペースを使い、共用の vote には触れない。
 # 環境変数（APP__DB__BACKEND / DB_PORT / KEEP_KEYSPACE / STOP_DB）は scripts/lib/common.sh を参照。
 set -euo pipefail
@@ -61,12 +63,12 @@ check_inprocess_sealer() (
     export APP__SESSION__SECRET="chain2-check-secret-0123456789abcdef"
     export APP__SHARD__COUNT=1
     export APP__SEAL__MAX_BALLOTS=100
-    export APP__SEAL__MAX_INTERVAL_SECS=10
+    export APP__SEAL__INTERVAL_SECS=10
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=10
     # 開始時刻を過去にして、起動直後に自動で open にする（原則17・18。このスイートは封印を見るので、
     # 投票の受付期間そのものは確認しない）。
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
-    # sealer=debug: 窓リセット（0 件満了）のログを、SIGTERM 直前の同期に使う。
-    export RUST_LOG="info,sealer=debug,tower_http=warn"
+    export RUST_LOG="info,tower_http=warn"
 
     LOG="$(mktemp)"
     CODES="$(mktemp)"
@@ -132,7 +134,7 @@ check_inprocess_sealer() (
     wait_for_log 'shard=0 height=2 count=100 trigger=count' 2000 "$LOG" || fail "height=2 が 2 秒以内に封印されません"
     echo "height=1,2: OK"
 
-    echo "== 4. 12 秒以内に height=3（50 件, trigger=time）"
+    echo "== 4. 12 秒以内に height=3（50 件（最小件数 10 以上）, trigger=time）"
     elapsed_since_injection() { echo $(($(now_ms) - INJECTED_AT)); }
     wait_for_log 'shard=0 height=3 count=50 trigger=time' $((12000 - $(elapsed_since_injection))) "$LOG" \
         || fail "height=3 が投入完了から 12 秒以内に封印されません"
@@ -160,25 +162,14 @@ check_inprocess_sealer() (
     [[ "$VERIFY_RC" -eq 3 ]] || fail "改ざん後の verify が exit 3 ではありません (exit=${VERIFY_RC})"
     [[ "$VERIFY_OUT" == *'検証 NG'* ]] || fail "「検証 NG」が出力されていません"
 
-    echo "== 8. 30 票を投票して SIGTERM → trigger=flush で 30 件のブロック"
-    TOKENS=()
-    for i in $(seq 501 530); do
-        TOKENS+=("$(login "voter-${i}")")
-    done
-    # 窓は 10 秒ごとにリセットされる。投票中に窓が満了して trigger=time になるのを避けるため、
-    # 窓が今リセットされた直後（次の満了まで約 10 秒ある）に投票して SIGTERM を送る。
-    resets_before="$({ grep -c '窓をリセットしました' "$LOG" || true; })"
-    until [[ "$({ grep -c '窓をリセットしました' "$LOG" || true; })" -gt "$resets_before" ]]; do
-        sleep 0.1
-    done
-    for i in $(seq 0 29); do
-        printf '%s %s\n' "$((501 + i))" "${TOKENS[$i]}"
-    done | xargs -P 30 -L 1 bash -c 'seed_vote "$0" 1 "$1"' >"$CODES"
+    echo "== 8. 30 票を投票して SIGTERM → フラッシュしない（原則9。残りの封印は締切の手続きの中でだけ）"
+    seq 501 530 | xargs -P 30 -I{} bash -c 'inject {}' >"$CODES"
     [[ "$({ grep -c '^201$' "$CODES" || true; })" == 30 ]] || fail "30 票が受理されていません"
+    # 30 件 >= 最小件数 10 だが、前回の封印（height=3）から 10 秒経つ前に止める。
     graceful_stop api
-    grep -Eq 'shard=0 height=4 count=30 trigger=flush' "$LOG" \
-        || fail "SIGTERM 後に trigger=flush で 30 件のブロックができていません"
-    echo "flush: OK"
+    if grep -Eq 'shard=0 height=4 ' "$LOG"; then fail "SIGTERM で停止したときに、ブロックが作られました"; fi
+    grep -aq '未封印の票はフラッシュせずに残します' "$LOG" || fail "停止時に、フラッシュしない旨のログがありません"
+    echo "SIGTERM: フラッシュしない（ブロックは増えない）: OK"
 
     # 秘密投票: ログに投票者 ID が出ていないこと（原則1）
     if grep -Eq 'voter-[0-9]' "$LOG"; then
@@ -198,7 +189,8 @@ check_no_append_without_change() (
     export APP__SESSION__SECRET="chain3-check-secret-0123456789abcdef"
     export APP__SHARD__COUNT=1
     export APP__SEAL__MAX_BALLOTS=100
-    export APP__SEAL__MAX_INTERVAL_SECS=10
+    export APP__SEAL__INTERVAL_SECS=10
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=10
     export APP__API__PORT="$PORT"
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
     # sealer=debug: アンカーを作らなかったときの skip のログを検査する。
@@ -261,7 +253,7 @@ check_no_append_without_change() (
 
     TMP_BODY="$(mktemp)"
     SEED_TMP="$(mktemp -d)"
-    seed_generate "$SEED_TMP" 5
+    seed_generate "$SEED_TMP" 15
 
     echo "== 1. 投票 0 件で 60 秒待つ: ブロックもアンカーも増えない"
     start_api
@@ -276,21 +268,21 @@ check_no_append_without_change() (
     [[ "$skips_idle" -ge 4 ]] || fail "DEBUG ログに skip が出ていません（${skips_idle} 件。60 秒で 5〜6 回のはず）"
     echo "60 秒間、ブロック 0・アンカー 0（skip のログ ${skips_idle} 件）: OK"
 
-    echo "== 2. 1 票投票する: ブロックが 1 つ、アンカーが 1 つ増える"
-    vote_once 1
+    echo "== 2. 10 票（最小件数）投票する: ブロックが 1 つ、アンカーが 1 つ増える"
+    for n in $(seq 1 10); do vote_once "$n"; done
     deadline=$((SECONDS + 40))
     until [[ "$(chain_height)" == 1 && "$(anchor_seq)" == 1 ]]; do
-        ((SECONDS < deadline)) || fail "1 票の投票から 40 秒以内に、ブロック 1・アンカー 1 になりません（高さ=$(chain_height) seq=$(anchor_seq)）"
+        ((SECONDS < deadline)) || fail "10 票の投票から 40 秒以内に、ブロック 1・アンカー 1 になりません（高さ=$(chain_height) seq=$(anchor_seq)）"
         sleep 1
     done
-    expect_state 1 1 "1 票の投票後"
+    expect_state 1 1 "10 票の投票後"
     echo "ブロックが 1 つ（高さ 1）、アンカーが 1 つ（seq=1）に増えた: OK"
 
     echo "== 3. さらに 60 秒待つ: 増えない。verify が OK"
     skips_before="$(log_count 'アンカーの作成を skip しました')"
     for i in 1 2 3 4 5 6; do
         sleep 10
-        expect_state 1 1 "1 票の後、さらに $((i * 10)) 秒後"
+        expect_state 1 1 "10 票の後、さらに $((i * 10)) 秒後"
     done
     [[ "$(log_count 'ブロックを封印しました')" == 1 ]] || fail "封印のログが 1 件ではありません"
     [[ "$(log_count 'アンカーを作成しました')" == 1 ]] || fail "アンカー作成のログが 1 件ではありません"
@@ -303,8 +295,8 @@ check_no_append_without_change() (
     VERIFY_RC=$?
     set -e
     echo "$VERIFY_OUT"
-    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'1 シャード, 2 ブロック, 1 票'* && "$VERIFY_OUT" == *'アンカー: seq=1'* ]] \
-        || fail "verify が OK ではないか、内容が想定と異なります（1 シャード・2 ブロック（ジェネシス含む）・1 票・アンカー seq=1）(exit=${VERIFY_RC})"
+    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'1 シャード, 2 ブロック, 10 票'* && "$VERIFY_OUT" == *'アンカー: seq=1'* ]] \
+        || fail "verify が OK ではないか、内容が想定と異なります（1 シャード・2 ブロック（ジェネシス含む）・10 票・アンカー seq=1）(exit=${VERIFY_RC})"
 
     echo "== 4. 変化なしで SIGTERM: 最終アンカーは、最新の状態を指していることを確認するだけ（作らない）"
     stop_api
@@ -314,14 +306,13 @@ check_no_append_without_change() (
     [[ "$(log_count 'ブロックを封印しました')" == 1 ]] || fail "変化がないのに、停止時にブロックが作られました"
     echo "停止時: 最終アンカーは確認のみ（アンカー 1・ブロック 1 のまま）: OK"
 
-    echo "== 5. 封印される前に SIGTERM: 停止時のフラッシュで封印され、最終アンカーが 1 つ作られる"
+    echo "== 5. 封印される前に SIGTERM: フラッシュしない（原則9）。ブロックもアンカーも作らない"
     start_api
-    vote_once 2
+    vote_once 11
     stop_api
-    grep -aq 'height=1 count=1 trigger=flush' "$LOG" || fail "停止時のフラッシュで 1 件のブロックができていません"
-    [[ "$(log_count 'アンカーを作成しました')" == 1 ]] || fail "停止時の最終アンカーが 1 つ作られていません"
-    grep -aq 'アンカーを作成しました seq=1 ' "$LOG" || fail "最終アンカーの seq が 1 ではありません"
-    echo "停止時: フラッシュで封印 → 最終アンカーを 1 つ作成: OK"
+    [[ "$(log_count 'ブロックを封印しました')" == 0 ]] || fail "停止時にブロックが作られました（SIGTERM ではフラッシュしない）"
+    [[ "$(log_count 'アンカーを作成しました')" == 0 ]] || fail "ブロックが増えていないのに、停止時にアンカーが作られました"
+    echo "停止時: フラッシュせず、ブロック 0・アンカー 0: OK"
 
     echo "OK: chain#3 no-append-without-change"
 )
@@ -346,6 +337,7 @@ check_db_persistence() (
     export APP__DB__NODES="127.0.0.1:${DB_PORT}"
     export APP__SHARD__COUNT=1
     export APP__SEAL__MAX_BALLOTS=100
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=10
     export APP__SEALER__SIGNING_SEED="0707070707070707070707070707070707070707070707070707070707070707"
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
     export RUST_LOG="info,sealer=debug,tower_http=warn"
@@ -388,11 +380,11 @@ check_db_persistence() (
 
     # start_api INTERVAL_SECS LABEL: sealer（独立プロセス）と api を起動する。
     start_api() {
-        echo "=== 起動: $2（seal.max_interval_secs=$1）" >>"$LOG"
+        echo "=== 起動: $2（seal.interval_secs=$1）" >>"$LOG"
         SEALER_SEQ=$((SEALER_SEQ + 1))
         # sealer と api で、同じログファイルを共有し、再起動をまたいで追記する（起動 1〜3 を通して、
         # 累積したログに対して grep する。fail() がそのまま末尾を表示できるよう、1 つのファイルにまとめる）。
-        spawn_append sealer "$LOG" env "APP__SEAL__MAX_INTERVAL_SECS=$1" "APP__SEALER__ID=chain4-sealer-${SEALER_SEQ}" ./target/debug/sealer
+        spawn_append sealer "$LOG" env "APP__SEAL__INTERVAL_SECS=$1" "APP__SEALER__ID=chain4-sealer-${SEALER_SEQ}" ./target/debug/sealer
         spawn_append api "$LOG" env "APP__API__PORT=${PORT}" ./target/debug/api
         wait_healthz "$BASE" 20 api || fail "${BASE}/healthz が応答しません（$2）"
         # sealer がシャード 0 のリースを取り、チェーン（ジェネシス）が読めるようになるまで待つ
@@ -430,7 +422,7 @@ check_db_persistence() (
     grep -E '^test result: .* [1-9][0-9]* passed' <<<"$it_out" | head -1
 
     # -----------------------------------------------------------------------
-    echo "== 3. 起動 1（封印間隔 600 秒）: DB 固有の並列書き込み（LWT）とフラッシュ"
+    echo "== 3. 起動 1（封印間隔 600 秒）: DB 固有の並列書き込み（LWT）と、SIGTERM ではフラッシュしないこと"
     # ログイン・状態一覧・候補者一覧の詳細な検証は、保存先に依存しないアプリケーション層のロジックであり、
     # election.sh（旧 check_step3）ですでに検証済みなので、ここでは行わない（docs/testing.md の「除外した項目」を参照）。
     # ここで見るのは、DB 固有の並列書き込み（Cassandra の LWT）が排他制御として機能すること。
@@ -464,10 +456,11 @@ check_db_persistence() (
     [[ "$(pool_total)" == 2 ]] || fail "並列投票後の /debug/pool の total が 2 ではありません: ${BODY}"
     echo "並列 100 リクエスト（DB の LWT）: 201=1, 409=99, プール 2 件: OK"
 
-    echo "-- SIGTERM（api → sealer）: sealer はフラッシュしてリースを解放してから終了する"
+    echo "-- SIGTERM（api → sealer）: sealer はフラッシュせずに（原則9）、リースを解放して終了する"
     stop_api_gracefully
-    grep -Eq 'shard=0 height=1 count=2 trigger=flush' "$LOG" || fail "SIGTERM 後に trigger=flush で 2 件のブロックができていません"
-    echo "flush: OK"
+    if grep -aq 'ブロックを封印しました' "$LOG"; then fail "SIGTERM で停止したときに、ブロックが作られました"; fi
+    grep -aq 'リースを解放しました' "$LOG" || fail "SIGTERM 後に、リースを解放していません"
+    echo "SIGTERM: フラッシュしない（ブロック 0）・リースを解放: OK"
 
     head_json() {
         request GET /api/v1/chains/0/head
@@ -475,12 +468,12 @@ check_db_persistence() (
     }
 
     # -----------------------------------------------------------------------
-    echo "== 4. 起動 2（封印間隔 10 秒）: 再起動後の保持"
+    echo "== 4. 起動 2（封印間隔 10 秒・最小 10 件）: 再起動後の保持と、投票開始（DB）からの経過時間"
     start_api 10 "起動 2（再起動）"
     head_json
-    [[ "$(field height)" == 1 && "$(field ballot_count)" == 2 ]] || fail "再起動後のチェーンが保持されていません（高さ 1・2 票のはず）: ${BODY}"
+    [[ "$(field height)" == 0 ]] || fail "SIGTERM で止めたので、ブロックは無いはずです: ${BODY}"
     [[ "$(field signer_public_key)" == "$PUBLIC_KEY" ]] || fail "再起動で署名の公開鍵が変わりました"
-    HEAD1_HASH="$(field block_hash)"
+    [[ "$(pool_total)" == 2 ]] || fail "SIGTERM 前の未封印の 2 票が、DB に保持されていません: ${BODY}"
 
     ALICE="$(login "voter-${ALICE_NO}")"
     request GET /api/v1/ballot-status "$ALICE"
@@ -488,48 +481,45 @@ check_db_persistence() (
         || fail "再起動後に投票状況が保持されていません: ${BODY}"
     request POST "/api/v1/contests/${SEED_ID}/${ALICE_DISTRICT}/vote" "$ALICE" "{\"candidate_id\":\"${ALICE_DISTRICT}.c4\"}"
     expect_status 409 "再起動後の再投票"
-    [[ "$(pool_total)" == 0 ]] || fail "封印済みの票がプールに残っています: ${BODY}"
-    run_verify --public-key "$PUBLIC_KEY"
-    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'検証 OK'* ]] || { echo "$VERIFY_OUT" >&2; fail "再起動後の verify が OK ではありません (exit=${VERIFY_RC})"; }
-    echo "再起動後: 投票状況・チェーン・公開鍵の保持 / 再投票 409 / verify OK"
+    echo "再起動後: 未封印の 2 票・投票状況・公開鍵の保持 / 再投票 409: OK"
 
-    seq 1 250 | xargs -P 25 -I{} bash -c 'inject {}' >"$CODES"
-    [[ "$(wc -l <"$CODES" | tr -d ' ')" == 250 && "$({ grep -vc '^201$' "$CODES" || true; })" == 0 ]] \
-        || fail "250 票がすべて 201 ではありません"
-    INJECTED_AT="$(now_ms)"
-    echo "投入完了: 250 件すべて 201"
+    # 経過時間の起点は投票開始（起動 1 で open になった時刻。DB の選挙状態に記録）。9 件（2 + 7）のまま、
+    # 投票開始から 10 秒以上待っても封印されない（最小件数 10 に届かない）。10 件目が届くと、すぐに封印される。
+    for n in $(seq 1 7); do
+        [[ "$(inject "$n")" == 201 ]] || fail "投票が 201 ではありません（voter-${n}）"
+    done
+    sleep 12
+    if grep -aq 'ブロックを封印しました' "$LOG"; then fail "9 件で封印されました（最小件数は 10）"; fi
+    [[ "$(inject 8)" == 201 ]] || fail "投票が 201 ではありません（voter-8）"
+    wait_for_log 'shard=0 height=1 count=10 trigger=time' 3000 "$LOG" \
+        || fail "10 件目で、すぐに（投票開始から 10 秒以上経っているので）封印されません"
+    echo "9 件は 12 秒待っても封印されない → 10 件目で height=1（10 件, trigger=time。起点は DB の投票開始時刻）: OK"
+    head_json
+    HEAD1_HASH="$(field block_hash)"
 
-    wait_for_log 'shard=0 height=2 count=100 trigger=count' 2000 "$LOG" || fail "height=2 が 2 秒以内に封印されません"
-    wait_for_log 'shard=0 height=3 count=100 trigger=count' 2000 "$LOG" || fail "height=3 が 2 秒以内に封印されません"
-    echo "height=2,3（各 100 件, trigger=count）: OK"
-    wait_for_log 'shard=0 height=4 count=50 trigger=time' $((12000 - $(now_ms) + INJECTED_AT)) "$LOG" \
-        || fail "height=4 が投入完了から 12 秒以内に封印されません"
-    echo "height=4（50 件, trigger=time）: OK（投入完了から $(($(now_ms) - INJECTED_AT)) ms）"
+    # 件数による封印: 100 件に達したら、すぐに 100 件で封印する。
+    seq 101 200 | xargs -P 25 -I{} bash -c 'inject {}' >"$CODES"
+    [[ "$(wc -l <"$CODES" | tr -d ' ')" == 100 && "$({ grep -vc '^201$' "$CODES" || true; })" == 0 ]] \
+        || fail "100 票がすべて 201 ではありません"
+    wait_for_log 'shard=0 height=2 count=100 trigger=count' 3000 "$LOG" || fail "height=2 が 100 件で封印されません"
+    echo "height=2（100 件, trigger=count）: OK"
 
     sleep 25
-    if grep -Eq 'shard=0 height=5 ' "$LOG"; then fail "25 秒待つ間に新しいブロックができました"; fi
+    if grep -Eq 'shard=0 height=3 ' "$LOG"; then fail "25 秒待つ間に新しいブロックができました（未封印 0 件）"; fi
     head_json
-    [[ "$(field height)" == 4 ]] || fail "head の高さが 4 のままではありません: ${BODY}"
-    HEAD4_HASH="$(field block_hash)"
+    [[ "$(field height)" == 2 ]] || fail "head の高さが 2 のままではありません: ${BODY}"
+    HEAD2_HASH="$(field block_hash)"
     echo "25 秒待っても新しいブロックなし: OK"
 
     run_verify --public-key "$PUBLIC_KEY"
     echo "$VERIFY_OUT"
-    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'blocks=5 ballots=252'* ]] \
-        || fail "verify が OK ではないか、ブロック数・票数が想定と異なります（5 ブロック・252 票）(exit=${VERIFY_RC})"
+    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'blocks=3 ballots=110'* ]] \
+        || fail "verify が OK ではないか、ブロック数・票数が想定と異なります（3 ブロック・110 票）(exit=${VERIFY_RC})"
 
     # -----------------------------------------------------------------------
     echo "== 5. 起動 2 → クラッシュ（SIGKILL）→ 起動 3: プールの票の保持と復旧"
-    # 窓が今リセットされた直後（次の満了まで約 10 秒）に 5 票を入れ、封印される前にクラッシュさせる。
-    TOKENS=()
-    for i in $(seq 1 5); do
-        TOKENS+=("$(login "voter-$((1010 + i))")")
-    done
-    resets_before="$({ grep -c '窓をリセットしました' "$LOG" || true; })"
-    until [[ "$({ grep -c '窓をリセットしました' "$LOG" || true; })" -gt "$resets_before" ]]; do sleep 0.1; done
-    for i in $(seq 1 5); do
-        printf '%s %s\n' "$((1010 + i))" "${TOKENS[$((i - 1))]}"
-    done | xargs -P 5 -L 1 bash -c 'seed_vote "$0" 1 "$1"' >"$CODES"
+    # 5 票（最小件数 10 未満なので、時間では封印されない）を入れて、クラッシュさせる。
+    seq 1011 1015 | xargs -P 5 -I{} bash -c 'inject {}' >"$CODES"
     [[ "$({ grep -c '^201$' "$CODES" || true; })" == 5 ]] || fail "5 票が受理されていません"
     [[ "$(pool_total)" == 5 ]] || fail "クラッシュ前のプールが 5 件ではありません: ${BODY}"
 
@@ -555,19 +545,22 @@ check_db_persistence() (
     request POST "/api/v1/contests/${SEED_ID}/${CRASH1_DISTRICT}/vote" "$CRASH1" "{\"candidate_id\":\"${CRASH1_DISTRICT}.c1\"}"
     expect_status 409 "クラッシュ前に投票した人の再投票"
     head_json
-    [[ "$(field height)" == 4 && "$(field block_hash)" == "$HEAD4_HASH" ]] \
+    [[ "$(field height)" == 2 && "$(field block_hash)" == "$HEAD2_HASH" ]] \
         || fail "クラッシュ後にチェーンの先頭が変わっています: ${BODY}"
     request GET /api/v1/chains/0/blocks/1
     [[ "$(field block_hash)" == "$HEAD1_HASH" ]] || fail "再起動をまたいで既存のブロックのハッシュが変わりました"
     echo "クラッシュ後: プール 5 票・投票状況・チェーンが保持されている OK"
 
-    # クラッシュした sealer のリース（TTL 6 秒）の期限切れ → 引き継ぎ → 窓（10 秒）の満了、を待つ。
-    wait_for_log 'shard=0 height=5 count=5 trigger=time' 40000 "$LOG" || fail "クラッシュ後にプールの 5 票が封印されません"
+    # さらに 5 票で最小件数（10）に達する。クラッシュした sealer のリース（TTL 6 秒）の期限切れ → 引き継ぎ →
+    # 前回の封印（引き継いだ sealer は、先頭ブロックの分の最後の秒とみなす。最大 59 秒遅い側）から 10 秒、を待つ。
+    seq 1016 1020 | xargs -P 5 -I{} bash -c 'inject {}' >"$CODES"
+    [[ "$({ grep -c '^201$' "$CODES" || true; })" == 5 ]] || fail "追加の 5 票が受理されていません"
+    wait_for_log 'shard=0 height=3 count=10 trigger=time' 90000 "$LOG" || fail "クラッシュ後にプールの 10 票が封印されません"
     [[ "$(pool_total)" == 0 ]] || fail "封印後にプールが空になっていません: ${BODY}"
     run_verify --public-key "$PUBLIC_KEY"
     echo "$VERIFY_OUT"
-    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'blocks=6 ballots=257'* ]] \
-        || fail "最終の verify が OK ではありません（6 ブロック・257 票のはず）(exit=${VERIFY_RC})"
+    [[ "$VERIFY_RC" -eq 0 && "$VERIFY_OUT" == *'blocks=4 ballots=120'* ]] \
+        || fail "最終の verify が OK ではありません（4 ブロック・120 票のはず）(exit=${VERIFY_RC})"
     stop_api_gracefully
 
     # 完全修飾テーブル名を使っているので、Cassandra の「USE <keyspace> with prepared statements」の警告は出ないはず。
@@ -596,7 +589,10 @@ check_multi_sealer() (
     export APP__DB__NODES="127.0.0.1:${DB_PORT}"
     export APP__SHARD__COUNT=4
     export APP__SEAL__MAX_BALLOTS=100
-    export APP__SEAL__MAX_INTERVAL_SECS=10
+    export APP__SEAL__INTERVAL_SECS=10
+    # このスイートはリースの引き継ぎを見る。投入後の残り（シャードごとの端数）が最小件数未満で残ると
+    # 「全票が封印される」を待てないので、最小件数を 1 にする（最小件数そのものは chain#8 が確認する）。
+    export APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1
     export APP__SEALER__LEASE_TTL_SECS=6
     export APP__SEALER__SIGNING_SEED="0808080808080808080808080808080808080808080808080808080808080808"
     export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
@@ -799,7 +795,7 @@ check_multi_sealer() (
     [[ "$VERIFY_OUT" == *'ballot_id の重複: なし OK'* ]] || fail "ballot_id の重複の確認が OK ではありません"
     grep -Eq 'アンカー: seq=[0-9]+ shards=4 OK' <<<"$VERIFY_OUT" || fail "アンカーの検証が OK ではありません"
 
-    echo "== 10. 正常停止（SIGTERM: api → sealer）: フラッシュしてリースを解放"
+    echo "== 10. 正常停止（SIGTERM: api → sealer）: フラッシュせずに（原則9）リースを解放"
     graceful_stop api
     graceful_stop sealer-b
     released="$({ grep -ac 'リースを解放しました' "$(log_of sealer-b)" || true; })"
@@ -840,9 +836,9 @@ check_tally() (
     export APP__DB__NODES="127.0.0.1:${DB_PORT}"
     export APP__SHARD__COUNT=2
     export APP__SEAL__MAX_BALLOTS=1000
-    # 時間による封印はさせない（投入中に時間切れで封印されると、未封印の確認（3節）が不安定になる）。
-    # 未封印 0 件は、closing の自動フラッシュ（4節）で作る。
-    export APP__SEAL__MAX_INTERVAL_SECS=600
+    # 時間による封印はさせない（投入中に時間で封印されると、未封印の確認（3節）が不安定になる）。
+    # 未封印 0 件は、closing の自動フラッシュ（4節。投票終了の手続き）で作る。
+    export APP__SEAL__INTERVAL_SECS=600
     export APP__SEALER__LEASE_TTL_SECS=6
     export APP__SEALER__SIGNING_SEED="0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
     export APP__SESSION__SECRET="chain6-check-secret-0123456789abcdef"
@@ -942,7 +938,7 @@ check_tally() (
     run_tally
     [[ "$RC" == 4 ]] || fail "未封印の票があるのに、終了コード 4 ではありません（${RC}）: ${TALLY_OUT}"
     [[ "$TALLY_OUT" == *"未封印の票が ${TOTAL_VOTES} 件"* ]] || fail "未封印の件数が表示されていません: ${TALLY_OUT}"
-    [[ "$TALLY_OUT" == *"SIGTERM"* && "$TALLY_OUT" == *"締切フラッシュ"* ]] || fail "締切フラッシュの案内がありません: ${TALLY_OUT}"
+    [[ "$TALLY_OUT" == *"投票終了の手続き"* && "$TALLY_OUT" == *"close --now"* ]] || fail "投票終了の手続きの案内がありません: ${TALLY_OUT}"
     [[ "$TALLY_OUT" == *"検証 OK"* ]] || fail "未封印の確認の前に、検証と突合が行われていません: ${TALLY_OUT}"
     [[ "$(out_dirs)" == 0 ]] || fail "中止したのに、出力ディレクトリができています"
     run_tally --allow-interim
@@ -1085,7 +1081,7 @@ check_viewer_api() (
     export APP__SESSION__SECRET="chain7-check-secret-0123456789abcdef"
     export APP__SHARD__COUNT=1
     export APP__SEAL__MAX_BALLOTS=3
-    export APP__SEAL__MAX_INTERVAL_SECS=10
+    export APP__SEAL__INTERVAL_SECS=10
     export APP__API__PORT="$PORT"
     export APP__CHAIN__REVEAL_BALLOTS=after_close
     # 選挙状態（原則17・18）の開始時刻は過去にして、起動直後に自動で open にする。このスイートが見る
@@ -1209,6 +1205,105 @@ check_viewer_api() (
     echo "OK: chain#7 ブロックチェーンのビューア API"
 )
 
+# ===========================================================================
+# 8. 封印ルール（原則9。memory。ADR 0020）
+# ===========================================================================
+# dev の設定（config/dev.toml: seal.interval_secs=10・seal.min_ballots_after_interval=10）で、
+#   9 票 → 20 秒待ってもブロックができない → 10 票目 → すぐに封印される（trigger=time）→
+#   5 票 → scripts/election.sh close --now → 締切の手続きの中で trigger=close の 5 件のブロック
+# を確認する。設定は、手元の config/local.toml の影響を受けないよう、config/dev.toml だけを一時ディレクトリに写して使う。
+check_seal_rules() (
+    set -euo pipefail
+    PORT="${CHECK_API_PORT:-18807}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18907}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="chain8-check-admin-token-0123456789abcdef"
+    export BASE
+
+    TMP="$(mktemp -d)"
+    LOG="$TMP/api.log"
+    mkdir -p "$TMP/config"
+    cp config/dev.toml "$TMP/config/dev.toml"
+    export APP_CONFIG_DIR="$TMP/config"
+    export APP__APP__ENV=dev
+    export APP__SESSION__SECRET="chain8-check-secret-0123456789abcdef"
+    export APP__API__PORT="$PORT"
+    export APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}"
+    export APP__ADMIN__TOKEN="$ADMIN_TOKEN"
+    # 締切の手続きの待ち時間（state_cache_secs + request_timeout_secs）を短くして、確認を速くする。
+    export APP__ELECTION__STATE_CACHE_SECS=1
+    export APP__API__REQUEST_TIMEOUT_SECS=1
+    export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
+    export RUST_LOG="info,tower_http=warn"
+
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        rm -rf "$TMP"
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        if [[ -s "$LOG" ]]; then
+            echo "--- api log（末尾）---" >&2
+            tail -n 30 "$LOG" >&2
+        fi
+        exit 1
+    }
+
+    vote_once() {
+        local token code
+        token="$(login "voter-$1")"
+        [[ -n "$token" ]] || fail "ログインできません（voter-$1）"
+        code="$(seed_vote "$1" 1 "$token")"
+        [[ "$code" == 201 ]] || fail "投票が 201 ではありません（voter-$1: ${code}）"
+    }
+    chain_height() {
+        curl -sS "${BASE}/api/v1/chains/0/head" | sed -n 's/.*"height":\([0-9]*\).*/\1/p'
+    }
+    seal_count() { { grep -ac 'ブロックを封印しました' "$LOG" || true; }; }
+    admin_phase() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null || true; }
+    phase_is() { [[ "$(admin_phase)" == *"\"phase\":\"$1\""* ]]; }
+
+    echo "== 1. dev の設定で起動（seal.interval_secs=10・seal.min_ballots_after_interval=10・shard.count=1）"
+    shown="$(./target/debug/app-config show)"
+    grep -q '^interval_secs = 10  # .*dev.toml' <<<"$shown" || fail "dev の設定で seal.interval_secs=10 になっていません:
+${shown}"
+    grep -q '^min_ballots_after_interval = 10  # .*dev.toml' <<<"$shown" || fail "dev の設定で seal.min_ballots_after_interval=10 になっていません"
+    SEED_TMP="$TMP/seed"
+    seed_generate "$SEED_TMP" 30
+    spawn api "$LOG" ./target/debug/api
+    wait_healthz "$BASE" 10 api || fail "api が応答しません"
+    wait_election_open "$BASE" 5 || fail "自動で open になりませんでした"
+    [[ "$(chain_height)" == 0 ]] || fail "起動直後はジェネシス（高さ 0）のはずです"
+
+    echo "== 2. 9 票 → 20 秒待ってもブロックができない（最小件数 10 に届かない。窓もリセットしない）"
+    for n in $(seq 1 9); do vote_once "$n"; done
+    sleep 20
+    [[ "$(chain_height)" == 0 && "$(seal_count)" == 0 ]] || fail "9 票で封印されました（高さ=$(chain_height)）"
+    echo "9 票・20 秒: ブロックなし OK"
+
+    echo "== 3. 10 票目 → すぐに（間隔は経っているので）全 10 件を封印する"
+    voted_at="$(now_ms)"
+    vote_once 10
+    wait_for_log 'shard=0 height=1 count=10 trigger=time' 2000 "$LOG" || fail "10 票目の後、2 秒以内に封印されません"
+    echo "10 票目: $(($(now_ms) - voted_at)) ms で height=1（10 件, trigger=time）OK"
+
+    echo "== 4. 5 票 → close --now → 締切の手続きの中で trigger=close の 5 件のブロック"
+    for n in $(seq 11 15); do vote_once "$n"; done
+    [[ "$(chain_height)" == 1 ]] || fail "5 票で封印されました（高さ=$(chain_height)）"
+    ./scripts/election.sh close --now --yes >"$TMP/close.out" 2>&1 || { cat "$TMP/close.out" >&2; fail "close --now が失敗しました"; }
+    wait_for_log 'shard=0 height=2 count=5 trigger=close' 10000 "$LOG" || fail "close --now の後、trigger=close で 5 件のブロックができません"
+    wait_until 10000 phase_is closed || fail "締切の手続きが終わり、closed になりません: $(admin_phase)"
+    [[ "$(admin_phase)" == *'"pending_by_shard":[0]'* ]] || fail "closed の時点で未封印が残っています: $(admin_phase)"
+    [[ "$(seal_count)" == 2 ]] || fail "封印の回数が 2 ではありません（$(seal_count)）"
+    echo "close --now: height=2（5 件, trigger=close）→ closed・未封印 0 件 OK"
+
+    graceful_stop api
+    echo "OK: chain#8 封印ルール（原則9）"
+)
+
 check_demo
 check_inprocess_sealer
 check_no_append_without_change
@@ -1216,5 +1311,6 @@ check_db_persistence
 check_multi_sealer
 check_tally
 check_viewer_api
+check_seal_rules
 
 echo "OK: check/chain.sh"

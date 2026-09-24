@@ -50,7 +50,7 @@ pub struct Config {
     pub auth_mode: AuthMode,
     /// `auth.argon2.*`。存在しない ID のダミーの照合に使う（実在する ID の照合と、計算量を同じにする）。
     pub password_params: PasswordParams,
-    /// `seal.max_ballots` / `seal.max_interval_secs`
+    /// `seal.max_ballots` / `seal.interval_secs` / `seal.min_ballots_after_interval`
     pub seal_policy: SealPolicy,
     /// `sealer.signing_seed`（秘密情報）。`app.mode=memory` のプロセス内 sealer だけが使う（任意。
     /// 未設定なら起動ごとにランダム生成）。`db` では api は署名鍵を持たない（公開鍵は DB から読む）。
@@ -156,9 +156,13 @@ impl Config {
             },
             seal_policy: SealPolicy::new(
                 usize::try_from(app.seal.max_ballots).context("seal.max_ballots が大きすぎます")?,
-                app.seal.max_interval_secs,
+                app.seal.interval_secs,
+                usize::try_from(app.seal.min_ballots_after_interval)
+                    .context("seal.min_ballots_after_interval が大きすぎます")?,
             )
-            .context("seal.max_ballots / seal.max_interval_secs が不正です")?,
+            .context(
+                "seal.max_ballots / seal.interval_secs / seal.min_ballots_after_interval が不正です",
+            )?,
             sealer_signing_seed: app.sealer.signing_seed.as_ref().map(|seed| *seed.expose()),
             reveal: match app.chain.reveal_ballots {
                 RevealBallots::Always => RevealPolicy::Always,
@@ -256,7 +260,7 @@ mod tests {
         let c = config(&[
             SECRET,
             ("seal.max_ballots", "7"),
-            ("seal.max_interval_secs", "10"),
+            ("seal.interval_secs", "10"),
             ("app.mode", "memory"),
             (
                 "sealer.signing_seed",
@@ -264,11 +268,11 @@ mod tests {
             ),
         ])
         .expect("valid");
-        assert_eq!(c.seal_policy, SealPolicy::new(7, 10).expect("valid"));
+        assert_eq!(c.seal_policy, SealPolicy::new(7, 10, 10).expect("valid"));
         assert_eq!(c.sealer_signing_seed, Some([1u8; 32]));
         // 不正な値は app-config の検証で、出所つきで弾かれる。
         assert!(config(&[SECRET, ("seal.max_ballots", "0")]).is_err());
-        assert!(config(&[SECRET, ("seal.max_interval_secs", "x")]).is_err());
+        assert!(config(&[SECRET, ("seal.interval_secs", "x")]).is_err());
         assert!(config(&[SECRET, ("sealer.signing_seed", "abcd")]).is_err());
     }
 

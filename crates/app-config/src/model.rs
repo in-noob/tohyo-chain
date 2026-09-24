@@ -113,7 +113,8 @@ pub struct Db {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seal {
     pub max_ballots: u64,
-    pub max_interval_secs: u64,
+    pub interval_secs: u64,
+    pub min_ballots_after_interval: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,7 +423,9 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
     }
 
     let max_ballots = r.uint("seal.max_ballots", 1, u64::from(u32::MAX));
-    let max_interval_secs = r.uint("seal.max_interval_secs", 1, 31_536_000);
+    let interval_secs = r.uint("seal.interval_secs", 1, 31_536_000);
+    let min_ballots_after_interval =
+        r.uint("seal.min_ballots_after_interval", 1, u64::from(u32::MAX));
 
     let sealer_id = r.text("sealer.id");
     let lease_ttl_secs = r.uint("sealer.lease_ttl_secs", MIN_LEASE_TTL_SECS, 86_400);
@@ -599,7 +602,8 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         },
         seal: Seal {
             max_ballots,
-            max_interval_secs,
+            interval_secs,
+            min_ballots_after_interval,
         },
         sealer: Sealer {
             id: (!sealer_id.trim().is_empty()).then_some(sealer_id),

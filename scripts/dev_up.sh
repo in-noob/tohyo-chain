@@ -4,7 +4,7 @@
 #   scripts/dev_up.sh [memory|cassandra] [--auth stub|db]     （既定は memory）
 #   scripts/dev_down.sh                      停止（cassandra では docker compose stop。ボリュームは残す）
 #
-#   memory    : api（dev-tools 有効・sealer 内蔵・seal.max_interval_secs=10（config/dev.toml））と trunk serve を起動する。
+#   memory    : api（dev-tools 有効・sealer 内蔵・seal.interval_secs=10・seal.min_ballots_after_interval=10（config/dev.toml））と trunk serve を起動する。
 #               再起動すると、票もチェーンも消える。改ざんデモ（/debug/tamper）が使える。認証は stub（入力した ID をそのまま採用）。
 #   cassandra : 上記に加えて、docker compose で Cassandra を起動して healthy を待ち、既定のキースペース vote に
 #               スキーマを投入する（IF NOT EXISTS なので、既存のデータは残る）。sealer は別プロセスで動かす
@@ -333,7 +333,8 @@ ${LOGIN_SECTION}
 ${NOTE_PERSIST}
 ■ チェーンの先頭（シャード 0）を見る:
    curl -s ${API}/api/v1/chains/0/head
-   （票は seal.max_interval_secs=10（config/dev.toml） 秒ごとに封印される。投票の後、10 秒ほど待つと高さが増える）
+   （票は、未封印が 10 件以上になり、前回の封印から 10 秒以上経つと封印される（config/dev.toml）。
+    10 件に満たない票は、scripts/election.sh close --now（締切の手続き）で封印される）
 
 ■ チェーンを検証する（全シャード・突合・アンカー）:
    cargo run -q -p verifier -- verify --api ${API}

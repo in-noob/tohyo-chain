@@ -1,54 +1,61 @@
 //! sealer の振る舞いテスト。時計は `ManualClock` で進めるので sleep を使わず決定的。
+//!
+//! 封印の経過時間は壁時計（UNIX 秒）で測る（ADR 0020）。`ManualClock::with_wall_base` を壁時計と単調時計の
+//! 両方に渡すので、`advance` で両方が同じだけ進む。
 
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application::{ChainRead, Clock, SealStore, StoreError, VoteStore};
+use application::{ChainRead, Clock, ElectionStateStore, SealStore, StoreError, VoteStore};
 use async_trait::async_trait;
 use domain::anchor::GENESIS_ANCHOR_PREV;
 use domain::encoding::ballot_order_key;
 use domain::seal_policy::SealPolicy;
 use domain::{
-    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ShardHead, ShardId, VoterId,
-    build_anchor, verify_anchor, verify_anchor_link, verify_chain,
+    Ballot, BallotId, Block, CandidateId, ContestId, Ed25519Signer, ElectionPhase, Period,
+    ShardHead, ShardId, VoterId, build_anchor, verify_anchor, verify_anchor_link, verify_chain,
 };
 use infra_memory::InMemoryStore;
 use sealer::{FinalAnchor, ManualClock, SealEvent, Sealer, SealerError, TickOutcome, Trigger};
 use std::sync::Mutex;
 
-/// 固定の壁時計（2027-01-15 相当。分単位に丸めると 30_000_000）。
+/// テストの壁時計の起点（2027-01-15 相当。分単位に丸めると 30_000_000）。
+const WALL_BASE: u64 = 1_800_000_000;
+
+/// 固定の壁時計（`spy_sealer` 用）。
 struct FixedWall;
 
 impl Clock for FixedWall {
     fn now_unix_secs(&self) -> u64 {
-        1_800_000_000
+        WALL_BASE
     }
 }
 
 struct Fixture {
     store: Arc<InMemoryStore>,
-    mono: Arc<ManualClock>,
+    clock: Arc<ManualClock>,
     signer: Arc<Ed25519Signer>,
     sealer: Sealer,
 }
 
-fn fixture(shards: u16, max_ballots: usize, interval_secs: u64) -> Fixture {
+/// `max_ballots` 件で封印、`interval_secs` 秒以上経って `min_ballots` 件以上で全件封印。
+fn fixture(shards: u16, max_ballots: usize, interval_secs: u64, min_ballots: usize) -> Fixture {
     let shard_count = NonZeroU16::new(shards).expect("non-zero");
     let store = Arc::new(InMemoryStore::new(shard_count));
-    let mono = Arc::new(ManualClock::new());
+    let clock = Arc::new(ManualClock::with_wall_base(WALL_BASE));
     let signer = Arc::new(Ed25519Signer::from_seed(&[9u8; 32]));
     let sealer = Sealer::new(
         store.clone(),
         signer.clone(),
-        Arc::new(FixedWall),
-        mono.clone(),
-        SealPolicy::new(max_ballots, interval_secs).expect("valid policy"),
+        clock.clone(),
+        clock.clone(),
+        SealPolicy::new(max_ballots, interval_secs, min_ballots).expect("valid policy"),
         shard_count,
     );
     Fixture {
         store,
-        mono,
+        clock,
         signer,
         sealer,
     }
@@ -112,10 +119,11 @@ async fn chain(store: &InMemoryStore, shard: u16) -> Vec<Block> {
 }
 
 const MS: fn(u64) -> Duration = Duration::from_millis;
+const SECS: fn(u64) -> Duration = Duration::from_secs;
 
 #[tokio::test]
 async fn init_creates_one_genesis_per_shard_and_is_idempotent() {
-    let mut f = fixture(3, 100, 10);
+    let mut f = fixture(3, 100, 10, 10);
     f.sealer.init().await.expect("init");
     f.sealer.init().await.expect("init again");
     for shard in 0..3 {
@@ -129,10 +137,10 @@ async fn init_creates_one_genesis_per_shard_and_is_idempotent() {
 
 #[tokio::test]
 async fn waits_below_limit_and_before_expiry() {
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     cast(&f.store, 0, 0, 99).await;
-    f.mono.advance(MS(9_999));
+    f.clock.advance(MS(9_999));
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
     assert_eq!(pending(&f.store, 0).await, 99);
 
@@ -145,8 +153,8 @@ async fn waits_below_limit_and_before_expiry() {
 }
 
 #[tokio::test]
-async fn two_hundred_fifty_ballots_seal_100_100_then_50_on_expiry_then_nothing() {
-    let mut f = fixture(1, 100, 10);
+async fn two_hundred_fifty_ballots_seal_100_100_then_50_after_the_interval() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     cast(&f.store, 0, 0, 250).await;
 
@@ -158,44 +166,63 @@ async fn two_hundred_fifty_ballots_seal_100_100_then_50_on_expiry_then_nothing()
     assert_eq!(pending(&f.store, 0).await, 50);
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
 
-    // 窓（直前の封印時刻 = 0 秒）から 10 秒未満は待ち、ちょうど 10 秒で全件封印。
-    f.mono.advance(MS(9_900));
+    // 前回の封印（t=0 秒）から 10 秒未満は待ち、ちょうど 10 秒で全件封印。
+    f.clock.advance(MS(9_900));
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
-    f.mono.advance(MS(100));
+    f.clock.advance(MS(100));
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(0, 3, 50, Trigger::Time)]
     );
     assert_eq!(pending(&f.store, 0).await, 0);
 
-    // その後は、25 秒経っても（0 件で窓が満了するだけで）ブロックはできない。
+    // その後は、25 秒経っても（0 件なので待つだけで）ブロックはできない。
     for _ in 0..25 {
-        f.mono.advance(Duration::from_secs(1));
+        f.clock.advance(SECS(1));
         assert_eq!(summary(&f.sealer.tick().await), vec![]);
     }
     assert_eq!(head_height(&f.store, 0).await, 3);
 }
 
 #[tokio::test]
+async fn below_the_minimum_waits_past_the_interval_and_the_minimum_th_ballot_seals_at_once() {
+    let mut f = fixture(1, 100, 10, 10);
+    f.sealer.init().await.expect("init");
+    cast(&f.store, 0, 0, 9).await;
+    // 9 件のまま 20 秒（間隔の 2 倍）経っても封印しない。
+    for _ in 0..20 {
+        f.clock.advance(SECS(1));
+        assert_eq!(summary(&f.sealer.tick().await), vec![]);
+    }
+    assert_eq!(pending(&f.store, 0).await, 9);
+    // 10 件目が届くと、すぐに全 10 件を封印する（窓は、待っている間にリセットされていない）。
+    cast(&f.store, 0, 9, 1).await;
+    assert_eq!(
+        summary(&f.sealer.tick().await),
+        vec![(0, 1, 10, Trigger::Time)]
+    );
+}
+
+#[tokio::test]
 async fn window_is_measured_from_the_last_seal() {
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 1);
     f.sealer.init().await.expect("init");
 
-    // t=5 秒で件数封印 → 新しい窓は 5 秒から。
-    f.mono.advance(Duration::from_secs(5));
+    // t=5 秒で件数封印 → 経過時間の起点は 5 秒から。
+    f.clock.advance(SECS(5));
     cast(&f.store, 0, 0, 100).await;
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(0, 1, 100, Trigger::Count)]
     );
 
-    // 起点 0 なら t=10 で満了してしまうが、起点は 5 なので t=14.9 でも待つ。
+    // 起点 0 なら t=10 で満了してしまうが、起点は 5 なので t=14 でも待つ。
     cast(&f.store, 0, 100, 1).await;
-    f.mono.advance(MS(5_000)); // t=10
+    f.clock.advance(SECS(5)); // t=10
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
-    f.mono.advance(MS(4_900)); // t=14.9
+    f.clock.advance(SECS(4)); // t=14
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
-    f.mono.advance(MS(100)); // t=15
+    f.clock.advance(SECS(1)); // t=15
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(0, 2, 1, Trigger::Time)]
@@ -203,36 +230,83 @@ async fn window_is_measured_from_the_last_seal() {
 }
 
 #[tokio::test]
-async fn empty_expiry_makes_no_block_but_restarts_the_window() {
-    let mut f = fixture(1, 100, 10);
+async fn zero_ballots_past_the_interval_make_no_block_and_do_not_reset_the_window() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
 
-    // 0 件のまま t=10 で満了: ブロックは作らず、窓だけがリセットされる。
-    f.mono.advance(Duration::from_secs(10));
+    // 0 件のまま t=10: ブロックは作らない。窓もリセットしない（原則9）。
+    f.clock.advance(SECS(10));
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
     assert_eq!(head_height(&f.store, 0).await, 0);
 
-    // 直後に届いた 1 件は、新しい窓（t=10 起点）で数える。
-    cast(&f.store, 0, 0, 1).await;
-    assert_eq!(summary(&f.sealer.tick().await), vec![]);
-    f.mono.advance(MS(9_900)); // t=19.9
-    assert_eq!(summary(&f.sealer.tick().await), vec![]);
-    f.mono.advance(MS(100)); // t=20
+    // 直後に 10 件届いたら、（窓の起点は t=0 のままなので）すぐに封印する。
+    f.clock.advance(SECS(1));
+    cast(&f.store, 0, 0, 10).await;
     assert_eq!(
         summary(&f.sealer.tick().await),
-        vec![(0, 1, 1, Trigger::Time)]
+        vec![(0, 1, 10, Trigger::Time)]
     );
 }
 
 #[tokio::test]
+async fn the_voting_start_is_the_origin_of_the_elapsed_time() {
+    let mut f = fixture(1, 100, 10, 10);
+    f.sealer.init().await.expect("init");
+    // 担当し始めて（t=0）から 100 秒後に、投票が始まった。
+    f.clock.advance(SECS(100));
+    f.sealer
+        .set_voting_started_at(Some(i64::try_from(WALL_BASE + 100).expect("fits")));
+    cast(&f.store, 0, 0, 10).await;
+    // 担当し始めた時刻から測れば満了しているが、起点は投票開始（t=100）なので、t=109 までは待つ。
+    f.clock.advance(SECS(9)); // t=109
+    assert_eq!(summary(&f.sealer.tick().await), vec![]);
+    f.clock.advance(SECS(1)); // t=110
+    assert_eq!(
+        summary(&f.sealer.tick().await),
+        vec![(0, 1, 10, Trigger::Time)]
+    );
+}
+
+#[tokio::test]
+async fn after_a_restart_the_last_seal_is_taken_from_the_head_block_never_earlier() {
+    let mut f = fixture(1, 100, 10, 1);
+    f.sealer.init().await.expect("init");
+    // t=5 秒で 1 ブロック封印（分に丸めると 30_000_000 分 = WALL_BASE）。
+    f.clock.advance(SECS(5));
+    cast(&f.store, 0, 0, 100).await;
+    f.sealer.tick().await;
+
+    // 同じストアを、別の sealer（再起動・引き継ぎ）が担当する。前回の封印の正確な時刻は知らないので、
+    // 先頭ブロックの分の最後の秒（WALL_BASE + 59）を前回の封印時刻とする。
+    let mut next = Sealer::new(
+        f.store.clone(),
+        f.signer.clone(),
+        f.clock.clone(),
+        f.clock.clone(),
+        SealPolicy::new(100, 10, 1).expect("valid policy"),
+        NonZeroU16::new(1).expect("non-zero"),
+    );
+    next.set_voting_started_at(Some(i64::try_from(WALL_BASE).expect("fits")));
+    next.init_shard(ShardId(0)).await.expect("init shard");
+    cast(&f.store, 0, 100, 1).await;
+    // 実際の封印（t=5）から 10 秒の t=15 では、まだ封印しない（早くは封印しない側に寄せる）。
+    f.clock.advance(SECS(10)); // t=15
+    assert_eq!(summary(&next.tick().await), vec![]);
+    f.clock.advance(SECS(53)); // t=68 = 59 + 9
+    assert_eq!(summary(&next.tick().await), vec![]);
+    f.clock.advance(SECS(1)); // t=69 = 59 + 10
+    assert_eq!(summary(&next.tick().await), vec![(0, 2, 1, Trigger::Time)]);
+}
+
+#[tokio::test]
 async fn sealed_ballots_leave_the_pool_and_are_hash_ordered_and_chain_verifies() {
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 1);
     f.sealer.init().await.expect("init");
     cast(&f.store, 0, 0, 100).await;
     let arrived: Vec<Ballot> = f.store.ballots_in_shard(ShardId(0));
     f.sealer.tick().await;
     cast(&f.store, 0, 100, 7).await;
-    f.mono.advance(Duration::from_secs(10));
+    f.clock.advance(SECS(10));
     f.sealer.tick().await;
 
     // 封印済みの票はプールから消えている。
@@ -263,7 +337,7 @@ async fn sealed_ballots_leave_the_pool_and_are_hash_ordered_and_chain_verifies()
 
 #[tokio::test]
 async fn shards_are_independent() {
-    let mut f = fixture(2, 100, 10);
+    let mut f = fixture(2, 100, 10, 10);
     f.sealer.init().await.expect("init");
     cast(&f.store, 1, 0, 100).await;
     cast(&f.store, 0, 1_000, 40).await;
@@ -275,8 +349,8 @@ async fn shards_are_independent() {
     assert_eq!(head_height(&f.store, 0).await, 0);
     assert_eq!(pending(&f.store, 0).await, 40);
 
-    // シャード 0 は自分の窓（t=0 起点）で満了する。高さはシャードごとに数える。
-    f.mono.advance(Duration::from_secs(10));
+    // シャード 0 は自分の起点（t=0）から 10 秒で封印する。高さはシャードごとに数える。
+    f.clock.advance(SECS(10));
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(0, 1, 40, Trigger::Time)]
@@ -285,33 +359,33 @@ async fn shards_are_independent() {
 }
 
 #[tokio::test]
-async fn flush_seals_the_remainder_regardless_of_time_and_count() {
-    let mut f = fixture(1, 100, 10);
+async fn close_flush_seals_the_remainder_regardless_of_time_and_count() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
-    cast(&f.store, 0, 0, 37).await;
-    // 窓は満了していないが、フラッシュは全件を封印する。
+    cast(&f.store, 0, 0, 3).await;
+    // 間隔も最小件数も満たしていないが、投票終了の手続きは全件を封印する。
     assert_eq!(
-        summary(&f.sealer.flush().await),
-        vec![(0, 1, 37, Trigger::Flush)]
+        summary(&f.sealer.close_flush().await),
+        vec![(0, 1, 3, Trigger::Close)]
     );
     assert_eq!(pending(&f.store, 0).await, 0);
 
-    // 0 件のフラッシュは空ブロックを作らない。
-    assert_eq!(summary(&f.sealer.flush().await), vec![]);
+    // 0 件なら何もしない（空のブロックを作らない）。
+    assert_eq!(summary(&f.sealer.close_flush().await), vec![]);
     assert_eq!(head_height(&f.store, 0).await, 1);
 }
 
 #[tokio::test]
-async fn flush_keeps_blocks_within_the_limit() {
-    let mut f = fixture(1, 100, 10);
+async fn close_flush_keeps_blocks_within_the_limit() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     cast(&f.store, 0, 0, 250).await;
     assert_eq!(
-        summary(&f.sealer.flush().await),
+        summary(&f.sealer.close_flush().await),
         vec![
             (0, 1, 100, Trigger::Count),
             (0, 2, 100, Trigger::Count),
-            (0, 3, 50, Trigger::Flush)
+            (0, 3, 50, Trigger::Close)
         ]
     );
     assert_eq!(pending(&f.store, 0).await, 0);
@@ -320,7 +394,7 @@ async fn flush_keeps_blocks_within_the_limit() {
 #[tokio::test]
 async fn failure_in_one_shard_does_not_block_others() {
     // init しないと head がなく、シャード 0 の封印は失敗する。シャード 1 はジェネシスを手で用意する。
-    let mut f = fixture(2, 100, 10);
+    let mut f = fixture(2, 100, 10, 10);
     let genesis = domain::genesis(&*f.signer, 1);
     f.store
         .commit(ShardId(1), genesis, 0)
@@ -347,12 +421,12 @@ async fn failure_in_one_shard_does_not_block_others() {
 fn trigger_labels_match_log_format() {
     assert_eq!(Trigger::Count.to_string(), "count");
     assert_eq!(Trigger::Time.to_string(), "time");
-    assert_eq!(Trigger::Flush.to_string(), "flush");
+    assert_eq!(Trigger::Close.to_string(), "close");
 }
 
 #[tokio::test(start_paused = true)]
-async fn spawned_task_seals_periodically_and_flushes_on_shutdown() {
-    let mut f = fixture(1, 100, 10);
+async fn spawned_task_seals_periodically_and_does_not_flush_on_shutdown() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     let (store, signer) = (f.store.clone(), f.signer.clone());
     let handle = sealer::spawn(
@@ -369,28 +443,77 @@ async fn spawned_task_seals_periodically_and_flushes_on_shutdown() {
     assert_eq!(head_height(&store, 0).await, 1);
     assert_eq!(pending(&store, 0).await, 0);
 
-    // 30 件だけ届いた状態で停止 → 締切フラッシュで封印されてから終了する。
+    // 30 件だけ届いた状態で停止（SIGTERM 相当）→ フラッシュしない（原則9）。票はストアに残る。
     cast(&store, 0, 100, 30).await;
     handle.shutdown().await.expect("shutdown");
     let blocks = chain(&store, 0).await;
-    assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[2].ballots.len(), 30);
-    assert_eq!(pending(&store, 0).await, 0);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(pending(&store, 0).await, 30);
     assert_eq!(verify_chain(&blocks, &signer.verifier()), Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawned_task_flushes_only_in_the_closing_procedure() {
+    let mut f = fixture(1, 100, 600, 10);
+    f.sealer.init().await.expect("init");
+    let store = f.store.clone();
+    let clock = f.clock.clone();
+    let opens_at = i64::try_from(WALL_BASE).expect("fits");
+    store
+        .ensure_initialized(Period {
+            opens_at: Some(opens_at),
+            closes_at: None,
+        })
+        .await
+        .expect("init election");
+    let handle = sealer::spawn(
+        f.sealer,
+        sealer::DEFAULT_TICK,
+        Duration::from_secs(600),
+        f.store.clone(),
+        Duration::from_secs(1),
+    );
+    run_spawned_for(&clock, 1).await;
+    assert_eq!(store.get().await.expect("state").phase, ElectionPhase::Open);
+
+    // 5 票: 件数も時間も満たさないので、待つ。
+    cast(&store, 0, 0, 5).await;
+    run_spawned_for(&clock, 5).await;
+    assert_eq!(head_height(&store, 0).await, 0);
+
+    // close --now 相当（open → closing）: 締切の手続きの中で、5 件のブロック（trigger=close）ができ、closed になる。
+    assert!(
+        store
+            .transition(
+                ElectionPhase::Open,
+                ElectionPhase::Closing,
+                "test",
+                opens_at + 6
+            )
+            .await
+            .expect("close")
+    );
+    run_spawned_for(&clock, 3).await;
+    assert_eq!(head_height(&store, 0).await, 1);
+    assert_eq!(chain(&store, 0).await[1].ballots.len(), 5);
+    assert_eq!(pending(&store, 0).await, 0);
+    assert_eq!(
+        store.get().await.expect("state").phase,
+        ElectionPhase::Closed
+    );
+    handle.shutdown().await.expect("shutdown");
 }
 
 // --- 更新がなければ、ブロックチェーンに何も追加しない ---
 
-const SECS: fn(u64) -> Duration = Duration::from_secs;
-
 #[tokio::test]
-async fn expiring_with_no_ballots_never_adds_a_block_or_an_anchor() {
-    // ブロック（回帰）: 0 件のまま窓が何度満了しても、ブロックを作らない（窓だけがリセットされる）。
+async fn waiting_with_no_ballots_never_adds_a_block_or_an_anchor() {
+    // ブロック: 0 件のまま何度間隔が過ぎても、ブロックを作らない。
     // アンカー: ジェネシスだけの状態は「更新なし」なので、作らない。
-    let mut f = fixture(2, 100, 10);
+    let mut f = fixture(2, 100, 10, 10);
     f.sealer.init().await.expect("init");
     for _ in 0..60 {
-        f.mono.advance(SECS(10));
+        f.clock.advance(SECS(10));
         assert_eq!(summary(&f.sealer.tick().await), vec![]);
         assert_eq!(f.sealer.anchor().await.expect("anchor"), None);
     }
@@ -401,12 +524,12 @@ async fn expiring_with_no_ballots_never_adds_a_block_or_an_anchor() {
 }
 
 #[tokio::test]
-async fn flushing_with_no_ballots_adds_nothing_even_after_earlier_activity() {
-    // 締切フラッシュ（残りをすべて封印）で、0 件ならブロックを作らない。最終アンカーも、変化がなければ作らない。
-    let mut f = fixture(1, 100, 10);
+async fn close_flush_with_no_ballots_adds_nothing_even_after_earlier_activity() {
+    // 投票終了の手続きで、0 件ならブロックを作らない。最終アンカーも、変化がなければ作らない。
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     // まず 0 件のフラッシュ。
-    assert_eq!(summary(&f.sealer.flush().await), vec![]);
+    assert_eq!(summary(&f.sealer.close_flush().await), vec![]);
     assert_eq!(f.sealer.finalize_anchor().await, Ok(FinalAnchor::UpToDate));
     assert_eq!(head_height(&f.store, 0).await, 0);
     assert_eq!(f.store.latest_anchor().await.expect("latest"), None);
@@ -414,14 +537,14 @@ async fn flushing_with_no_ballots_adds_nothing_even_after_earlier_activity() {
     // 票が届いてフラッシュされ、最終アンカーができたあとの、0 件のフラッシュ。
     cast(&f.store, 0, 0, 6).await;
     assert_eq!(
-        summary(&f.sealer.flush().await),
-        vec![(0, 1, 6, Trigger::Flush)]
+        summary(&f.sealer.close_flush().await),
+        vec![(0, 1, 6, Trigger::Close)]
     );
     let Ok(FinalAnchor::Created(anchor)) = f.sealer.finalize_anchor().await else {
         panic!("変化があったので、最終アンカーが作られるはず");
     };
     assert_eq!(anchor.seq, 1);
-    assert_eq!(summary(&f.sealer.flush().await), vec![]);
+    assert_eq!(summary(&f.sealer.close_flush().await), vec![]);
     assert_eq!(f.sealer.finalize_anchor().await, Ok(FinalAnchor::UpToDate));
     assert_eq!(head_height(&f.store, 0).await, 1);
     assert_eq!(
@@ -433,7 +556,7 @@ async fn flushing_with_no_ballots_adds_nothing_even_after_earlier_activity() {
 
 #[tokio::test]
 async fn an_anchor_is_created_only_when_a_head_changed_since_the_previous_anchor() {
-    let mut f = fixture(2, 100, 10);
+    let mut f = fixture(2, 100, 10, 1);
     f.sealer.init().await.expect("init");
     let verifier = f.signer.verifier();
     let heights =
@@ -447,7 +570,7 @@ async fn an_anchor_is_created_only_when_a_head_changed_since_the_previous_anchor
 
     // shard 0 にブロックが 1 つできた → アンカー 1。
     cast(&f.store, 0, 0, 3).await;
-    f.mono.advance(SECS(10));
+    f.clock.advance(SECS(10));
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(0, 1, 3, Trigger::Time)]
@@ -465,14 +588,14 @@ async fn an_anchor_is_created_only_when_a_head_changed_since_the_previous_anchor
         Some(first.clone())
     );
 
-    // 窓が 0 件で満了しても（ブロックが増えないので）、作らない。
-    f.mono.advance(SECS(10));
+    // 0 件のまま間隔が過ぎても（ブロックが増えないので）、作らない。
+    f.clock.advance(SECS(10));
     assert_eq!(summary(&f.sealer.tick().await), vec![]);
     assert_eq!(f.sealer.anchor().await.expect("anchor"), None);
 
     // shard 1 にブロックができた → アンカー 2（アンカー 1 の続き）。
     cast(&f.store, 1, 0, 2).await;
-    f.mono.advance(SECS(10));
+    f.clock.advance(SECS(10));
     assert_eq!(
         summary(&f.sealer.tick().await),
         vec![(1, 1, 2, Trigger::Time)]
@@ -486,11 +609,11 @@ async fn an_anchor_is_created_only_when_a_head_changed_since_the_previous_anchor
 
 #[tokio::test]
 async fn finalize_anchor_only_confirms_when_the_last_anchor_is_current() {
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 1);
     f.sealer.init().await.expect("init");
 
     cast(&f.store, 0, 0, 3).await;
-    f.mono.advance(SECS(10));
+    f.clock.advance(SECS(10));
     f.sealer.tick().await;
     let anchor = f.sealer.anchor().await.expect("anchor").expect("changed");
 
@@ -504,7 +627,7 @@ async fn finalize_anchor_only_confirms_when_the_last_anchor_is_current() {
 
     // アンカーのあとにブロックが増えた: 最後のアンカーを追いつかせるために、1 つ作る。
     cast(&f.store, 0, 3, 2).await;
-    f.sealer.flush().await;
+    f.sealer.close_flush().await;
     let Ok(FinalAnchor::Created(last)) = f.sealer.finalize_anchor().await else {
         panic!("変化があったので、最終アンカーが作られるはず");
     };
@@ -518,10 +641,10 @@ async fn finalize_anchor_only_confirms_when_the_last_anchor_is_current() {
 #[tokio::test]
 async fn an_anchor_contradicting_the_chain_is_reported_and_never_overwritten() {
     // 直前のアンカーが指す高さより、実際のチェーンが低い（巻き戻し）: 新しいアンカーで上書きせず、エラーにする。
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 1);
     f.sealer.init().await.expect("init");
     cast(&f.store, 0, 0, 3).await;
-    f.mono.advance(SECS(10));
+    f.clock.advance(SECS(10));
     f.sealer.tick().await;
     let forged = build_anchor(
         1,
@@ -553,18 +676,18 @@ async fn an_anchor_contradicting_the_chain_is_reported_and_never_overwritten() {
 }
 
 /// `spawn` した sealer を、`secs` 秒ぶん動かす（時計は手動なので、tick の周期ごとに進める）。
-async fn run_spawned_for(mono: &ManualClock, secs: u64) {
+async fn run_spawned_for(clock: &ManualClock, secs: u64) {
     for _ in 0..secs * 5 {
-        mono.advance(sealer::DEFAULT_TICK);
+        clock.advance(sealer::DEFAULT_TICK);
         tokio::time::sleep(sealer::DEFAULT_TICK).await;
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn spawned_task_adds_nothing_while_idle_and_finalizes_only_on_change() {
-    let mut f = fixture(1, 100, 10);
+    let mut f = fixture(1, 100, 10, 1);
     f.sealer.init().await.expect("init");
-    let (store, mono) = (f.store.clone(), f.mono.clone());
+    let (store, clock) = (f.store.clone(), f.clock.clone());
     let handle = sealer::spawn(
         f.sealer,
         sealer::DEFAULT_TICK,
@@ -573,38 +696,39 @@ async fn spawned_task_adds_nothing_while_idle_and_finalizes_only_on_change() {
         Duration::from_secs(1),
     );
 
-    // 票が無いまま 60 秒（窓・アンカーの間隔が 6 回ずつ）: ブロックもアンカーも増えない。
-    run_spawned_for(&mono, 60).await;
+    // 票が無いまま 60 秒（封印・アンカーの間隔が 6 回ずつ）: ブロックもアンカーも増えない。
+    run_spawned_for(&clock, 60).await;
     assert_eq!(head_height(&store, 0).await, 0);
     assert_eq!(store.latest_anchor().await.expect("latest"), None);
 
-    // 1 票 → ブロック 1 つ、アンカー 1 つ。
+    // 1 票（最小件数 1）→ ブロック 1 つ、アンカー 1 つ。
     cast(&store, 0, 0, 1).await;
-    run_spawned_for(&mono, 25).await;
+    run_spawned_for(&clock, 25).await;
     assert_eq!(head_height(&store, 0).await, 1);
     let anchor = store.latest_anchor().await.expect("latest").expect("some");
     assert_eq!(anchor.seq, 1);
 
     // さらに 60 秒: 増えない。
-    run_spawned_for(&mono, 60).await;
+    run_spawned_for(&clock, 60).await;
     assert_eq!(head_height(&store, 0).await, 1);
     assert_eq!(
         store.latest_anchor().await.expect("latest"),
         Some(anchor.clone())
     );
 
-    // 変化なしで停止: 0 件のフラッシュも最終アンカーも、何も作らない。
+    // 変化なしで停止: 最終アンカーは、何も作らない。
     handle.shutdown().await.expect("shutdown");
     assert_eq!(head_height(&store, 0).await, 1);
     assert_eq!(store.latest_anchor().await.expect("latest"), Some(anchor));
 }
 
 #[tokio::test(start_paused = true)]
-async fn spawned_task_finalizes_the_anchor_when_the_flush_added_a_block() {
-    let mut f = fixture(1, 100, 10);
+async fn spawned_task_finalizes_the_anchor_on_shutdown_without_flushing() {
+    let mut f = fixture(1, 100, 10, 10);
     f.sealer.init().await.expect("init");
     let store = f.store.clone();
-    // アンカーの間隔（600 秒）は来ない。停止時のフラッシュで封印された票を、最終アンカーが指す。
+    // アンカーの間隔（600 秒）は来ない。停止時の最終アンカーが、件数で封印されたブロックを指す。
+    // 残りの 4 票はフラッシュしない（原則9）。
     let handle = sealer::spawn(
         f.sealer,
         sealer::DEFAULT_TICK,
@@ -612,9 +736,11 @@ async fn spawned_task_finalizes_the_anchor_when_the_flush_added_a_block() {
         f.store.clone(),
         Duration::from_secs(1),
     );
-    cast(&store, 0, 0, 4).await;
+    cast(&store, 0, 0, 104).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     handle.shutdown().await.expect("shutdown");
     assert_eq!(head_height(&store, 0).await, 1);
+    assert_eq!(pending(&store, 0).await, 4);
     let anchor = store.latest_anchor().await.expect("latest").expect("some");
     assert_eq!((anchor.seq, anchor.heads[0].height), (1, 1));
 }
@@ -695,7 +821,7 @@ fn spy_sealer(shards: u16, lose_genesis_race: bool) -> (Sealer, Arc<SpyStore>) {
         signer,
         Arc::new(FixedWall),
         Arc::new(ManualClock::new()),
-        SealPolicy::new(100, 10).expect("valid policy"),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
     );
     (sealer, spy)
@@ -780,7 +906,7 @@ async fn init_fails_on_a_conflict_when_no_chain_exists() {
         signer,
         Arc::new(FixedWall),
         Arc::new(ManualClock::new()),
-        SealPolicy::new(100, 10).expect("valid policy"),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
     );
     assert_eq!(

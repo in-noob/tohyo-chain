@@ -256,6 +256,9 @@ pub struct ElectionAuditEntry {
 pub struct ElectionStateSnapshot {
     pub phase: ElectionPhase,
     pub period: Period,
+    /// open に遷移した時刻（UNIX 秒）。封印の経過時間の起点（投票開始時刻）に使う（原則9。ADR 0020）。
+    /// scheduled の間は `None`。
+    pub opened_at: Option<i64>,
     /// closing に遷移した時刻（締切の手続きの待ち時間の起点）。closing 以外では意味を持たない。
     pub closing_started_at: Option<i64>,
 }

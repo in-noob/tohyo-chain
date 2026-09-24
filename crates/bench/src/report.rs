@@ -438,7 +438,7 @@ pub fn render_markdown(root: &Path) -> anyhow::Result<String> {
     }
 
     out.push_str("\n### 封印の trigger 別の回数（ブロック数）\n\n");
-    out.push_str("| 構成 | 定常中 count | 定常中 time | 定常中 flush | ドレイン中 count | ドレイン中 time | ドレイン中 flush | 飽和中 count | 飽和中 time | 定常+ドレインの count 割合 | 定常+ドレインの time 割合 |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("| 構成 | 定常中 count | 定常中 time | 定常中 close | ドレイン中 count | ドレイン中 time | ドレイン中 close | 飽和中 count | 飽和中 time | 定常+ドレインの count 割合 | 定常+ドレインの time 割合 |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
     for (name, v) in &runs {
         let c = &v["config"];
         let (sh, se, ap) = label(name, c);
@@ -446,10 +446,10 @@ pub fn render_markdown(root: &Path) -> anyhow::Result<String> {
         let get = |phase: &str, t: &str| s[phase]["blocks"][t].as_u64().unwrap_or(0);
         let total = get("steady", "count")
             + get("steady", "time")
-            + get("steady", "flush")
+            + get("steady", "close")
             + get("drain", "count")
             + get("drain", "time")
-            + get("drain", "flush");
+            + get("drain", "close");
         let all = |t: &str| get("steady", t) + get("drain", t);
         row(
             &mut out,
@@ -457,10 +457,10 @@ pub fn render_markdown(root: &Path) -> anyhow::Result<String> {
                 format!("shards={sh} sealer={se} api={ap}"),
                 get("steady", "count").to_string(),
                 get("steady", "time").to_string(),
-                get("steady", "flush").to_string(),
+                get("steady", "close").to_string(),
                 get("drain", "count").to_string(),
                 get("drain", "time").to_string(),
-                get("drain", "flush").to_string(),
+                get("drain", "close").to_string(),
                 get("saturation", "count").to_string(),
                 get("saturation", "time").to_string(),
                 pct(all("count"), total),
@@ -581,8 +581,8 @@ mod tests {
 2026-09-20T05:00:01.250000Z  INFO sealer::coordinator: リースを取得しました shard=0 owner=sealer-a
 2026-09-20T05:00:10.500000Z  INFO sealer::sealer: ブロックを封印しました shard=0 height=1 count=100 trigger=count took_ms=23
 2026-09-20T05:10:10.750000Z  INFO sealer::sealer: ブロックを封印しました shard=3 height=7 count=42 trigger=time took_ms=9
-2026-09-20T05:10:11.000000Z  INFO sealer::sealer: ブロックを封印しました shard=1 height=2 count=5 trigger=flush
-2026-09-20T05:10:12.000000Z DEBUG sealer::sealer: 窓をリセットしました（未封印 0 件） shard=0
+2026-09-20T05:10:11.000000Z  INFO sealer::sealer: ブロックを封印しました shard=1 height=2 count=5 trigger=close
+2026-09-20T05:10:12.000000Z DEBUG sealer::sealer: アンカーの作成を skip しました last_seq=1
 ";
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         // took_ms のない古い形式のログも読める。
         assert_eq!(
             (events[2].trigger.as_str(), events[2].took_ms),
-            ("flush", None)
+            ("close", None)
         );
         assert_eq!(events[1].t_ms - events[0].t_ms, 600_250);
     }
