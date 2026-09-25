@@ -595,7 +595,7 @@ scripts/check_all.sh        # 上記に加えて、scripts/check/*.sh の全ス�
 | `election.sh` | 投票フロー（ログイン・状態・候補者・投票・再投票拒否・並列・対象外・秘密投票）・47 都道府県規模の選挙データ（生成・表示範囲・投票順・壊れたデータの検出）・選挙状態の遷移と投票の受付期間（schedule → 自動 open → 自動 closing → closed・期間の境界・締切直前の票の封印・公開用ポートと管理用リスナーの分離） | 約 1.5 分 |
 | `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh`・確認用のサンプルデータ（`sample_data.sh` を 3 つの phase で実行し、CSV の各行を実際に試す） | 約 4 分（Docker が必要） |
 | `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release`・白票（選択肢・確認の文言・ビューアの別の行）・投票のやり直し（完了画面のボタン・一覧・上限の理由・確認の文言・置き換えのリンク） | 数秒〜数十秒 |
-| `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
+| `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、`common.sh` の読み込みが 1 回だけで同名の関数を上書きしないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
 
 `core.sh` と `chain.sh`、`auth.sh` は Docker（Compose プラグイン）が必要で、DB を起動する。DB の起動に失敗したときは、
 コンテナのログの FATAL / ERROR 行をそのまま表示して終了する。使う DB は `db.backend`（既定 `cassandra`。ScyllaDB は

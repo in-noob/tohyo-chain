@@ -94,7 +94,8 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    scripts/check/chain.sh#8 が、dev の設定（interval=10 秒・min=10）で確認する。
 10. 確認は scripts/check/<スイート名>.sh にまとめ、scripts/check_all.sh ですべて実行する。
     共通の処理は scripts/lib/common.sh に置く。新しい機能を追加するときは、関係するスイートに
-    確認項目を追加する。
+    確認項目を追加する。common.sh を読み込むのは 1 回だけにし、common.sh と同じ名前の関数を定義しない
+    （bash では後の定義が前の定義を置き換えるため。例外は fail と、スイート内の count / pool_total。scripts/check/docs.sh#4 が確認する）。
 11. 設定は config/ 配下の TOML に集約する。読み込みの優先順は
     config/default.toml → config/{APP_ENV}.toml → config/local.toml（gitignore）→ 環境変数 APP__*。
     トークン用のシークレットや署名鍵のシードなどの秘密情報は、設定ファイルに書かず

@@ -97,19 +97,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-now_ms() { date +%s%3N; }
-
-# wait_until TIMEOUT_MS COMMAND...
-wait_until() {
-    local timeout_ms="$1" start
-    shift
-    start="$(now_ms)"
-    until "$@"; do
-        (($(now_ms) - start > timeout_ms)) && return 1
-        sleep 0.5
-    done
-}
-
 build() {
     echo "== ビルド（perf プロファイル）"
     cargo build -q --profile perf -p api -p sealer -p bench --features api/dev-tools

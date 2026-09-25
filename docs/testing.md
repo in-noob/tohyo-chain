@@ -63,7 +63,7 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 | check_step9.sh | labels.* がビルド時に web へ渡る、web は app-config に依存しない | core.sh#8 |
 | check_step9.sh | 旧来の環境変数名が残っていない、環境変数の直接参照がない（app-config 以外） | docs.sh#2 |
 | check_step9.sh | CLAUDE.md に原則 11 の記載がある | docs.sh#2 |
-| check_step9.sh | 全スクリプトの構文（bash -n） | docs.sh#3 |
+| check_step9.sh | 全スクリプトの構文（bash -n） | docs.sh#5 |
 | check_step10.sh | 投票 0 件で 60 秒待ってもブロック・アンカーが増えない（skip ログを含む） | chain.sh#3 |
 | check_step10.sh | 10 票（最小件数）投票 → ブロック・アンカーが 1 つ増える、さらに 60 秒待っても増えない・verify OK | chain.sh#3 |
 | check_step10.sh | 変化なしで SIGTERM → 最終アンカーは確認するだけ（作らない） | chain.sh#3 |
@@ -231,6 +231,20 @@ auth.sh#1 のローカルの `login` / `token_of`（同じ処理）は削除し�
 直した不具合: `scripts/dev_up.sh cassandra` が、起動の途中（Cassandra の起動）で `common.sh` を読み直していたため、`dev_up.sh` 自身の
 `alive` / `wait_until`（引数の形が `common.sh` の同名の関数と違う）が上書きされ、「起動の完了を待つ」で必ず失敗していた。
 `common.sh` は冒頭で読み込み済みなので、読み直しを削除した（サンプルデータを画面で確認する手順が、この起動に依存するため）。
+
+## 追記: common.sh の関数の上書きの検出
+
+`scripts/dev_up.sh cassandra` が、途中で `common.sh` を読み直して、自身の `alive` / `wait_until`（引数の形が `common.sh` の同名の関数と
+違う）を置き換えられ、起動待ちで必ず失敗していた（ADR 0023 の作業で発見。初回のコミットから存在した）。構文の検査（`bash -n`）では
+見つからず、`dev_up.sh` を実行するスイートも無かったため、次を追加・変更した。
+
+| 項目 | 新 |
+|---|---|
+| `common.sh` を読み込むスクリプトは、読み込みが 1 回だけで、`common.sh` と同じ名前の関数を定義しない（例外: `fail`。確認スイートの `count` / `pool_total`）。grep による静的な確認で、変更前のコードでは `bench.sh`（`now_ms` / `wait_until`）と `dev_up.sh`（`alive` / `now_ms` / `wait_until`）を検出する | docs.sh#4（新規。構文の確認は #5 に移動） |
+
+変更したスクリプト: `dev_up.sh` の `alive` / `wait_until` を `pid_alive` / `wait_for` に改名し（引数の形が違うため）、使っていない
+`now_ms` を削除した。`bench.sh` の `now_ms` / `wait_until` は `common.sh` と引数の形・動作が同じ（待つ間隔だけ 0.5 秒と 0.3 秒）なので削除し、
+`common.sh` のものを使う（bench.sh は core.sh#9 が実行する）。
 
 ## 再編前後の所要時間
 
