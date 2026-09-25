@@ -20,8 +20,8 @@ pub use load::{DEFAULT_TOML, ENV_PREFIX, Loaded, SECRET_KEYS, Sources, env_name,
 pub use model::{
     Admin, Api, App, AppConfig, Argon2, Auth, AuthMode, Chain, Credentials, Db, DbBackend,
     DisplayTimezone, Election, Env, Labels, MAX_KEYSPACE_LEN, MAX_REVOTES_LIMIT,
-    MIN_LEASE_TTL_SECS, MIN_SESSION_SECRET_LEN, Mode, RevealBallots, Seal, Sealer, Session, Shard,
-    Timestamp, Web, check_keyspace,
+    MAX_SAMPLE_OPEN_HOURS, MIN_LEASE_TTL_SECS, MIN_SESSION_SECRET_LEN, Mode, RevealBallots, Sample,
+    Seal, Sealer, Session, Shard, Timestamp, Web, check_keyspace,
 };
 pub use secret::{MASK, Secret};
 

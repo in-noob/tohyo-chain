@@ -707,6 +707,23 @@ fn revotes_are_off_by_default_and_the_limit_is_validated() {
 }
 
 #[test]
+fn sample_data_settings_have_defaults_and_are_validated() {
+    let c = load_for_test(&[]).expect("defaults").config;
+    assert_eq!(c.sample.open_hours, 24);
+    assert_eq!(c.sample.output_dir, std::path::PathBuf::from("out/sample"));
+    let c = load_for_test(&[("sample.open_hours", "720")])
+        .expect("valid")
+        .config;
+    assert_eq!(c.sample.open_hours, 720);
+    for bad in ["0", "721", "-1", "x"] {
+        let text = err_text(load_for_test(&[("sample.open_hours", bad)]));
+        assert!(text.contains("sample.open_hours"), "{bad}: {text}");
+    }
+    let text = err_text(load_for_test(&[("sample.output_dir", " ")]));
+    assert!(text.contains("sample.output_dir"), "{text}");
+}
+
+#[test]
 fn the_revote_key_lives_only_in_the_secrets_directory() {
     let (config, secrets) = (TempDir::new(), TempDir::new());
     let loaded = load_from(&sources(&config, &secrets, &[])).expect("valid");

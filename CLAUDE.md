@@ -19,6 +19,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Web (Trunk): **`trunk` コマンドは必ず `crates/web` で実行する**（`cd crates/web && trunk serve` / `cd crates/web && trunk build --release`）。ワークスペースのルートで実行すると `could not find the root package of the target crate` で失敗する
 - 設定の確認: `cargo run -p app-config -- show`（実効値と出所。秘密情報は ***）/ `get KEY` / `validate`。設定は原則 11（config/、環境変数は `APP__<セクション>__<項目>`）
 - 手元で動かす: `scripts/dev_up.sh [memory|cassandra] [--auth stub|db]` / `scripts/dev_down.sh`（画面 http://localhost:8080、api 18080）。認証の既定は、memory が stub、cassandra が db（起動時に credgen が名簿の有権者を登録し、ID とパスワードを secrets/credentials.csv に出力する）
+- 確認用のサンプルデータ: `APP__APP__MODE=db scripts/sample_data.sh [--phase before|open|closed] [--yes]`（ADR 0023。db_reset --all → seedgen → election.sh schedule →
+  credgen → API で事前の投票 → 封印。パターン P01〜P13 の ID・パスワードと期待結果を out/sample/credentials_patterns.csv（0600）に出す。
+  期間の長さは sample.open_hours。画面で見るには `APP__ELECTION__SEED_DIR=out/sample/seed scripts/dev_up.sh cassandra`。check/auth.sh#2 が CSV の各行を実際に試す）
 - 選挙状態（scheduled → open → closing → closed。原則17・18）: `scripts/election.sh status | schedule --opens-at <RFC3339> --closes-at <RFC3339> | open --now | close --now`（管理用リスナー admin.bind、既定 127.0.0.1:18081。トークンは secrets/admin_token か環境変数 APP__ADMIN__TOKEN）
 - Step 完了確認: `scripts/check_all.sh`（fmt / clippy / test と `scripts/check/*.sh`（core / chain / election / auth / web / docs の 6 スイート）をすべて実行。ルートから実行する。対応表は docs/testing.md）
 

@@ -1,8 +1,9 @@
 # shellcheck shell=bash
-# scripts/check/*.sh・scripts/dev_up.sh・scripts/db_reset.sh・scripts/bench.sh・scripts/tally.sh 共通の処理。
+# scripts/check/*.sh・scripts/dev_up.sh・scripts/db_reset.sh・scripts/sample_data.sh・scripts/bench.sh・scripts/tally.sh 共通の処理。
 # ワークスペースのルートで source する。
 #
 #   設定（crates/app-config）  cfg_build / cfg_init / cfg_get / admin_token（README の「設定」節）
+#   開発用の秘密情報           dev_default_secrets / ensure_revote_key
 #   DB（Cassandra / ScyllaDB） db_setup_vars / db_check_docker / db_static_checks / db_ensure / db_fresh /
 #                              db_fresh_stop / db_node_addr / db_stop
 #   専用キースペース           ks_init / ks_cql / ks_create / ks_matching / ks_drop
@@ -10,10 +11,11 @@
 #   起動・停止・待ち合わせ     spawn / alive / graceful_stop / hard_stop / stop_all / wait_port / wait_healthz /
 #                              wait_until / now_ms
 #   アサーション               fail / request / expect_status / count / login
+#   DB 認証の有権者の操作      db_login / token_of / ballots_of / ballot_field / ballot_count / cast_vote
 #
 # 確認スイート（scripts/check/*.sh）は、手元の設定（config/local.toml、secrets/、環境変数 APP__…）の影響で
 # 結果が変わらないよう、cfg_init で設定を分離する（下記）。CFG_USE_REAL=1 なら分離しない
-# （scripts/dev_up.sh・scripts/db_reset.sh は、手元の実際の設定を使う）。
+# （scripts/dev_up.sh・scripts/db_reset.sh・scripts/sample_data.sh は、手元の実際の設定を使う）。
 
 # fail が未定義のスクリプトのための既定。個々のスイートは、ログの末尾を表示するなど、より詳しい fail を上書きしてよい。
 if ! declare -F fail >/dev/null 2>&1; then
@@ -63,6 +65,38 @@ admin_token() {
         printf '%s' "$APP__ADMIN__TOKEN"
     else
         cat "${APP_SECRETS_DIR:-secrets}/admin_token" 2>/dev/null | tr -d '\n' || true
+    fi
+}
+
+# --- 開発用の秘密情報（scripts/dev_up.sh・scripts/sample_data.sh が使う。本番で使わないこと）---
+# 公開されている固定値。署名鍵の種は、DB に登録された公開鍵と一致しないと sealer が起動を拒否するので、
+# sample_data.sh で作ったデータを dev_up.sh で見るには、両方が同じ値を使う必要がある（だからここで共有する）。
+DEV_SESSION_SECRET="dev-only-secret-do-not-use-in-production-0123456789"
+DEV_SIGNING_SEED="0707070707070707070707070707070707070707070707070707070707070707"
+DEV_ADMIN_TOKEN="dev-only-admin-token-do-not-use-in-production-0123456789"
+
+# dev_default_secrets: 環境変数でも secrets/ でも指定されていない秘密情報にだけ、開発用の固定値を環境変数で渡す。
+dev_default_secrets() {
+    local var file value
+    while read -r var file value; do
+        if [[ -z "${!var:-}" && ! -f "${APP_SECRETS_DIR:-secrets}/$file" ]]; then
+            export "$var=$value"
+        fi
+    done <<EOF
+APP__SESSION__SECRET session_secret $DEV_SESSION_SECRET
+APP__SEALER__SIGNING_SEED sealer_signing_seed $DEV_SIGNING_SEED
+APP__ADMIN__TOKEN admin_token $DEV_ADMIN_TOKEN
+EOF
+}
+
+# ensure_revote_key: 再投票の鍵（vote.allow_revote = true のときだけ。ADR 0022）は、固定値にしない: secrets/revote_key にだけ置き、
+# 締切の手続きでファイルごと破棄されるので、無ければ、その都度、乱数で作る（権限 0600。git 管理外）。cfg_build の後に呼ぶ。
+ensure_revote_key() {
+    local dir="${APP_SECRETS_DIR:-secrets}"
+    if [[ "$(cfg_get vote.allow_revote)" == true && ! -f "$dir/revote_key" ]]; then
+        mkdir -p "$dir"
+        (umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$dir/revote_key")
+        echo "再投票の鍵を ${dir}/revote_key に作りました（締切の手続きで破棄されます）"
     fi
 }
 
@@ -462,6 +496,37 @@ login() {
         -d "{\"voter_id\":\"$1\",\"my_number\":\"123456789012\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
 }
 export -f login
+
+# --- DB 認証（auth.mode=db）の有権者としての操作（scripts/sample_data.sh と check/auth.sh#2 が使う）---
+#   db_login LOGIN_ID PASSWORD           ログインし、STATUS / BODY を設定する（マイナンバーは固定のダミー値）
+#   token_of                             BODY（ログインの応答）のトークン
+#   ballots_of TOKEN                     GET /api/v1/ballot-status の本文を BALLOTS に入れる（投票用紙は表示順）
+#   ballot_field K FIELD                 BALLOTS の、表示順で K 番目（1 始まり）の投票用紙の項目（contest_id / voted / ballots_cast）
+#   ballot_count                         BALLOTS の投票用紙の数
+#   cast_vote TOKEN CONTEST CANDIDATE [REVOTE]
+#                                        CONTEST（{election_id}/{district_id}）に投票し、STATUS / BODY を設定する。
+#                                        REVOTE（画面が見た ballots_cast）を付けると再投票
+BALLOTS=""
+db_login() {
+    request POST /api/v1/login "" "{\"login_id\":\"$1\",\"password\":\"$2\",\"my_number\":\"123456789012\"}"
+}
+token_of() { sed -n 's/.*"token":"\([^"]*\)".*/\1/p' <<<"$BODY"; }
+ballots_of() {
+    request GET /api/v1/ballot-status "$1"
+    expect_status 200 "GET /api/v1/ballot-status"
+    BALLOTS="$BODY"
+}
+ballot_field() {
+    { grep -o "\"$2\":\"\{0,1\}[^\",}]*" <<<"$BALLOTS" || true; } | sed -n "${1}p" | sed 's/.*:"\{0,1\}//'
+}
+ballot_count() {
+    { grep -o '"contest_id":' <<<"$BALLOTS" || true; } | wc -l | tr -d ' '
+}
+cast_vote() {
+    local body="{\"candidate_id\":\"$3\"}"
+    [[ -n "${4:-}" ]] && body="{\"candidate_id\":\"$3\",\"revote\":$4}"
+    request POST "/api/v1/contests/$2/vote" "$1" "$body"
+}
 
 pool_total() {
     request GET /debug/pool

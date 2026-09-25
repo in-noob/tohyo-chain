@@ -10,7 +10,7 @@
 .env
 .env.*
 
-# 実行時の生成物（開票結果など）
+# 実行時の生成物（開票結果・確認用のサンプルデータ out/sample/（平文のパスワードを含む credentials_patterns.csv）など）
 /out/
 
 # 実環境の設定（コミットするのは *.example.toml だけ）

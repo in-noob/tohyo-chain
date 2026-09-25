@@ -66,7 +66,7 @@ scripts/dev_down.sh                      # 停止
   `cargo run -q -p verifier -- demo`（オフラインのデモ）を使う。
 - 設定は「[設定](#設定)」の仕組みで読む（`config/dev.toml` が効く。手元の上書きは `config/local.toml`）。ポート（`api.port` / `web.port`）と画面の文言（`labels.*`）も設定から渡す。
   起動前に設定を検証し、不正なら、どのファイルのどの項目がなぜ不正かを表示して終了する。
-- スクリプト内のシークレットと署名鍵は、**開発用の固定値**（`APP__SESSION__SECRET` や `secrets/` で指定していれば、そちらを使う）。公開されているので、本番では絶対に使わないこと。
+- シークレットと署名鍵は、**開発用の固定値**（`scripts/lib/common.sh` の `dev_default_secrets`。`sample_data.sh` と共用。`APP__SESSION__SECRET` や `secrets/` で指定していれば、そちらを使う）。公開されているので、本番では絶対に使わないこと。
 - 前提: `trunk`（`cargo install trunk --locked`）と wasm ターゲット（下の「前提」）。初回は wasm のビルドで数分かかる。
   cassandra モードには Docker（Compose プラグイン）も必要。
 
@@ -193,6 +193,56 @@ scripts/db_reset.sh --yes      # 確認を省略
 削除する件数を表示して、`yes` と入力するまで削除しない。**api や sealer が動いているときは、止めるよう促して終了する**
 （動いている最中に消すと、sealer が持っているチェーンの状態と DB が食い違うため）。`app.env=production` では、何も削除せずにエラーで終了する。
 `app.mode=memory` では「再起動するとリセットされます」と表示して終了する。対象は設定の `db.keyspace`（`APP__DB__KEYSPACE`）。
+
+## 確認用のサンプルデータ（`scripts/sample_data.sh`）
+
+開発環境の DB に、ユーザー単位の確認パターン（P01〜P13）を一括で登録し、ID・パスワードと**期待結果**を CSV に出力する
+（`app.mode=db` 用。[ADR 0023](docs/adr/0023-sample-data.md)）。
+
+```
+scripts/dev_down.sh                                          # api / sealer が動いていたら止める（動いていると拒否される）
+APP__APP__MODE=db scripts/sample_data.sh                     # = --phase open: 投票期間中（今から sample.open_hours 時間。既定 24）
+APP__APP__MODE=db scripts/sample_data.sh --phase before      # 投票の開始前（開始は sample.open_hours 時間後）
+APP__APP__MODE=db scripts/sample_data.sh --phase closed      # 投票の終了後（事前の投票の後に close --now で締め切る）
+APP__APP__MODE=db scripts/sample_data.sh --yes               # DB のリセットの確認を省略
+APP__ELECTION__SEED_DIR=out/sample/seed scripts/dev_up.sh cassandra   # 作ったデータを画面で確認する（選挙データの場所を渡す）
+```
+
+新しい仕組みは作らず、既存のスクリプトと CLI を順に使う: `db_reset.sh --all`（スキーマの作成を含む）→ `seedgen`（小規模の選挙データ。
+32 都道府県・各 1 選挙区・候補者 2 人。32 は参議院の合区（鳥取・島根）が現れる最小の数）→ api・sealer の起動 →
+`election.sh schedule`（選挙期間）→ `credgen`（有権者の登録。P13 は `credgen --reissue`）→ API での事前の投票 →
+封印（open は封印のルール、closed は `election.sh close --now` の締切の手続き）→ CSV の出力 → api・sealer の停止。
+
+| ID | パターン | 事前の状態 |
+|---|---|---|
+| P01 | 通常（未投票、投票用紙が複数） | 9 枚すべて未投票 |
+| P02 | 投票用紙が1枚だけ | 最高裁判所裁判官国民審査（全国）だけ |
+| P03 | 合区の選挙区に属する | 参議院選挙区が「鳥取県・島根県選挙区（合区）」 |
+| P04 | 投票できる投票用紙がない | 名簿の選挙区が空（ログインはできる） |
+| P05 | 一部の投票用紙だけ投票済み | 1 枚目だけ投票済み |
+| P06 | すべて投票済み | 9 枚すべて投票済み |
+| P07 | 白票で投票済み | 1 枚目に白票（`vote.allow_blank=false` では作成不可） |
+| P08 | 再投票済み（A→B） | 1 枚目を候補者 1 → 候補者 2 にやり直し済み（`vote.allow_revote=false` では作成不可） |
+| P09 | 再投票の上限に到達 | 1 枚目を `vote.max_revotes` 回やり直し済み（同上） |
+| P10 | パスワード誤り | 正しいログイン ID と、誤ったパスワード |
+| P11 | 存在しないID | 形式は正しいが、登録されていないログイン ID |
+| P12 | IDの形式が不正 | 空白と記号を含むログイン ID |
+| P13 | 再発行済み | 2 行: 再発行前の ID とパスワード（失敗）/ 再発行後の ID とパスワード（成功） |
+
+- `--phase before` では、事前の投票が必要な P05〜P09 は作れないので、CSV に「作成不可（開始前のため）」と書く（ID・パスワードは空）。
+- 出力: `<sample.output_dir>/credentials_patterns.csv`（既定 `out/sample/`。**平文のパスワードを含む**。権限 0600・git 管理外）。
+  列は `pattern_id, pattern_name, login_id, password, 都道府県, 選挙区, 投票用紙の数, 期待結果_ログイン, 期待結果_投票, 期待結果_再投票, 備考`。
+  最後に、パターンごとの要約表（パスワードは表示しない）をターミナルに出す。
+- **期待結果は、実際の選挙状態・`open` で固定した選挙のルール（`allow_revote` / `allow_blank` / `max_revotes`）・期間から計算する**
+  （API の判定の順: 受付期間 → 再投票の可否 → 投票対象か → 投票先 → 投票済みか → 上限）。セルは「<操作> → <結果>」の形で、そのまま手順になる:
+  - 期待結果_投票: 「表示順で先頭の未投票の投票用紙（無ければ 1 枚目）に、候補者 1（P07 は白票）で投票」。例 `2枚目に候補者1で投票 → 成功（201）`
+  - 期待結果_再投票: 「先頭の投票済みの投票用紙（無ければ 1 枚目）を、候補者 2 でやり直す（`revote` = その `ballots_cast`）」。例 `1枚目を候補者2でやり直し → 拒否（409 revote_limit_reached）`
+  - 投票用紙がない P04 は、`対象外の投票用紙（<contest_id>）` に対して試す。ログインできない行は `—`。
+  - 試す順は **ログイン → 再投票 → 投票**（投票の確認で未投票が投票済みに変わり、再投票の結果が変わるため）。確認で投票すると状態が
+    変わるので、やり直すときはスクリプトを再実行する。期待結果は、開始前は開始時刻まで、投票期間中は終了時刻まで有効。
+- `scripts/check/auth.sh#2` が、3 つの phase のそれぞれで実行し、CSV の各行を実際に試して期待結果と一致することを確認する（CSV がそのままテスト仕様）。
+- `app.env=production` では何もせずに終了し、`app.mode=memory` では db モードで実行するよう案内して終了する。認証は db（環境変数で渡す）。
+  秘密情報は `dev_up.sh` と同じ開発用の固定値（`scripts/lib/common.sh`。署名鍵が同じなので、そのまま `dev_up.sh cassandra` で確認できる）。
 
 ## デザインとテーマ（ライト / ダーク）
 
@@ -376,6 +426,7 @@ eval "$(cargo run -q -p app-config -- web-env)"   # 画面の文言（labels.*�
 | `election.voting_opens_at` / `voting_closes_at` | 空 | 投票の開始（RFC 3339。**未実装**）/ 締切（RFC 3339。`verifier tally` の「締切後の集計か」の判定と、`chain.reveal_ballots=after_close` の公開の判定に使う。空だと `--allow-interim` なしでは集計できない。api は、締切後の投票を拒否しない）|
 | `vote.allow_blank` | `true` | 白票を選べるか（[白票](#白票)）。選挙状態が `open` に移った時点の値を固定し、それ以降は設定を変えても使わない（原則19）|
 | `vote.allow_revote` / `vote.max_revotes` | `false` / `5` | 投票期間中の再投票を認めるか・上限回数（1〜100。初回の投票を含めない）（[再投票](#再投票)）。`open` に移った時点で固定する |
+| `sample.open_hours` / `sample.output_dir` | 24 / `out/sample` | 確認用のサンプルデータ（`scripts/sample_data.sh`）の投票期間の長さ（時間。1〜720）/ 出力先（選挙データと CSV）（[確認用のサンプルデータ](#確認用のサンプルデータscriptssample_datash)）|
 | `chain.reveal_ballots` | `always` | ブロックの詳細で票の中身を公開するタイミング（`always` = 常に / `after_close` = `election.voting_closes_at` 以後だけ。要 `voting_closes_at`）。[ビューア](#ブロックチェーンのビューアchain)を参照 |
 | `labels.*` | 現行の文言 | 画面・API のエラー・集計の文言（`site_title` / `done_message` / `login_heading` / `ballot_item`（既定「投票用紙」）/ `progress`（既定「{total}枚中{current}枚目」）/ `blank_option`（白票の選択肢。既定「白票（どの候補者にも投票しない）」）/ `blank_confirm`（白票の確認の文言。既定「白票として投票します。よろしいですか？」）/ `blank_name`（集計・ビューア・エラーでの白票の呼び名。既定「白票」）/ `revote_button`（既定「投票をやり直す」）/ `revote_confirm`（既定「前回の投票内容を変更します」）/ `revote_limit_reached`（上限の理由。`{max}` は上限回数。既定「やり直しの上限（{max}回）に達しています」））|
 
@@ -542,7 +593,7 @@ scripts/check_all.sh        # 上記に加えて、scripts/check/*.sh の全ス�
 | `core.sh` | api の起動・`domain::seal_policy` の単体テスト・設定（ファイルの反映・環境変数の優先・秘密情報・不正な設定での起動失敗・`labels.*` の web への反映）・性能計測ツール一式（`bench.sh`）・白票（投票 → 封印 → tally の白票の数・`vote.allow_blank=false` での拒否）・再投票（A → B → 白票・上限・同時の再投票・締切での鍵の破棄・tally は最後の票だけ・`vote.allow_revote=false` では 409） | 約 5 分（Docker が必要） |
 | `chain.sh` | `verifier demo`・封印ポリシー（トリガー・verify・改ざん検出）・「更新がなければ追加しない」・DB 永続化とクラッシュ復旧・複数 sealer のリース引き継ぎ・`verifier tally`（集計）・ブロックチェーンのビューア API・封印ルール（原則9: 最小件数・close --now での締切の封印）・再投票（DB の LWT・締切前の非公開・sealer による鍵の破棄・verify / tally・置き換えのリンク） | 約 10 分（Docker が必要） |
 | `election.sh` | 投票フロー（ログイン・状態・候補者・投票・再投票拒否・並列・対象外・秘密投票）・47 都道府県規模の選挙データ（生成・表示範囲・投票順・壊れたデータの検出）・選挙状態の遷移と投票の受付期間（schedule → 自動 open → 自動 closing → closed・期間の境界・締切直前の票の封印・公開用ポートと管理用リスナーの分離） | 約 1.5 分 |
-| `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh` | 約 1.5 分（Docker が必要） |
+| `auth.sh` | credgen（ID・パスワードの事前登録）・DB 認証・`db_reset.sh`・確認用のサンプルデータ（`sample_data.sh` を 3 つの phase で実行し、CSV の各行を実際に試す） | 約 4 分（Docker が必要） |
 | `web.sh` | 画面遷移ロジック（flow）・純粋性と依存方向・wasm 向け clippy・デザイントークン・テーマ・`trunk build --release`・白票（選択肢・確認の文言・ビューアの別の行）・投票のやり直し（完了画面のボタン・一覧・上限の理由・確認の文言・置き換えのリンク） | 数秒〜数十秒 |
 | `docs.sh` | 旧来の呼び名・環境変数名・封印ルールの旧名が残っていないこと、全スクリプトの構文（`bash -n`） | 1 秒未満 |
 

@@ -151,6 +151,15 @@ bind = "127.0.0.1:18081"
 # 管理用エンドポイントのトークン（秘密情報）は、この設定ファイルには書けない。
 # 環境変数 APP__ADMIN__TOKEN か secrets/admin_token で渡す（scripts/election.sh が使う）。
 
+[sample]
+# 確認用のサンプルデータ（scripts/sample_data.sh。README の「確認用のサンプルデータ」）の設定。
+# --phase open のときの投票期間の長さ（時間。1〜720）。期間は「今から open_hours 時間」（開始は実行した時刻）。
+# --phase before では、開始は今から open_hours 時間後、終了はその open_hours 時間後。
+open_hours = 24
+# 出力先のディレクトリ。選挙データ（<output_dir>/seed）と、パターンごとの ID・パスワードの CSV
+# （<output_dir>/credentials_patterns.csv。平文のパスワードを含む。権限 0600）を置く。git 管理外の場所にする。
+output_dir = "out/sample"
+
 [labels]
 # 画面の文言。画面（web）はビルド時に受け取る: eval "$(cargo run -q -p app-config -- web-env)" してから trunk を実行する。
 # ヘッダに表示するサイト名。
