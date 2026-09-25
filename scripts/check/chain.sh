@@ -16,6 +16,9 @@
 # 環境変数（APP__DB__BACKEND / DB_PORT / KEEP_KEYSPACE / STOP_DB）は scripts/lib/common.sh を参照。
 set -euo pipefail
 
+# --help: 先頭のコメント（使い方）を表示して終わる（何も起動・変更しない。scripts/check/docs.sh#8 が確認する）。
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0; }
+
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR/.."
 source scripts/lib/common.sh
@@ -29,7 +32,7 @@ cargo build -q -p api --features dev-tools -p sealer -p verifier -p seedgen
 echo "共通ビルド: OK（api[dev-tools]・sealer・verifier・seedgen）"
 
 # ===========================================================================
-# 1. verifier demo（旧 check_step1.sh）
+# 1. verifier demo
 # ===========================================================================
 check_demo() (
     set -euo pipefail
@@ -56,7 +59,7 @@ check_demo() (
 )
 
 # ===========================================================================
-# 2. in-process sealer（memory。旧 check_step4.sh）
+# 2. in-process sealer（memory）
 # ===========================================================================
 check_inprocess_sealer() (
     set -euo pipefail
@@ -184,7 +187,7 @@ check_inprocess_sealer() (
 )
 
 # ===========================================================================
-# 3. 「データに更新がない場合は、ブロックチェーンに何も追加しない」（memory。旧 check_step10.sh）
+# 3. 「データに更新がない場合は、ブロックチェーンに何も追加しない」（memory）
 # ===========================================================================
 check_no_append_without_change() (
     set -euo pipefail
@@ -323,7 +326,7 @@ check_no_append_without_change() (
 )
 
 # ===========================================================================
-# 4. DB 永続化・復旧（DB。旧 check_step6.sh）
+# 4. DB 永続化・復旧（DB）
 # ===========================================================================
 check_db_persistence() (
     set -euo pipefail
@@ -429,7 +432,7 @@ check_db_persistence() (
     # -----------------------------------------------------------------------
     echo "== 3. 起動 1（封印間隔 600 秒）: DB 固有の並列書き込み（LWT）と、SIGTERM ではフラッシュしないこと"
     # ログイン・状態一覧・候補者一覧の詳細な検証は、保存先に依存しないアプリケーション層のロジックであり、
-    # election.sh（旧 check_step3）ですでに検証済みなので、ここでは行わない（docs/testing.md の「除外した項目」を参照）。
+    # election.sh#1 ですでに検証済み（保存先に依存しないハンドラ層のロジック）なので、ここでは行わない。
     # ここで見るのは、DB 固有の並列書き込み（Cassandra の LWT）が排他制御として機能すること。
     start_api 600 "起動 1"
     request GET /api/v1/chains/0/head
@@ -578,7 +581,7 @@ check_db_persistence() (
 )
 
 # ===========================================================================
-# 5. 複数 sealer のリース引き継ぎ（DB。旧 check_step7.sh）
+# 5. 複数 sealer のリース引き継ぎ（DB）
 # ===========================================================================
 check_multi_sealer() (
     set -euo pipefail
@@ -817,7 +820,7 @@ check_multi_sealer() (
 )
 
 # ===========================================================================
-# 6. verifier tally（DB。旧 check_step13.sh）
+# 6. verifier tally（DB）
 # ===========================================================================
 check_tally() (
     set -euo pipefail
@@ -1059,7 +1062,7 @@ check_tally() (
 )
 
 # ===========================================================================
-# 7. ブロックチェーンのビューア API（memory。旧 check_step14.sh）
+# 7. ブロックチェーンのビューア API（memory）
 # ===========================================================================
 check_viewer_api() (
     set -euo pipefail

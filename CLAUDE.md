@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 `tohyo-chain` is a Web投票システムのプロトタイプ（Cargo ワークスペース、Rust edition 2024）。水平スケール可能な API と、
-ハッシュチェーン（簡易ブロックチェーン）による改ざん検知を検証する。クレート構成・起動方法は [README.md](README.md)、
-守るべき原則は本ファイルの「投票システム プロトタイプ」節、設計判断は `docs/adr/` を参照。
+ハッシュチェーン（簡易ブロックチェーン）による改ざん検知を検証する。文書の入口は [README.md](README.md)（3 分で試す手順と、
+docs/ の目次）。守るべき原則は本ファイルの「投票システム プロトタイプ」節、設計判断は `docs/adr/` を参照。
 
 ## Commands
 
@@ -24,14 +24,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   期間の長さは sample.open_hours。画面で見るには `APP__ELECTION__SEED_DIR=out/sample/seed scripts/dev_up.sh cassandra`。check/auth.sh#2 が CSV の各行を実際に試す）
 - 選挙状態（scheduled → open → closing → closed。原則17・18）: `scripts/election.sh status | schedule --opens-at <RFC3339> --closes-at <RFC3339> | open --now | close --now`（管理用リスナー admin.bind、既定 127.0.0.1:18081。トークンは secrets/admin_token か環境変数 APP__ADMIN__TOKEN）
 - Step 完了確認: `scripts/check_all.sh`（fmt / clippy / test と `scripts/check/*.sh`（core / chain / election / auth / web / docs の 6 スイート）をすべて実行。ルートから実行する。対応表は docs/testing.md）
+- ツールの版: `scripts/env_report.sh --update`（rust-toolchain.toml・crates/web/Trunk.toml の trunk-version・Cargo.lock・docker-compose.yml と各ツールの --version から、docs/environment.md の版の表を作り直す。`--check` で差分の確認。ADR 0024）
 
 ## Tooling notes
 
-- Edition 2024 requires Rust 1.85 or newer.
+- Edition 2024 requires Rust 1.85 or newer. Rust の版は `rust-toolchain.toml` で固定している（rustup が自動で合わせる。上げるときは clippy を通して env_report で文書を更新する）。
 - `.vscode/launch.json` has CodeLLDB (`lldb`) debug configs for the `api` binary and its unit tests; it needs the CodeLLDB extension.
 - `target/` is git-ignored.
 - Trunk はカレントディレクトリの `Cargo.toml` からルートパッケージを探す。ワークスペースのルートは仮想マニフェスト（パッケージなし）なので、`index.html` と `Trunk.toml`（proxy 設定を含む）は `crates/web/` 直下に置き、`trunk` も `crates/web` で実行する。成果物は `crates/web/dist/`（git 管理外）。
-- web のビルドには `rustup target add wasm32-unknown-unknown` と `cargo install trunk --locked`（0.21 系）が必要。
+- web のビルドには wasm32 ターゲット（rust-toolchain.toml が入れる）と Trunk が必要。Trunk の版は `crates/web/Trunk.toml` の `trunk-version` で固定（違う版の trunk は起動を拒否する）。入れ方は docs/environment.md。
 
 ## Working rules
 
@@ -105,9 +106,12 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     APP__<セクション>__<項目>。秘密情報（session.secret、sealer.signing_seed）は設定ファイルに書くとエラーで、
     環境変数か secrets/（gitignore。1 ファイル 1 値）から読む。api / sealer / verifier / bench / スクリプトはすべて
     app-config から読み、設定値の直書きや環境変数の直接参照をしない（scripts/check/core.sh・scripts/check/docs.sh が確認する）。
-    不正な値は、起動時に「どのファイルのどの項目がなぜ不正か」を表示して終了する。未実装の機能に対応する項目
-    （投票の開始時刻 voting_opens_at など）は、指定されたら「未実装」で起動を失敗させる。
-    voting_closes_at は、verifier tally の締切判定と、chain.reveal_ballots=after_close の公開の判定に使う（api は締切後の投票を拒否しない）。
+    不正な値は、起動時に「どのファイルのどの項目がなぜ不正か」を表示して終了する。未実装の機能に対応する項目は、
+    指定されたら「未実装」で起動を失敗させる（現時点で該当する項目は無い）。
+    election.voting_opens_at / voting_closes_at は、init で DB に取り込み（以後は DB が正。原則17）、api の受付の判定（原則18）と、
+    chain.reveal_ballots=after_close の公開の判定に使う。
+    全項目の説明・既定値・変更できるタイミング（いつでも / open で固定 / init で固定など）は docs/configuration.md に書く
+    （default.toml の項目がすべて書かれていることを scripts/check/docs.sh#7 が確認する）。
     web は app-config に依存せず、ビルド時に必要な値（labels.*）だけを `app-config web-env` の環境変数で受け取る。
 12. 利用者に見える文言（画面・エラーメッセージ・集計結果の表示名）はコードに直接書かず、
     設定の labels から読む。コード内部の型名や API のパスは contest のまま残す。
@@ -115,7 +119,7 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
     （既定「{total}枚中{current}枚目」）。白票は、選択肢が labels.blank_option、確認画面が labels.blank_confirm、
     集計・ビューア・API のエラーでの呼び名が labels.blank_name（原則20）。再投票は、完了画面のボタンが labels.revote_button、
     確認画面が labels.revote_confirm、上限の理由（画面・API のエラー）が labels.revote_limit_reached（{max} は上限回数）。画面・API のエラー・集計に、旧来の呼び名（contest を片仮名にした語）は
-    使わない（crates/・config/・seed/・scripts/・README・CLAUDE.md を scripts/check/docs.sh が確認する）。
+    使わない（crates/・config/・seed/・scripts/・README・CLAUDE.md・docs/*.md を scripts/check/docs.sh が確認する）。
 13. ID は変更されない文字列コードにする。区割り変更など、将来変わり得る意味を ID に埋め込まない。
     都道府県は JIS X 0401 の2桁コード（01〜47）を使う。
     ID 体系（crates/domain/src/ids.rs。読み込み時に、形式・文字種・最大長を検証する）:
@@ -216,5 +220,9 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
 
 ## 作業ルール
 - 各フェーズ開始時に計画を提示し、承認後に実装する
+- 文書は README.md を入口にして docs/ に置き、同じ内容を複数の場所に書かない（README は概要・3 分で試す手順・目次だけ。
+  置き場所は ADR 0024）。仕様を変えたら、該当する docs/ の文書と CLAUDE.md を同じ変更で直す
+- スクリプトは `--help` で先頭のコメント（使い方）を表示し、何も起動・変更せずに終わる（文書に出てくるスクリプトは、実在と
+  `--help` を scripts/check/docs.sh#8 が確認する）
 - cargo fmt / cargo clippy -- -D warnings / cargo test を通してから完了報告する
 - 設計判断は docs/adr/NNNN-*.md に「背景・決定・理由・代替案」で記録する

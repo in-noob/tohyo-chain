@@ -1,0 +1,8 @@
+# Rust の版を固定する（rustup が、このディレクトリで自動的にこの版を使う。無ければ入れる）。
+# 版を上げるときは、ここを変えて cargo clippy --workspace -- -D warnings を通し、scripts/env_report.sh --update で
+# docs/environment.md を再生成する（docs/environment.md・ADR 0024）。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

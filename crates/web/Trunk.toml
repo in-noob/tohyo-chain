@@ -1,3 +1,7 @@
+# この版の Trunk で実行する（違う版だと trunk が起動を拒否する）。版の出どころはここだけで、docs/environment.md の
+# 版の表（scripts/env_report.sh）と、インストールの手順（cargo install trunk --version ...）がここから読む。
+trunk-version = "0.21.14"
+
 [build]
 target = "index.html"
 dist = "dist"

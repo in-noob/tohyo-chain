@@ -30,7 +30,7 @@ request_timeout_secs = 10
 
 [web]
 # 画面（trunk serve）のポート。/api は crates/web/Trunk.toml の proxy が api.port へ転送する
-# （Trunk.toml の値と一致させる。scripts/check_step9.sh が確認する）。
+# （Trunk.toml の値と一致させる。scripts/check/core.sh#3 が確認する）。
 port = 8080
 
 [db]
@@ -102,12 +102,12 @@ login_id_length = 10
 
 [election]
 # 選挙データのあるディレクトリ。選挙ごとに seed/<election_id>/ の下に、election.toml・districts.csv・
-# candidates/<選挙の種類>.csv・voters.csv を置く（README の「選挙データ」を参照）。
+# candidates/<選挙の種類>.csv・voters.csv を置く（docs/data-setup.md の「選挙データ」を参照）。
 seed_dir = "seed"
 # 読み込む選挙の ID（seed_dir の下のディレクトリ名。小文字の英数字・_・-、32 文字以内）。
 election_id = "2026-general"
 # 投票の受付期間（RFC 3339 形式で秒まで。タイムゾーンのオフセットが必須。例: 2026-10-01T09:00:00+09:00）。
-# 空なら、選挙状態は scheduled で止まり、electionctl / scripts/election.sh で手動で開始・終了する
+# 空なら、選挙状態は scheduled で止まり、scripts/election.sh で手動で開始・終了する
 # （原則17・18。ADR 0019）。開始が終了より後の値は起動時にエラーにする。
 voting_opens_at = ""
 # 投票の締切。次の 3 つに使う:
@@ -152,7 +152,7 @@ bind = "127.0.0.1:18081"
 # 環境変数 APP__ADMIN__TOKEN か secrets/admin_token で渡す（scripts/election.sh が使う）。
 
 [sample]
-# 確認用のサンプルデータ（scripts/sample_data.sh。README の「確認用のサンプルデータ」）の設定。
+# 確認用のサンプルデータ（scripts/sample_data.sh。docs/operations.md）の設定。
 # --phase open のときの投票期間の長さ（時間。1〜720）。期間は「今から open_hours 時間」（開始は実行した時刻）。
 # --phase before では、開始は今から open_hours 時間後、終了はその open_hours 時間後。
 open_hours = 24

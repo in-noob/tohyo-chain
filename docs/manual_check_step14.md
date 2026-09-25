@@ -1,28 +1,27 @@
 # Step 14 手動確認チェックリスト（ブロックチェーンのビューア）
 
-自動テスト（`scripts/check_step14.sh`）では、API（ページ送り・締切前後の票の公開・Cache-Control）と、画面のビルドまでを検証している。
+自動テスト（`scripts/check/chain.sh` の #7 と `scripts/check/web.sh` の #3）では、API（ページ送り・締切前後の票の公開・Cache-Control）と、画面のビルドまでを検証している。
 ブラウザでの見た目・操作・リンクのたどり方は、このチェックリストで確認する。
 各項目は、確認できたら `[x]` にする。
 
 ## 0. 準備
 
-- [ ] 前提: `rustup target add wasm32-unknown-unknown` と `cargo install trunk --locked`
+- [ ] 前提: [environment.md](environment.md) の手順で Rust と Trunk が入っている
 - [ ] 小さな選挙データを生成する（有権者 `voter-1`〜`voter-30`）:
   ```
   cargo run -q -p seedgen -- --out /tmp/seed-demo --election-id 2026-general --prefectures 3 --districts-per-pref 2 \
     --candidates-per-district 4 --voters 30 --municipalities-per-pref 2 --pref-assembly-districts-per-pref 2 --force
   ```
-- [ ] 締切を「数分後」にして、api を起動する（票の公開が、締切前後で変わることを確かめるため）:
+- [ ] 締切を「数分後」にして起動し、投票の受付を始める（票の公開が、締切前後で変わることを確かめるため）:
   ```
-  export APP__SESSION__SECRET=dev-secret-0123456789abcdef
   export APP__ELECTION__SEED_DIR=/tmp/seed-demo
   export APP__SEAL__MAX_BALLOTS=3            # 3 票ごとにブロックが増える
   export APP__SEAL__INTERVAL_SECS=10         # アンカーも 10 秒ごと（変化があれば）
   export APP__CHAIN__REVEAL_BALLOTS=after_close
   export APP__ELECTION__VOTING_CLOSES_AT=$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)
-  cargo run -p api
+  scripts/dev_up.sh                          # api 18080・画面 http://localhost:8080
+  scripts/election.sh open --now --yes
   ```
-- [ ] 別の端末で画面を起動: `cd crates/web && trunk serve`（http://localhost:8080）
 - [ ] 票を 30 票入れる（ブロックが 10 個できる）。各有権者が、名簿の 1 番目の選挙区に投票する:
   ```
   for n in $(seq 1 30); do

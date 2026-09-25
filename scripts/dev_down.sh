@@ -5,6 +5,9 @@
 #   リースも解放する）。未封印の票はフラッシュしない（原則9。残りの封印は、締切の手続きの中でだけ行う）。cassandra モードでは docker compose stop（ボリュームは削除しない）。
 set -euo pipefail
 
+# --help: 先頭のコメント（使い方）を表示して終わる（何も起動・変更しない。scripts/check/docs.sh#8 が確認する）。
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0; }
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 

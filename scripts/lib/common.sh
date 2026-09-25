@@ -2,7 +2,7 @@
 # scripts/check/*.sh・scripts/dev_up.sh・scripts/db_reset.sh・scripts/sample_data.sh・scripts/bench.sh・scripts/tally.sh 共通の処理。
 # ワークスペースのルートで source する。
 #
-#   設定（crates/app-config）  cfg_build / cfg_init / cfg_get / admin_token（README の「設定」節）
+#   設定（crates/app-config）  cfg_build / cfg_init / cfg_get / admin_token（docs/configuration.md）
 #   開発用の秘密情報           dev_default_secrets / ensure_revote_key
 #   DB（Cassandra / ScyllaDB） db_setup_vars / db_check_docker / db_static_checks / db_ensure / db_fresh /
 #                              db_fresh_stop / db_node_addr / db_stop
@@ -16,6 +16,13 @@
 # 確認スイート（scripts/check/*.sh）は、手元の設定（config/local.toml、secrets/、環境変数 APP__…）の影響で
 # 結果が変わらないよう、cfg_init で設定を分離する（下記）。CFG_USE_REAL=1 なら分離しない
 # （scripts/dev_up.sh・scripts/db_reset.sh・scripts/sample_data.sh は、手元の実際の設定を使う）。
+#
+# 読み込む（source する）ためのファイル。直接実行したとき（bash scripts/lib/common.sh --help）は、このコメントを表示して終わる。
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"
+    exit 0
+fi
 
 # fail が未定義のスクリプトのための既定。個々のスイートは、ログの末尾を表示するなど、より詳しい fail を上書きしてよい。
 if ! declare -F fail >/dev/null 2>&1; then

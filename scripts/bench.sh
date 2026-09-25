@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 性能計測（scripts/bench.sh）。結果は docs/benchmark.md にまとめる。
+# 性能計測（scripts/bench.sh）。結果の読み方は docs/architecture-scaling.md の「ベンチマーク結果の読み方」。
 #
 #   scripts/bench.sh run    [--configs "S:sealer数:api数,..."] [--out DIR]   構成ごとの負荷計測
 #   scripts/bench.sh store  [--shards "1,4,8"]                 [--out DIR]   DB 直接（api なし）の計測
@@ -29,6 +29,9 @@
 #   BENCH_COMPOSE_PROJECT=vote-bench  BENCH_DB_PORT=19042
 # ビルドは速度最適化の perf プロファイル（target/perf）で行う。
 set -euo pipefail
+
+# --help: 先頭のコメント（使い方）を表示して終わる（何も起動・変更しない。scripts/check/docs.sh#8 が確認する）。
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
