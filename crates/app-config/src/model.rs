@@ -82,6 +82,7 @@ pub struct AppConfig {
     pub vote: Vote,
     pub chain: Chain,
     pub admin: Admin,
+    pub sample: Sample,
     pub labels: Labels,
 }
 
@@ -210,6 +211,18 @@ pub struct Admin {
     /// 管理用エンドポイントのトークン（秘密情報）。`app.mode=db` かつ管理操作を使うときに必須。
     pub token: Option<Secret<String>>,
 }
+
+/// 確認用のサンプルデータ（`scripts/sample_data.sh`）の設定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sample {
+    /// `--phase open` の投票期間の長さ（時間）。期間は「今から `open_hours` 時間」。
+    pub open_hours: u32,
+    /// 出力先のディレクトリ（選挙データと、パターンごとの CSV）。
+    pub output_dir: PathBuf,
+}
+
+/// `sample.open_hours` の上限（30 日）。
+pub const MAX_SAMPLE_OPEN_HOURS: u64 = 720;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Labels {
@@ -597,6 +610,12 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         );
     }
 
+    let sample_open_hours = r.uint("sample.open_hours", 1, MAX_SAMPLE_OPEN_HOURS);
+    let sample_output_dir = r.text("sample.output_dir");
+    if sample_output_dir.trim().is_empty() {
+        r.bad("sample.output_dir", "空にできません");
+    }
+
     let admin_bind = r.text("admin.bind");
     if check_node(&admin_bind).is_err() {
         r.bad("admin.bind", "host:port の形式が必要です");
@@ -693,6 +712,10 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         admin: Admin {
             bind: admin_bind,
             token: admin_token,
+        },
+        sample: Sample {
+            open_hours: u32::try_from(sample_open_hours).unwrap_or(u32::MAX),
+            output_dir: PathBuf::from(sample_output_dir),
         },
         labels,
     })

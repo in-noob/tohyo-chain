@@ -23,7 +23,8 @@
 #   （設定から Trunk 用の設定ファイル .dev/trunk.toml を生成して使う）。画面の文言（labels.*）も、設定からビルド時に渡す（app-config web-env）。
 # ログ: logs/{api,sealer,trunk}.log。PID: .dev/pids（「役割 PID」を 1 行ずつ）。
 #
-# !! 下のシークレットと署名鍵は、開発用の固定値。公開されているので、本番では絶対に使わないこと。
+# !! シークレットと署名鍵は、開発用の固定値（scripts/lib/common.sh の dev_default_secrets。scripts/sample_data.sh と共用）。
+#    公開されているので、本番では絶対に使わないこと。
 #    （手元で secrets/session_secret や APP__SESSION__SECRET を指定していれば、そちらを使う。）
 set -euo pipefail
 
@@ -55,11 +56,6 @@ done
 DEV_DIR=.dev
 PIDS_FILE="$DEV_DIR/pids"
 LOG_DIR=logs
-
-# --- 開発用の固定値（本番で使わないこと）---
-DEV_SESSION_SECRET="dev-only-secret-do-not-use-in-production-0123456789"
-DEV_SIGNING_SEED="0707070707070707070707070707070707070707070707070707070707070707"
-DEV_ADMIN_TOKEN="dev-only-admin-token-do-not-use-in-production-0123456789"
 
 # 手元の設定（config/local.toml、secrets/、環境変数 APP__…）を、そのまま使う（確認スクリプトと違って分離しない）。
 CFG_USE_REAL=1
@@ -108,15 +104,6 @@ if [[ "$MODE" == memory && "$AUTH" == db ]]; then
     exit 2
 fi
 
-# 環境変数でも secrets/ でも指定されていない秘密情報にだけ、開発用の固定値を環境変数で渡す。
-# dev_default_secret 環境変数名 secrets/のファイル名 値
-dev_default_secret() {
-    local var="$1" file="$2" value="$3"
-    if [[ -z "${!var:-}" && ! -f "${APP_SECRETS_DIR:-secrets}/$file" ]]; then
-        export "$var=$value"
-    fi
-}
-
 port_in_use() { (: </dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
 alive() { kill -0 "$1" 2>/dev/null; }
 now_ms() { date +%s%3N; }
@@ -152,18 +139,10 @@ else
     export APP__APP__MODE=memory
 fi
 export APP__AUTH__MODE="$AUTH"
-dev_default_secret APP__SESSION__SECRET session_secret "$DEV_SESSION_SECRET"
-dev_default_secret APP__SEALER__SIGNING_SEED sealer_signing_seed "$DEV_SIGNING_SEED"
-dev_default_secret APP__ADMIN__TOKEN admin_token "$DEV_ADMIN_TOKEN"
+dev_default_secrets
 # 設定が不正なら、何も起動する前に、ここで（どのファイルのどの項目がなぜ不正か）を表示して終了する。
 "$CFG_BIN" validate >/dev/null || fail "設定が不正です（上のメッセージを参照。実効値は: cargo run -p app-config -- show）"
-# 再投票の鍵（vote.allow_revote = true のときだけ。ADR 0022）は、固定値にしない: secrets/revote_key にだけ置き、締切の手続きで
-# ファイルごと破棄されるので、無ければ、その都度、乱数で作る（権限 0600。git 管理外）。
-if [[ "$(cfg_get vote.allow_revote)" == true && ! -f "${APP_SECRETS_DIR:-secrets}/revote_key" ]]; then
-    mkdir -p "${APP_SECRETS_DIR:-secrets}"
-    (umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"${APP_SECRETS_DIR:-secrets}/revote_key")
-    echo "再投票の鍵を ${APP_SECRETS_DIR:-secrets}/revote_key に作りました（締切の手続きで破棄されます）"
-fi
+ensure_revote_key
 API_PORT_CFG="$(cfg_get api.port)"
 WEB_PORT="$(cfg_get web.port)"
 if [[ -f "$PIDS_FILE" ]]; then
@@ -204,8 +183,6 @@ rm -f "$LOG_DIR/sealer.log"
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == cassandra ]]; then
     echo "== 1. Cassandra の起動（docker compose）"
-    # shellcheck source=lib/common.sh
-    source "$SCRIPT_DIR/lib/common.sh"
     db_setup_vars
     db_check_docker
     db_ensure

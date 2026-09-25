@@ -210,6 +210,28 @@ scripts/check_all.sh       6 つのスイートを順番に実行し、成功・
 変更した確認: chain.sh#6 の改ざん（cqlsh の出力から票の tuple を取り出して書き換える）を、票の tuple の 4 つ目の要素（`revote`。
 再投票の無い選挙では `null`）に合わせた。`reconciliation.csv` の列に「うち再投票」を足したので、列番号を合わせた。
 
+## 追記: 確認用のサンプルデータ（ADR 0023）
+
+`scripts/sample_data.sh`（パターン P01〜P13 のサンプルデータと、期待結果つきの CSV）に合わせて、次を追加した。
+
+| 項目 | 新 |
+|---|---|
+| `app.env=production` では拒否（何も変更しない）・`app.mode=memory` では db モードでの実行を案内して終了・不正な `--phase` は終了コード 2・既定の出力先が `.gitignore` に登録済み | auth.sh#2（新規） |
+| `--phase before`（`allow_revote=false`）/ `open`（`allow_revote=true`・`max_revotes=2`）/ `closed`（`allow_revote=true`・`max_revotes=1`・`allow_blank=false`）のそれぞれで実行し、CSV の権限 0600・ヘッダ・14 行・作成不可の行（before は P05〜P09、closed は P07）・要約表（パスワードを出さない）・途中の CSV が残らない・終了後に api が残らない | auth.sh#2 |
+| api・sealer を起動し直して、CSV の各行で、実際にログイン → 再投票 → 投票 を試し、HTTP ステータスとエラーの種類が期待結果の列と一致する（投票用紙の数・P03 の合区も確認。CSV がそのままテスト仕様） | auth.sh#2 |
+| open: api が動いている間は、DB も CSV も変えずに拒否する。closed: `verifier verify` が OK・`revote_key` は破棄済み | auth.sh#2 |
+| 設定 `sample.open_hours`（1〜720）・`sample.output_dir`（空は不可）の既定値と検証 | `cargo test -p app-config`（`sample_data_settings_have_defaults_and_are_validated`） |
+
+変更したスクリプト: `scripts/dev_up.sh` の開発用の秘密情報（固定値と `dev_default_secret`）と再投票の鍵の生成を、`scripts/lib/common.sh` の
+`dev_default_secrets` / `ensure_revote_key` に移した（`sample_data.sh` と同じ署名鍵を使わないと、作ったデータを `dev_up.sh cassandra` で
+開けないため）。DB 認証での有権者の操作（`db_login` / `token_of` / `ballots_of` / `ballot_field` / `ballot_count` / `cast_vote`）も
+`common.sh` に置き、`sample_data.sh` と auth.sh#2 が共用する。
+auth.sh#1 のローカルの `login` / `token_of`（同じ処理）は削除し、`common.sh` の `db_login` / `token_of` を使う。
+
+直した不具合: `scripts/dev_up.sh cassandra` が、起動の途中（Cassandra の起動）で `common.sh` を読み直していたため、`dev_up.sh` 自身の
+`alive` / `wait_until`（引数の形が `common.sh` の同名の関数と違う）が上書きされ、「起動の完了を待つ」で必ず失敗していた。
+`common.sh` は冒頭で読み込み済みなので、読み直しを削除した（サンプルデータを画面で確認する手順が、この起動に依存するため）。
+
 ## 再編前後の所要時間
 
 `scripts/check_all.sh` を、直前まで（旧 `check_step0.sh`〜`check_step15.sh`、計 16 本）と、再編後（新 `scripts/check/*.sh`、

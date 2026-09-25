@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # auth スイート: ID・パスワードの事前登録（credgen）と、DB 認証（auth.mode=db）と、DB のリセット
-# （scripts/db_reset.sh）（対応表: docs/testing.md）。
+# （scripts/db_reset.sh）と、確認用のサンプルデータ（scripts/sample_data.sh）（対応表: docs/testing.md）。
+# auth#1
 #   1. credgen で 100 人分を登録 → CSV の件数・列・権限（0600）・文字（0/O/1/I/l なし）を確認。DB にはハッシュ（Argon2id）だけ
 #   2. 正しい ID とパスワードでログインでき、ログイン ID とは別の内部 voter_id で、DB の名簿の投票用紙に投票できる
 #   3. パスワード違い・存在しない ID・形式が不正な ID が、同じステータス・同じメッセージで失敗する（応答時間も同程度）
@@ -10,6 +11,12 @@
 #      （api / sealer が動いている間は拒否。確認なしでは何も消えない）
 #   6. db_reset --all --yes の後は、ログインできない
 #   7. app.env=production では、db_reset が拒否される。memory モードでは、再起動でリセットされると表示して終了する
+# auth#2（scripts/sample_data.sh。ADR 0023）
+#   0. app.env=production では拒否、memory モードでは db モードでの実行を案内して終了、不正な --phase は終了コード 2
+#   1. --phase before / open / closed のそれぞれで実行する（選挙のルールも phase ごとに変える）。CSV の権限 0600・ヘッダ・
+#      14 行（P13 は 2 行）・作成不可の行（before は P05〜P09、closed は allow_blank=false の P07）。要約表にパスワードを出さない
+#   2. api・sealer を起動し直して、CSV の各行で、実際にログイン → 再投票 → 投票 を試し、期待結果の列と一致することを確認する
+#   3. open: api が動いている間は、DB も CSV も変えずに拒否する。closed: verifier verify が OK・revote_key は破棄済み
 # 専用のキースペースを使う。共用の vote には触れない。
 # 環境変数（APP__DB__BACKEND / DB_PORT / KEEP_KEYSPACE / STOP_DB）は scripts/lib/common.sh を参照。
 set -euo pipefail
@@ -96,17 +103,9 @@ check_credgen_and_db_auth() (
         graceful_stop sealer
     }
 
-    # login LOGIN_ID PASSWORD → ステータスを STATUS、本文を BODY に入れる
-    login_raw() {
-        local data="$1"
-        STATUS="$(curl -sS -o "$TMP/body" -w '%{http_code}' -X POST "${BASE}/api/v1/login" \
-            -H 'Content-Type: application/json' -d "$data")"
-        BODY="$(cat "$TMP/body")"
-    }
-    login() {
-        login_raw "{\"login_id\":\"$1\",\"password\":\"$2\",\"my_number\":\"123456789012\"}"
-    }
-    token_of() { sed -n 's/.*"token":"\([^"]*\)".*/\1/p' <<<"$BODY"; }
+    # login_raw JSON → ステータスを STATUS、本文を BODY に入れる（ID とパスワードでのログインは common.sh の db_login、
+    # トークンの取り出しは token_of）
+    login_raw() { request POST /api/v1/login "" "$1"; }
 
     # CSV の n 行目（ヘッダを除く）の列（1: login_id, 2: password）
     csv_field() { sed -n "$(($2 + 1))p" "$1" | cut -d, -f"$3"; }
@@ -169,7 +168,7 @@ check_credgen_and_db_auth() (
     start_services
     LOGIN1="$(csv_field "$CSV" 1 1)"
     PASS1="$(csv_field "$CSV" 1 2)"
-    login "$LOGIN1" "$PASS1"
+    db_login "$LOGIN1" "$PASS1"
     [[ "$STATUS" == 200 ]] || fail "正しい ID とパスワードでログインできません（${STATUS}: ${BODY}）"
     TOKEN="$(token_of)"
     [[ -n "$TOKEN" ]] || fail "トークンを取得できません"
@@ -189,13 +188,13 @@ check_credgen_and_db_auth() (
 
     # -----------------------------------------------------------------------
     echo "== 3. パスワード違い・存在しない ID・形式が不正な ID は、同じステータスと同じメッセージで失敗する"
-    login "$LOGIN1" "WRONGPASSW0RD"
+    db_login "$LOGIN1" "WRONGPASSW0RD"
     WRONG_STATUS="$STATUS"
     WRONG_BODY="$BODY"
-    login "ZZZZZZZZZZ" "$PASS1"
+    db_login "ZZZZZZZZZZ" "$PASS1"
     UNKNOWN_STATUS="$STATUS"
     UNKNOWN_BODY="$BODY"
-    login "bad id!" "$PASS1"
+    db_login "bad id!" "$PASS1"
     MALFORMED_STATUS="$STATUS"
     MALFORMED_BODY="$BODY"
     login_raw "{\"login_id\":\"$LOGIN1\"}"
@@ -214,11 +213,11 @@ check_credgen_and_db_auth() (
     measure_ms() { # measure_ms LOGIN PASSWORD N → 平均ミリ秒
         local t0 t1 i
         t0="$(now_ns)"
-        for i in $(seq 1 "$3"); do login "$1" "$2"; done
+        for i in $(seq 1 "$3"); do db_login "$1" "$2"; done
         t1="$(now_ns)"
         echo $(((t1 - t0) / $3 / 1000000))
     }
-    login "$LOGIN1" "WRONGPASSW0RD" # ウォームアップ
+    db_login "$LOGIN1" "WRONGPASSW0RD" # ウォームアップ
     wrong_ms="$(measure_ms "$LOGIN1" "WRONGPASSW0RD" 10)"
     unknown_ms="$(measure_ms "ZZZZZZZZZZ" "WRONGPASSW0RD" 10)"
     echo "応答時間の平均: パスワード違い ${wrong_ms} ms / 存在しない ID ${unknown_ms} ms"
@@ -262,12 +261,12 @@ check_credgen_and_db_auth() (
     [[ "$out" == *"再発行 100"* ]] || fail "再発行が 100 人ではありません: ${out}"
     [[ "$(($(wc -l <"$REISSUE_CSV") - 1))" == 100 && "$(stat -c %a "$REISSUE_CSV")" == 600 ]] || fail "再発行の CSV の件数・権限が想定と異なります"
     expect_count credentials 100 "再発行後（古い認証情報は削除される）"
-    login "$LOGIN1" "$PASS1"
+    db_login "$LOGIN1" "$PASS1"
     [[ "$STATUS" == 401 ]] || fail "再発行の後も、古い ID とパスワードでログインできます（${STATUS}）"
     NEW_LOGIN="$(csv_field "$REISSUE_CSV" 1 1)"
     NEW_PASS="$(csv_field "$REISSUE_CSV" 1 2)"
     [[ "$NEW_LOGIN" != "$LOGIN1" ]] || fail "再発行されたログイン ID が、古いものと同じです"
-    login "$NEW_LOGIN" "$NEW_PASS"
+    db_login "$NEW_LOGIN" "$NEW_PASS"
     [[ "$STATUS" == 200 ]] || fail "再発行された ID とパスワードでログインできません（${STATUS}）"
     TOKEN="$(token_of)"
     ballots="$(curl -sS "${BASE}/api/v1/ballot-status" -H "Authorization: Bearer ${TOKEN}")"
@@ -284,7 +283,7 @@ check_credgen_and_db_auth() (
     expect_count participation 1 "動作中の拒否の後"
     echo "api / sealer 稼働中: 拒否（何も削除しない）: OK"
     for n in 2 3 4 5 6; do
-        login "$(csv_field "$REISSUE_CSV" "$n" 1)" "$(csv_field "$REISSUE_CSV" "$n" 2)"
+        db_login "$(csv_field "$REISSUE_CSV" "$n" 1)" "$(csv_field "$REISSUE_CSV" "$n" 2)"
         [[ "$STATUS" == 200 ]] || fail "ログインできません（再発行 ${n} 行目）"
         tok="$(token_of)"
         b="$(curl -sS "${BASE}/api/v1/ballot-status" -H "Authorization: Bearer ${tok}")"
@@ -319,7 +318,7 @@ check_credgen_and_db_auth() (
     echo "db_reset --votes: 投票データが 0 件、認証情報と選挙の定義は残る: OK"
 
     start_services
-    login "$NEW_LOGIN" "$NEW_PASS"
+    db_login "$NEW_LOGIN" "$NEW_PASS"
     [[ "$STATUS" == 200 ]] || fail "リセット後に、同じ ID とパスワードでログインできません（${STATUS}）"
     TOKEN="$(token_of)"
     ballots="$(curl -sS "${BASE}/api/v1/ballot-status" -H "Authorization: Bearer ${TOKEN}")"
@@ -339,7 +338,7 @@ check_credgen_and_db_auth() (
     expect_count credentials 0 "db_reset --all の後"
     expect_count voter_roll 0 "db_reset --all の後"
     start_services
-    login "$NEW_LOGIN" "$NEW_PASS"
+    db_login "$NEW_LOGIN" "$NEW_PASS"
     [[ "$STATUS" == 401 ]] || fail "db_reset --all の後も、ログインできます（${STATUS}）"
     stop_procs
     echo "db_reset --all: 認証情報が空になり、ログインできない: OK"
@@ -371,6 +370,219 @@ check_credgen_and_db_auth() (
     echo "OK: auth#1 credgen・DB 認証・db_reset（DB_BACKEND=${DB_BACKEND}）"
 )
 
+# -----------------------------------------------------------------------------
+# 2. 確認用のサンプルデータ（scripts/sample_data.sh。ADR 0023）: 3 つの phase のそれぞれで実行し、出力した CSV の各行について、
+#    実際にログイン・再投票・投票を試して、期待結果の列と一致することを確認する（CSV がそのままテスト仕様）。
+# -----------------------------------------------------------------------------
+check_sample_data() (
+    set -euo pipefail
+    db_setup_vars
+    ks_init auth2
+
+    PORT="${CHECK_API_PORT_SAMPLE:-18824}"
+    BASE="http://127.0.0.1:${PORT}"
+    export BASE
+    TMP="$(mktemp -d)"
+    API_LOG="$TMP/api.log"
+    SEALER_LOG="$TMP/sealer.log"
+    OUT="$TMP/sample"
+
+    export APP__APP__MODE=db
+    export APP__AUTH__MODE=db
+    export APP__DB__NODES="127.0.0.1:${DB_PORT}"
+    export APP__API__PORT="$PORT"
+    export APP__ADMIN__BIND="127.0.0.1:$((PORT + 1))"
+    export APP__SAMPLE__OUTPUT_DIR="$OUT"
+    # 再投票の鍵（secrets/revote_key）は、この確認専用の secrets ディレクトリに作られ、締切の手続きで破棄される。
+    export APP_SECRETS_DIR="$TMP/secrets"
+    export APP__SESSION__SECRET="auth2-check-secret-0123456789abcdef"
+    export APP__SEALER__SIGNING_SEED="0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    export APP__ADMIN__TOKEN="auth2-check-admin-token-0123456789abcdef"
+    export APP__SEALER__LEASE_TTL_SECS=6
+    # 投票期間中の事前の投票（16 票）を、10 秒で封印させる（最小件数は既定の 10 件）。締切の手続きの待ち時間も短くする。
+    export APP__SEAL__INTERVAL_SECS=10
+    export APP__ELECTION__STATE_CACHE_SECS=1
+    export APP__API__REQUEST_TIMEOUT_SECS=3
+    export APP__AUTH__ARGON2__MEMORY_KIB=4096
+    export RUST_LOG="info,tower_http=warn"
+    BLANK="$(cfg_get labels.blank_name)"
+
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        hard_stop sealer
+        rm -rf "$TMP"
+        ks_drop
+        db_stop
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        for f in "$API_LOG" "$SEALER_LOG" "$OUT/logs/api.log" "$OUT/logs/sealer.log"; do
+            if [[ -s "$f" ]]; then
+                echo "--- ${f}（末尾）---" >&2
+                tail -n 12 "$f" >&2
+            fi
+        done
+        exit 1
+    }
+
+    start_services() {
+        spawn sealer "$SEALER_LOG" env APP__SEALER__ID=auth2-sealer APP__ELECTION__SEED_DIR="$OUT/seed" ./target/debug/sealer
+        spawn api "$API_LOG" env APP__ELECTION__SEED_DIR="$OUT/seed" ./target/debug/api
+        wait_healthz "$BASE" 30 api || fail "api が起動しません"
+        chain_ready() { [[ "$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/api/v1/chains/0/head")" == 200 ]]; }
+        wait_until 60000 chain_ready || fail "sealer がチェーンを用意しません"
+    }
+    stop_services() {
+        graceful_stop api
+        graceful_stop sealer
+    }
+
+    # run_case CELL KIND TOKEN: 期待結果のセル（「<操作> → <結果>」）の操作を実際に行い、結果（HTTP ステータスとエラーの種類）を比べる。
+    #   操作: 「K枚目」（BALLOTS の表示順で K 番目）か「対象外の投票用紙（<contest_id>）」に、「候補者N」か白票で、投票（vote）／やり直し（revote。
+    #         revote には、その投票用紙の ballots_cast を入れる）
+    #   結果: 「成功（201）」か「拒否（<status> <error>）」
+    run_case() {
+        local cell="$1" kind="$2" token="$3" op res contest cast=0 candidate code err=""
+        op="${cell%% → *}"
+        res="${cell##* → }"
+        if [[ "$op" =~ ^([0-9]+)枚目 ]]; then
+            contest="$(ballot_field "${BASH_REMATCH[1]}" contest_id)"
+            cast="$(ballot_field "${BASH_REMATCH[1]}" ballots_cast)"
+        elif [[ "$op" =~ ^対象外の投票用紙（([^）]+)） ]]; then
+            contest="${BASH_REMATCH[1]}"
+        else
+            fail "${ROW_ID}: 操作を読めません: ${op}"
+        fi
+        [[ -n "$contest" ]] || fail "${ROW_ID}: 対象の投票用紙がありません: ${op}"
+        if [[ "$op" == *"${BLANK}で"* ]]; then
+            candidate=blank
+        elif [[ "$op" =~ 候補者([0-9]+) ]]; then
+            candidate="${contest#*/}.c${BASH_REMATCH[1]}"
+        else
+            fail "${ROW_ID}: 投票先を読めません: ${op}"
+        fi
+        [[ "$res" =~ （([0-9]{3})(\ ([a-z_]+))?）$ ]] || fail "${ROW_ID}: 結果を読めません: ${res}"
+        code="${BASH_REMATCH[1]}"
+        err="${BASH_REMATCH[3]}"
+        if [[ "$kind" == revote ]]; then
+            cast_vote "$token" "$contest" "$candidate" "$cast"
+        else
+            cast_vote "$token" "$contest" "$candidate"
+        fi
+        [[ "$STATUS" == "$code" ]] || fail "${ROW_ID}: ${cell}: 実際は ${STATUS}（${BODY}）"
+        [[ -z "$err" || "$BODY" == *"\"error\":\"${err}\""* ]] || fail "${ROW_ID}: ${cell}: エラーの種類が違います（${BODY}）"
+    }
+
+    # verify_csv PHASE: CSV の形式と、各行の期待結果を確かめる。
+    verify_csv() {
+        local phase="$1" csv="$OUT/credentials_patterns.csv" line tried=0 skipped=0 token n
+        [[ -f "$csv" ]] || fail "${csv} がありません"
+        [[ "$(stat -c %a "$csv")" == 600 ]] || fail "CSV の権限が 0600 ではありません: $(stat -c %a "$csv")"
+        [[ "$(head -1 "$csv")" == "pattern_id,pattern_name,login_id,password,都道府県,選挙区,投票用紙の数,期待結果_ログイン,期待結果_投票,期待結果_再投票,備考" ]] \
+            || fail "CSV のヘッダが想定と異なります: $(head -1 "$csv")"
+        [[ "$(tail -n +2 "$csv" | cut -d, -f1 | paste -sd' ')" == "P01 P02 P03 P04 P05 P06 P07 P08 P09 P10 P11 P12 P13 P13" ]] \
+            || fail "パターンの行が想定と異なります: $(tail -n +2 "$csv" | cut -d, -f1 | paste -sd' ')"
+        [[ "$(awk -F, '{print NF}' "$csv" | sort -u)" == 11 ]] || fail "列の数が 11 ではない行があります"
+        while IFS= read -r line; do
+            IFS=, read -r ROW_ID name login pw _ dist count e_login e_vote e_revote _ <<<"$line"
+            ROW_ID="${ROW_ID}（${name}）"
+            if [[ "$e_login" == 作成不可* ]]; then
+                [[ -z "$login" && -z "$pw" && "$e_vote" == "$e_login" && "$e_revote" == "$e_login" ]] \
+                    || fail "${ROW_ID}: 作成不可の行に、ID・パスワードか別の期待結果があります"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            [[ "$e_login" =~ （([0-9]{3}) ]] || fail "${ROW_ID}: 期待結果_ログインを読めません: ${e_login}"
+            db_login "$login" "$pw"
+            [[ "$STATUS" == "${BASH_REMATCH[1]}" ]] || fail "${ROW_ID}: ログイン: 期待 ${e_login}、実際は ${STATUS}"
+            tried=$((tried + 1))
+            if [[ "$e_vote" == —* ]]; then
+                [[ "$STATUS" != 200 && "$e_revote" == —* ]] || fail "${ROW_ID}: ログインできる行の投票が「—」です"
+                continue
+            fi
+            token="$(token_of)"
+            ballots_of "$token"
+            n="$(ballot_count)"
+            [[ "$n" == "$count" ]] || fail "${ROW_ID}: 投票用紙の数が ${n} です（CSV は ${count}）"
+            [[ "$ROW_ID" != P03* || "$dist" == *合区* ]] || fail "${ROW_ID}: 合区の選挙区がありません: ${dist}"
+            # 再投票を先に試す（投票の確認で、未投票の投票用紙が投票済みに変わるため）。
+            run_case "$e_revote" revote "$token"
+            ballots_of "$token"
+            run_case "$e_vote" vote "$token"
+        done < <(tail -n +2 "$csv")
+        echo "  ${phase}: ${tried} 行を試して期待結果どおり・作成不可 ${skipped} 行"
+        SKIPPED="$skipped"
+    }
+
+    echo "== 0. 準備"
+    db_check_docker
+    cargo build -q -p api -p sealer -p credgen -p seedgen -p verifier
+    db_ensure
+    echo "専用キースペース: ${KS}"
+
+    echo "== 1. app.env=production では拒否・memory モードは db モードでの実行を案内する"
+    mkdir -p "$TMP/config-prod"
+    printf '[app]\nmode = "db"\n' >"$TMP/config-prod/production.toml"
+    set +e
+    out="$(APP_CONFIG_DIR="$TMP/config-prod" APP__APP__ENV=production ./scripts/sample_data.sh --yes 2>&1)"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 && "$out" == *"production"* && "$out" == *"何も変更していません"* ]] || fail "app.env=production で拒否されません（rc=${rc}）: ${out}"
+    set +e
+    out="$(APP__APP__MODE=memory APP__AUTH__MODE=stub ./scripts/sample_data.sh --yes 2>&1)"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 && "$out" == *"APP__APP__MODE=db scripts/sample_data.sh"* ]] || fail "memory モードで、db モードでの実行が案内されません（rc=${rc}）: ${out}"
+    [[ ! -e "$OUT" ]] || fail "拒否したのに、出力先が作られています"
+    set +e
+    out="$(./scripts/sample_data.sh --phase later 2>&1)"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 2 && "$out" == *"before / open / closed"* ]] || fail "不正な --phase が、終了コード 2 で拒否されません（rc=${rc}）: ${out}"
+    echo "production: 拒否・memory: db モードの案内・不正な --phase: 終了コード 2: OK"
+    git check-ignore -q out/sample/credentials_patterns.csv || fail "既定の出力先 out/sample/credentials_patterns.csv が .gitignore に登録されていません"
+
+    # phase ごとに、選挙のルールも変えて、期待結果の計算（allow_revote / allow_blank / max_revotes）を確かめる。
+    for spec in "before:scheduled:false:true:5:5" "open:open:true:true:2:0" "closed:closed:true:false:1:1"; do
+        IFS=: read -r phase want_state revote blank max want_skipped <<<"$spec"
+        echo "== 2-${phase}. sample_data.sh --phase ${phase}（allow_revote=${revote} allow_blank=${blank} max_revotes=${max}）"
+        export APP__VOTE__ALLOW_REVOTE="$revote" APP__VOTE__ALLOW_BLANK="$blank" APP__VOTE__MAX_REVOTES="$max"
+        out="$(./scripts/sample_data.sh --phase "$phase" --yes 2>&1)" || { echo "$out" >&2; fail "sample_data.sh --phase ${phase} が失敗しました"; }
+        [[ "$out" == *"選挙状態: ${want_state}"* ]] || fail "要約に「選挙状態: ${want_state}」がありません: ${out}"
+        [[ "$(grep -cE '^P[0-9]{2} ' <<<"$out")" == 14 ]] || fail "要約表に、14 行（P13 は 2 行）がありません: ${out}"
+        if grep -Fq "$(sed -n 2p "$OUT/credentials_patterns.csv" | cut -d, -f4)" <<<"$out"; then fail "要約表にパスワードが表示されています"; fi
+        [[ ! -e "$OUT/.credgen.csv" && ! -e "$OUT/.credgen-reissue.csv" ]] || fail "credgen の途中の CSV（平文のパスワード）が残っています"
+        pgrep -x api >/dev/null && fail "sample_data.sh の終了後も api が動いています"
+        start_services
+        request GET /api/v1/election-status
+        [[ "$BODY" == *"\"phase\":\"${want_state}\""* ]] || fail "再起動後の選挙状態が ${want_state} ではありません: ${BODY}"
+        verify_csv "$phase"
+        [[ "$SKIPPED" == "$want_skipped" ]] || fail "作成不可の行が ${SKIPPED} 行です（期待 ${want_skipped}）"
+        if [[ "$phase" == before ]]; then
+            [[ "$(grep -c '作成不可（開始前のため）' "$OUT/credentials_patterns.csv")" == 5 ]] || fail "開始前に、P05〜P09 が「作成不可（開始前のため）」になっていません"
+        elif [[ "$phase" == open ]]; then
+            # 動いている api があると、DB を消さずに拒否する（CSV もそのまま）。
+            before_csv="$(md5sum <"$OUT/credentials_patterns.csv")"
+            set +e
+            out="$(./scripts/sample_data.sh --phase open --yes 2>&1)"
+            rc=$?
+            set -e
+            [[ "$rc" -ne 0 && "$out" == *"dev_down.sh"* ]] || fail "api が動いているのに、拒否されません（rc=${rc}）: ${out}"
+            [[ "$(md5sum <"$OUT/credentials_patterns.csv")" == "$before_csv" ]] || fail "拒否したのに、CSV が変わりました"
+            echo "  api の稼働中は拒否（DB・CSV はそのまま）: OK"
+        else
+            ./target/debug/verifier verify --api "$BASE" >"$TMP/verify.out" 2>&1 || { cat "$TMP/verify.out" >&2; fail "締切後のチェーンの検証が失敗しました"; }
+            [[ ! -e "$APP_SECRETS_DIR/revote_key" ]] || fail "締切後も revote_key が残っています"
+            echo "  締切後: verifier verify OK・revote_key は破棄済み: OK"
+        fi
+        stop_services
+    done
+    echo "OK: auth#2 確認用のサンプルデータ（DB_BACKEND=${DB_BACKEND}）"
+)
+
 check_credgen_and_db_auth
+check_sample_data
 
 echo "OK: check/auth.sh"
