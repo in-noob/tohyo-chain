@@ -105,11 +105,13 @@ if [[ "$MODE" == memory && "$AUTH" == db ]]; then
 fi
 
 port_in_use() { (: </dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
-alive() { kill -0 "$1" 2>/dev/null; }
-now_ms() { date +%s%3N; }
+# common.sh の alive（spawn で付けた名前で調べる）/ wait_until（ミリ秒・説明なし）とは引数の形が違うので、別の名前にする
+# （同じ名前にすると、後から読み込んだ方に置き換わる。scripts/check/docs.sh#4 が確認する）。
+# pid_alive PID: プロセスが生きているか（.dev/pids の PID は、このスクリプトの外で起動したものも含む）。
+pid_alive() { kill -0 "$1" 2>/dev/null; }
 
-# wait_until TIMEOUT_SECS DESCRIPTION CMD...: CMD が成功するまで待つ。
-wait_until() {
+# wait_for TIMEOUT_SECS DESCRIPTION CMD...: CMD が成功するまで待つ。時間切れなら、説明を付けて失敗する。
+wait_for() {
     local timeout="$1" what="$2" deadline
     shift 2
     deadline=$((SECONDS + timeout))
@@ -148,7 +150,7 @@ WEB_PORT="$(cfg_get web.port)"
 if [[ -f "$PIDS_FILE" ]]; then
     running=""
     while read -r role pid; do
-        [[ -n "${pid:-}" ]] && alive "$pid" && running="${running} ${role}(${pid})"
+        [[ -n "${pid:-}" ]] && pid_alive "$pid" && running="${running} ${role}(${pid})"
     done <"$PIDS_FILE"
     if [[ -n "$running" ]]; then
         echo "すでに起動しています:${running}" >&2
@@ -256,25 +258,25 @@ echo "  trunk: PID $!（ログ: $LOG_DIR/trunk.log。初回は wasm のビルド
 echo "== 5. 起動の完了を待つ"
 api_pid="$(awk '$1 == "api" {print $2}' "$PIDS_FILE")"
 api_ready() {
-    alive "$api_pid" || fail "api が終了しました"
+    pid_alive "$api_pid" || fail "api が終了しました"
     [[ "$(curl -s --max-time 2 "http://127.0.0.1:${API_PORT_CFG}/healthz" || true)" == *'"status":"ok"'* ]]
 }
-wait_until 60 "api の起動" api_ready
+wait_for 60 "api の起動" api_ready
 if [[ "$MODE" == cassandra ]]; then
     # sealer がシャード 0 のリースを取り、ジェネシスを作るまで（前回クラッシュした場合はリースの期限切れまで）待つ。
     sealer_pid="$(awk '$1 == "sealer" {print $2}' "$PIDS_FILE")"
     chain_ready() {
-        alive "$sealer_pid" || fail "sealer が終了しました"
+        pid_alive "$sealer_pid" || fail "sealer が終了しました"
         [[ "$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${API_PORT_CFG}/api/v1/chains/0/head" || true)" == 200 ]]
     }
-    wait_until 90 "sealer のチェーン準備" chain_ready
+    wait_for 90 "sealer のチェーン準備" chain_ready
 fi
 trunk_pid="$(awk '$1 == "trunk" {print $2}' "$PIDS_FILE")"
 web_ready() {
-    alive "$trunk_pid" || fail "trunk serve が終了しました"
+    pid_alive "$trunk_pid" || fail "trunk serve が終了しました"
     [[ "$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${WEB_PORT}/" || true)" == 200 ]]
 }
-wait_until 600 "画面（trunk serve）の起動" web_ready
+wait_for 600 "画面（trunk serve）の起動" web_ready
 CLEANUP_ON_EXIT=0
 
 API="http://localhost:${API_PORT_CFG}"

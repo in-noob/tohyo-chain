@@ -4,7 +4,9 @@
 #      （画面・API・集計の呼び名は labels.ballot_item から読む: 原則12）
 #   2. 旧来の環境変数名（SESSION_SECRET など）が残っていない。app-config 以外のコードが、環境変数を直接読んでいない。
 #      CLAUDE.md に原則 11（設定の集約）の記載がある
-#   3. すべてのシェルスクリプトが構文として正しい（bash -n）
+#   3. 封印ルールの旧名が残っていない
+#   4. common.sh を読み込むスクリプトが、1 回だけ読み込み、common.sh と同じ名前の関数を定義しない（許可した上書きを除く）
+#   5. すべてのシェルスクリプトが構文として正しい（bash -n）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -57,7 +59,32 @@ fi
 grep -q 'seal.min_ballots_after_interval' CLAUDE.md && grep -q 'CloseFlush' CLAUDE.md || fail "CLAUDE.md に原則9 の実装（ADR 0020）の記載がありません"
 echo "封印ルールの旧名なし / CLAUDE.md の記載: OK"
 
-echo "== 4. 全スクリプトの構文（bash -n）"
+echo "== 4. scripts/lib/common.sh の関数を、読み込んだスクリプトが上書きしない"
+# bash では、同じ名前の関数を後から定義すると、前の定義が置き換わる。引数の形が違う同名の関数があると、どちらが
+# 呼ばれるかが読み込みの順番で変わり、壊れても構文の検査（bash -n）では見つからない（dev_up.sh cassandra が、
+# 途中で common.sh を読み直して自身の alive / wait_until を置き換えられ、起動待ちで必ず失敗していた）。
+#   - common.sh を読み込むのは、1 つのスクリプトにつき 1 回だけ
+#   - common.sh と同じ名前の関数を定義しない（例外: fail は、common.sh が「未定義のときだけ」既定を定義するので、
+#     各スクリプトが先に定義してよい。確認スイートの count / pool_total は、スイートの中だけで意図して置き換えている）
+COMMON_FUNCS="$(grep -oE '^[[:space:]]*[a-z_][a-z0-9_]*\(\)' scripts/lib/common.sh | tr -d '() ' | sort -u)"
+ALLOWED_OVERRIDES='^(fail|count|pool_total)$'
+shadow_hits=""
+for f in scripts/*.sh scripts/check/*.sh; do
+    sources="$(grep -cE '^[[:space:]]*(source|\.)[[:space:]].*lib/common\.sh' "$f" || true)"
+    [[ "$sources" == 0 ]] && continue
+    [[ "$sources" == 1 ]] || shadow_hits+="${f}: common.sh を ${sources} 回読み込んでいます"$'\n'
+    while read -r name; do
+        [[ -z "$name" || "$name" =~ $ALLOWED_OVERRIDES ]] && continue
+        grep -qx "$name" <<<"$COMMON_FUNCS" && shadow_hits+="${f}: common.sh と同じ名前の関数 ${name}() を定義しています"$'\n'
+    done < <(grep -oE '^[[:space:]]*[a-z_][a-z0-9_]*\(\)' "$f" | tr -d '() ' | sort -u)
+done
+if [[ -n "$shadow_hits" ]]; then
+    printf '%s' "$shadow_hits" >&2
+    fail "common.sh の関数を上書きしているスクリプトがあります（別の名前にするか、common.sh の関数を使ってください）"
+fi
+echo "common.sh の読み込みは 1 回だけ・同名の関数の上書きなし: OK"
+
+echo "== 5. 全スクリプトの構文（bash -n）"
 n=0
 for f in scripts/*.sh scripts/check/*.sh scripts/lib/*.sh; do
     bash -n "$f" || fail "$f に構文エラーがあります"
