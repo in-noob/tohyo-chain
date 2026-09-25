@@ -1,24 +1,23 @@
 # Step 15 手動確認チェックリスト（デザインとダークモード）
 
-自動テスト（`scripts/check_step15.sh`）では、次を検証している: 色がデザイントークン以外に書かれていないこと、両方のテーマで
+自動テスト（`scripts/check/web.sh` の #2・#3）では、次を検証している: 色がデザイントークン以外に書かれていないこと、両方のテーマで
 文字と背景のコントラスト比が 4.5:1 以上（枠線・フォーカスは 3:1 以上）であること、`index.html` のスクリプトの置き場所と規則、ビルド。
 **目で見る確認**（見た目・ちらつき・OS 設定への追従・各画面）は、このチェックリストで行う。
 各項目は、確認できたら `[x]` にする。**ライトとダークの両方で、同じ画面を確認すること**（各項目の後ろの ☀ / 🌙 を、順に確認する）。
 
 ## 0. 準備
 
-- [ ] 前提: `rustup target add wasm32-unknown-unknown` と `cargo install trunk --locked`
+- [ ] 前提: [environment.md](environment.md) の手順で Rust と Trunk が入っている
 - [ ] 小さな選挙データを生成する（有権者 `voter-1`〜）:
   ```
   cargo run -q -p seedgen -- --out /tmp/seed-demo --election-id 2026-general --prefectures 3 --districts-per-pref 2 \
     --candidates-per-district 4 --voters 30 --municipalities-per-pref 2 --pref-assembly-districts-per-pref 2 --force
   ```
-- [ ] 端末 A で api を起動する（ブロックが見られるよう、3 票ごとに封印する）:
+- [ ] 起動して、投票の受付を始める（ブロックが見られるよう、3 票ごとに封印する）:
   ```
-  export APP__SESSION__SECRET=dev-secret-0123456789abcdef APP__ELECTION__SEED_DIR=/tmp/seed-demo APP__SEAL__MAX_BALLOTS=3
-  cargo run -p api
+  APP__ELECTION__SEED_DIR=/tmp/seed-demo APP__SEAL__MAX_BALLOTS=3 scripts/dev_up.sh   # 画面 http://localhost:8080
+  scripts/election.sh open --now --yes
   ```
-- [ ] 端末 B で画面を起動: `cd crates/web && trunk serve`（http://localhost:8080）
 - [ ] 開発者ツール（F12）を開き、Console にエラーが出ていない
 - [ ] （任意）OS の設定で、ライト / ダークを切り替えられるようにしておく
 

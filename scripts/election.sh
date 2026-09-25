@@ -18,6 +18,9 @@
 # 無ければ secrets/admin_token）から読む。
 set -euo pipefail
 
+# --help: 先頭のコメント（使い方）を表示して終わる（何も起動・変更しない。scripts/check/docs.sh#8 が確認する）。
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0; }
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
@@ -64,8 +67,12 @@ done
 
 BIND="$(cfg_get admin.bind)" || fail "設定を読み込めません（上のメッセージを参照）"
 BASE="http://${BIND}"
+# app.env=dev では、scripts/dev_up.sh・scripts/sample_data.sh が api に渡すのと同じ開発用の固定値を使う（環境変数でも
+# secrets/ でも指定していないときだけ）。dev_up.sh は自分が起動した api にしか環境変数を渡さないので、別のシェルから
+# 実行するこのスクリプトも同じ値を選ぶ必要がある。
+[[ "$(cfg_get app.env)" == dev ]] && dev_default_secrets
 TOKEN="$(admin_token)"
-[[ -n "$TOKEN" ]] || fail "admin.token が未設定です（環境変数 APP__ADMIN__TOKEN か secrets/admin_token で渡してください。scripts/dev_up.sh は開発用の固定値を自動で使う）"
+[[ -n "$TOKEN" ]] || fail "admin.token が未設定です（環境変数 APP__ADMIN__TOKEN か secrets/admin_token で渡してください。app.env=dev では開発用の固定値を使う）"
 
 # GNU date（-d）と BSD/macOS date（-v ... -j -f）の両方に対応する。
 fmt_time() {

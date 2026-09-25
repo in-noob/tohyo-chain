@@ -20,3 +20,6 @@ config/production.toml
 
 # ログ
 *.log
+
+# scripts/dev_up.sh の実行時の状態（PID・モード・生成した Trunk の設定。絶対パスを含む）
+/.dev/

@@ -1,19 +1,19 @@
 # Step 5 手動確認チェックリスト（画面）
 
-自動テスト（`scripts/check_step5.sh`）では、画面遷移ロジックとビルドまでを検証している。
+自動テスト（`scripts/check/web.sh`）では、画面遷移ロジックとビルドまでを検証している。
 ブラウザでの見た目・操作・秘密投票の性質は、このチェックリストで確認する。
 各項目は、確認できたら `[x]` にする。
 
 ## 0. 準備
 
-- [ ] 前提のインストール: `rustup target add wasm32-unknown-unknown` と `cargo install trunk --locked`
-- [ ] 端末 A で API を起動（開発用の `dev-tools` 付き）:
+- [ ] 前提: [environment.md](environment.md) の手順で Rust と Trunk が入っている
+- [ ] 起動して、投票の受付を始める（起動直後の選挙状態は scheduled で、投票を受け付けない）:
   ```
-  APP__SESSION__SECRET=dev-secret-0123456789abcdef cargo run -p api --features dev-tools
+  scripts/dev_up.sh
+  scripts/election.sh open --now --yes
   ```
-  （ポート 18080。票の封印を短い間隔で確かめたいときは `APP__SEAL__INTERVAL_SECS=10 APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1` を付ける。
-  既定の最小件数は 10 件で、それ未満の票は時間では封印されない。原則9）
-- [ ] 端末 B で画面を起動: `cd crates/web && trunk serve`
+  （api 18080・画面 8080。封印は、未封印が 10 件以上で 10 秒ごと（`config/dev.toml`）。1 票から封印を確かめたいときは、
+  `APP__SEAL__MIN_BALLOTS_AFTER_INTERVAL=1 scripts/dev_up.sh` で起動する）
 - [ ] ブラウザで http://localhost:8080 を開く。ログイン画面が表示される
 - [ ] 開発者ツール（F12）を開き、Console にエラーが出ていない
 
@@ -112,18 +112,18 @@
 ## 8. 秘密投票の確認（開発者ツール）
 
 - [ ] **Application → Local Storage / Session Storage / Cookies** が空（トークンも候補者も保存されていない）
-- [ ] **Network** で投票のリクエスト（`POST /api/v1/contests/1/vote`）を開く:
-  - [ ] リクエスト本文は `{"candidate_id": 数値}` のみ
+- [ ] **Network** で投票のリクエスト（`POST /api/v1/contests/2026-general/shugiin_smd.13.01/vote` など）を開く:
+  - [ ] リクエスト本文は `{"candidate_id": "shugiin_smd.13.01.c1"}` の形のみ（白票は `"blank"`。再投票のときだけ `revote` が付く）
   - [ ] 応答は `201` で本文は `{"status":"accepted"}` のみ（`ballot_id` などのレシートがない）
 - [ ] **Console** にトークン・候補者・投票内容が出力されていない
 - [ ] 投票の後、ブラウザの履歴（戻るボタンの長押し）に投票画面のエントリが残っていない
-- [ ] 端末 A（API）のログに、投票者 ID も候補者も出ていない
+- [ ] api のログ（`logs/api.log`）に、投票者 ID も候補者も出ていない
 
 ## 9. プロキシ（開発時）
 
 - [ ] Network タブで、API のリクエスト先が `localhost:8080`（画面と同じオリジン）になっている
 - [ ] CORS エラーが出ていない
-- [ ] 端末 B の `trunk serve` を止めずに API だけ再起動しても、画面から再び API を呼べる
+- [ ] `trunk serve` を止めずに api だけ再起動しても、画面から再び API を呼べる
 
 ## 10. 操作性・表示
 

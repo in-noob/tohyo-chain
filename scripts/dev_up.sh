@@ -17,7 +17,7 @@
 #            git 管理外・権限 0600）に出力する。登録済みなら何もしない。パスワードは、画面にもログにも出さない。
 #   環境変数 APP__AUTH__MODE を指定していれば、それを使う（--auth が優先）。
 #
-# 設定: config/default.toml < config/dev.toml < config/local.toml < secrets/ < 環境変数 APP__…（README の「設定」節）。
+# 設定: config/default.toml < config/dev.toml < config/local.toml < secrets/ < 環境変数 APP__…（docs/configuration.md）。
 #   このスクリプトが決めるのは、app.mode（memory / db）・auth.mode（stub / db）と、秘密情報の開発用の固定値だけ。
 #   ポートは設定から読む: api.port（既定 18080）、web.port（既定 8080）。/api は trunk serve の proxy が api へ転送する
 #   （設定から Trunk 用の設定ファイル .dev/trunk.toml を生成して使う）。画面の文言（labels.*）も、設定からビルド時に渡す（app-config web-env）。
@@ -27,6 +27,9 @@
 #    公開されているので、本番では絶対に使わないこと。
 #    （手元で secrets/session_secret や APP__SESSION__SECRET を指定していれば、そちらを使う。）
 set -euo pipefail
+
+# --help: 先頭のコメント（使い方）を表示して終わる（何も起動・変更しない。scripts/check/docs.sh#8 が確認する）。
+[[ "${1:-}" == -h || "${1:-}" == --help ]] && { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
@@ -239,6 +242,8 @@ WEB_ENV="$("$CFG_BIN" web-env)"
 TRUNK_CONFIG="$PWD/$DEV_DIR/trunk.toml"
 cat >"$TRUNK_CONFIG" <<TOML
 # scripts/dev_up.sh が、設定（web.port / api.port）から生成したファイル（手で編集しない。crates/web/Trunk.toml と同じ内容）。
+$(grep -E '^trunk-version[[:space:]]*=' crates/web/Trunk.toml)
+
 [build]
 target = "$PWD/crates/web/index.html"
 dist = "$PWD/crates/web/dist"

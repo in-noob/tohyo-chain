@@ -3,7 +3,7 @@
 //!   credgen [--reissue] [--confirm-no-output]
 //!
 //! 有権者は、設定（election.seed_dir / election.election_id）の選挙データの名簿（voters.csv）から読む。
-//! 登録先の DB は、設定（db.nodes / db.keyspace）。設定は README の「設定」を参照。
+//! 登録先の DB は、設定（db.nodes / db.keyspace）。設定は docs/configuration.md を参照。
 //!
 //!   --reissue            登録済みの有権者にも、新しいログイン ID とパスワードを発行し直す
 //!                        （既定は、登録済みの有権者をスキップする）。古い認証情報は削除される。
