@@ -177,6 +177,7 @@ eval "$(cargo run -q -p app-config -- web-env)" # 画面の文言（labels.*）�
 | `labels.blank_option` | 白票（どの候補者にも投票しない） | 候補者一覧の最後に置く白票の選択肢 |
 | `labels.blank_confirm` | 白票として投票します。よろしいですか？ | 白票を選んだときの確認画面の文言 |
 | `labels.blank_name` | 白票 | 集計・ビューア・API のエラーでの白票の呼び名 |
+| `labels.election_hash` | 選挙定義のハッシュ | ビューア（/chain とブロックの詳細）の、選挙定義のハッシュ（ADR 0025）の見出し |
 | `labels.revote_button` | 投票をやり直す | 完了画面の再投票のボタン |
 | `labels.revote_confirm` | 前回の投票内容を変更します | 再投票の確認画面の文言（前回の内容は出さない） |
 | `labels.revote_limit_reached` | やり直しの上限（{max}回）に達しています | 上限に達した理由（`{max}` が必須） |

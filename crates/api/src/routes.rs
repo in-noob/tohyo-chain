@@ -83,6 +83,7 @@ async fn election_status(
         display_timezone: state.display_timezone.name.to_string(),
         display_timezone_offset_secs: state.display_timezone.offset_secs,
         rules: Some(rules_dto(state.rules(&snapshot))),
+        election_hash: shared_types::hex::encode(&state.election_hash),
     }))
 }
 

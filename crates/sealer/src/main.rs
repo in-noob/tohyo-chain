@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = SealerConfig::load()?;
+    // 選挙定義のハッシュ（ADR 0025）。既にあるチェーンのジェネシスの値や、DB に登録済みの値（先に起動した api / sealer が
+    // 登録）と違えば、起動を拒否する。
+    let election_hash = config.election_hash()?;
     let clock = Arc::new(SystemClock);
     let store = Arc::new(
         ScyllaStore::connect(
@@ -49,11 +52,22 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(SystemMonotonic::new()),
         config.policy,
         config.shard_count,
+        election_hash,
     );
     // 別の署名鍵が既に登録されていれば、ここで起動を拒否する（1 本のチェーンに別の鍵の署名を混ぜない）。
     sealer.register_signer().await.context(
         "署名鍵の登録に失敗しました（別の sealer.signing_seed で作られたチェーンがある可能性があります）",
     )?;
+    // 既にあるチェーンのジェネシスと照合してから、cluster_config に登録・照合する（先に登録すると、チェーンと食い違う値が
+    // 残ってしまう）。
+    sealer
+        .check_existing_chains()
+        .await
+        .context("選挙定義の照合に失敗しました")?;
+    store
+        .ensure_election_hash(&election_hash)
+        .await
+        .context("選挙定義の照合に失敗しました")?;
 
     // 選挙状態（原則17）。init（スキーマを作った後の最初の接続）で、設定の期間を取り込む。
     // その後に設定ファイルの期間と DB の期間が違っていたら、警告して DB の値を使う。
@@ -106,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         max_ballots = config.policy.max_ballots(),
         interval_secs = config.policy.interval_secs(),
         min_ballots_after_interval = config.policy.min_ballots_after_interval(),
+        election_hash = %shared_types::hex::encode(&election_hash),
         "sealer を起動しました"
     );
     let handle = spawn_coordinator(coordinator, DEFAULT_TICK);

@@ -144,6 +144,7 @@ fn header_dto(block: &Block) -> HeaderDto {
         merkle_root: hex::encode(&h.merkle_root),
         ballot_count: h.ballot_count,
         sealed_at_minute: h.sealed_at_minute,
+        election_hash: hex::encode(&h.election_hash),
     }
 }
 
@@ -326,7 +327,7 @@ mod tests {
 
     fn block_with(contest: &str, candidate: &str) -> Block {
         let signer = Ed25519Signer::from_seed(&[1u8; 32]);
-        let genesis = genesis(&signer, 10);
+        let genesis = genesis(&signer, 10, [0xe1; 32]);
         let ballot = Ballot {
             ballot_id: BallotId::from_random_bytes([9; 16]),
             contest_id: ContestId::parse(contest).expect("contest"),
@@ -458,7 +459,7 @@ mod tests {
             }),
             ..first.clone()
         };
-        let g = genesis(&signer, 10);
+        let g = genesis(&signer, 10, [0xe1; 32]);
         let b1 = seal_block(&g, vec![first.clone()], 11, &signer).expect("seal");
         let b2 = seal_block(&b1, vec![second], 12, &signer).expect("seal");
         let chain = FixedChain(vec![g, b1, b2.clone()]);

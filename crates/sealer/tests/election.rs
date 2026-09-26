@@ -14,6 +14,9 @@ use domain::{Ed25519Signer, ElectionPhase, ElectionRules, Period};
 use infra_memory::InMemoryStore;
 use sealer::{ManualClock, Sealer};
 
+/// 選挙定義のハッシュ（テスト用の固定値）。
+const TEST_ELECTION_HASH: domain::Hash32 = [0xe1; 32];
+
 struct ManualWall(AtomicU64);
 
 impl ManualWall {
@@ -46,6 +49,7 @@ async fn memory_scheduler_advances_through_the_full_lifecycle() {
         mono.clone(),
         SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     sealer.init().await.expect("init");
 
@@ -141,6 +145,7 @@ async fn ballots_cast_just_before_closing_are_sealed_before_closed() {
         mono.clone(),
         SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     sealer.init().await.expect("init");
     store
@@ -229,6 +234,7 @@ async fn the_closing_procedure_destroys_the_revote_key_and_records_it_once() {
         mono.clone(),
         SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     sealer.init().await.expect("init");
     store

@@ -102,4 +102,10 @@
 ブロックのハッシュは、固定長ビッグエンディアンのバイナリ正規化の SHA-256（原則4。serde_json などは使わない。[ADR 0002](adr/0002-hash-chain-encoding.md)）。
 票の正規化バイト列は `ballot_id(16) ‖ len(2) ‖ contest_id ‖ len(2) ‖ candidate_id`（版 2。[ADR 0013](adr/0013-string-ids-and-chain-format-v2.md)）。
 版 3 から、再投票のつながりを持つ票だけ、後ろに `0x01 ‖ slot(32) ‖ seq(4)`（初回）または `0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32)` を
-足す（つながりの無い票は版 2 と同じバイト列）。旧いスキーマ・旧いチェーンとは互換性がない（接続時に検出して、作り直しの手順つきで失敗する）。
+足す（つながりの無い票は版 2 と同じバイト列）。
+版 4 から、ヘッダーは `version(2) ‖ height(8) ‖ prev_hash(32) ‖ merkle_root(32) ‖ ballot_count(4) ‖ sealed_at_minute(8) ‖ election_hash(32)`
+（118 バイト）。`election_hash` は選挙定義のハッシュで、ジェネシスが持ち、以後のブロックは引き継ぐ（[ADR 0025](adr/0025-election-definition-hash.md)）。
+対象は、seed から読み込んだ後の選挙・選挙の種類・選挙区・候補者（名前・政党・略歴を含む）を ID 順に並べたもの（有権者名簿は含めない）で、
+ファイルの行・列の順番や改行コードが違っても、内容が同じなら同じ値になる。`GET /api/v1/election-status` とチェーンの API のヘッダーで公開し、
+ビューアにも表示する。
+旧いスキーマ・旧いチェーンとは互換性がない（接続時に検出して、作り直しの手順つきで失敗する）。

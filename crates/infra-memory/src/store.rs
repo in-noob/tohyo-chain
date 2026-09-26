@@ -889,7 +889,7 @@ mod tests {
     #[tokio::test]
     async fn commit_appends_block_and_removes_consumed_ballots_from_pool() {
         let (s, signer) = (store(2), signer());
-        s.commit(ShardId(0), genesis(&signer, 1), 0)
+        s.commit(ShardId(0), genesis(&signer, 1, [0xe1; 32]), 0)
             .await
             .expect("genesis");
         cast_n(&s, ShardId(0), 1, 5).await;
@@ -924,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn commit_rejects_broken_continuity_or_mismatched_ballots_without_changes() {
         let (s, signer) = (store(1), signer());
-        let g = genesis(&signer, 1);
+        let g = genesis(&signer, 1, [0xe1; 32]);
         // 空のチェーンにジェネシス以外は置けない。
         cast_n(&s, ShardId(0), 1, 3).await;
         let orphan = seal_block(
@@ -1024,7 +1024,7 @@ mod tests {
 
         // 封印してプールから消えると、pending は減り、participation は変わらない。
         let signer = signer();
-        let g = genesis(&signer, 1);
+        let g = genesis(&signer, 1, [0xe1; 32]);
         s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
         let batch = s.peek_pending(ShardId(0), 3).await.expect("peek");
         let sealed = seal_block(&g, batch, 2, &signer).expect("seal");
@@ -1116,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn blocks_are_paged_newest_first_and_clamped_to_the_chain() {
         let (s, signer) = (store(2), signer());
-        let mut chain = vec![genesis(&signer, 1)];
+        let mut chain = vec![genesis(&signer, 1, [0xe1; 32])];
         s.commit(ShardId(0), chain[0].clone(), 0)
             .await
             .expect("genesis");
@@ -1230,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn tamper_changes_one_sealed_ballot_only() {
         let (s, signer) = (store(1), signer());
-        let g = genesis(&signer, 1);
+        let g = genesis(&signer, 1, [0xe1; 32]);
         s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
         cast_n(&s, ShardId(0), 1, 4).await;
         let batch = s.peek_pending(ShardId(0), 4).await.expect("peek");

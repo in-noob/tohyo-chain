@@ -245,6 +245,8 @@ pub struct Labels {
     pub blank_confirm: String,
     /// 集計結果・ビューア・API のエラーでの、白票の呼び名。
     pub blank_name: String,
+    /// ビューアの、選挙定義のハッシュ（ADR 0025）の見出し。
+    pub election_hash: String,
     /// 全投票完了の画面の、再投票のボタン。
     pub revote_button: String,
     /// 再投票の確認画面の文言（前回の投票内容は表示しない）。
@@ -593,6 +595,7 @@ pub(crate) fn extract(entries: &Entries) -> Result<AppConfig, ConfigError> {
         blank_option: r.label("labels.blank_option", 100),
         blank_confirm: r.label("labels.blank_confirm", 200),
         blank_name: r.label("labels.blank_name", 30),
+        election_hash: r.label("labels.election_hash", 100),
         revote_button: r.label("labels.revote_button", 100),
         revote_confirm: r.label("labels.revote_confirm", 200),
         revote_limit_reached: r.label("labels.revote_limit_reached", 200),

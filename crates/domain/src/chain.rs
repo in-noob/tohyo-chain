@@ -7,8 +7,9 @@ use crate::types::{Ballot, Block, BlockHeader, Hash32};
 
 /// ブロックの形式の版。2: 票の `contest_id` / `candidate_id` を、数値（各 4 バイト）から、長さ接頭辞つきの
 /// 文字列 ID（[`crate::ids`]）に変えた（ADR 0013）。3: 票の後ろに、再投票のつながり（slot・seq・supersedes）を
-/// 足せるようにした（ADR 0022。つながりの無い票のバイト列は版 2 と同じ）。
-pub const BLOCK_VERSION: u16 = 3;
+/// 足せるようにした（ADR 0022。つながりの無い票のバイト列は版 2 と同じ）。4: ヘッダーの末尾に、選挙定義のハッシュ
+/// （`election_hash`）を足した（ADR 0025）。
+pub const BLOCK_VERSION: u16 = 4;
 
 /// 封印（`seal_block`）の失敗。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -52,6 +53,10 @@ pub enum ChainError {
     BlockHashMismatch { height: u64 },
     #[error("height={height}: 署名が不正です")]
     SignatureInvalid { height: u64 },
+    #[error(
+        "height={height}: 選挙定義のハッシュ（election_hash）がジェネシスブロックと一致しません"
+    )]
+    ElectionHashMismatch { height: u64 },
 }
 
 impl ChainError {
@@ -67,7 +72,8 @@ impl ChainError {
             | Self::BallotOrderInvalid { height }
             | Self::MerkleRootMismatch { height }
             | Self::BlockHashMismatch { height }
-            | Self::SignatureInvalid { height } => Some(height),
+            | Self::SignatureInvalid { height }
+            | Self::ElectionHashMismatch { height } => Some(height),
         }
     }
 
@@ -84,6 +90,7 @@ impl ChainError {
             Self::MerkleRootMismatch { .. } => "MerkleRootMismatch",
             Self::BlockHashMismatch { .. } => "BlockHashMismatch",
             Self::SignatureInvalid { .. } => "SignatureInvalid",
+            Self::ElectionHashMismatch { .. } => "ElectionHashMismatch",
         }
     }
 }
@@ -101,8 +108,9 @@ fn assemble(header: BlockHeader, ballots: Vec<Ballot>, signer: &dyn Signer) -> B
     }
 }
 
-/// ジェネシスブロック: 高さ 0、`prev_hash` は全ゼロ、票 0 件。
-pub fn genesis(signer: &dyn Signer, sealed_at_minute: u64) -> Block {
+/// ジェネシスブロック: 高さ 0、`prev_hash` は全ゼロ、票 0 件。`election_hash` は選挙定義のハッシュ
+/// （[`crate::election_hash::election_definition_hash`]。以後のブロックが引き継ぐ）。
+pub fn genesis(signer: &dyn Signer, sealed_at_minute: u64, election_hash: Hash32) -> Block {
     let header = BlockHeader {
         version: BLOCK_VERSION,
         height: 0,
@@ -110,11 +118,12 @@ pub fn genesis(signer: &dyn Signer, sealed_at_minute: u64) -> Block {
         merkle_root: empty_root(),
         ballot_count: 0,
         sealed_at_minute,
+        election_hash,
     };
     assemble(header, Vec::new(), signer)
 }
 
-/// `prev` の次のブロックを封印する。
+/// `prev` の次のブロックを封印する。選挙定義のハッシュ（`election_hash`）は `prev` から引き継ぐ。
 ///
 /// `ballots` は所有権ごと受け取り、`ballot_id` のハッシュ昇順に並べ替えて
 /// ブロックに移す（呼び出し側は到着順のまま渡してよい）。
@@ -151,11 +160,13 @@ pub fn seal_block(
         merkle_root: merkle_root(&ballots),
         ballot_count,
         sealed_at_minute,
+        election_hash: prev.header.election_hash,
     };
     Ok(assemble(header, ballots, signer))
 }
 
-/// チェーン全体を検証する。最初に見つかった不整合を返す。
+/// チェーン全体を検証する。最初に見つかった不整合を返す。全ブロックの `election_hash` がジェネシスと同じことも
+/// 確かめる（ジェネシスの値が手元の選挙定義と同じかは、呼び出し側が照合する。ADR 0025）。
 ///
 /// ブロックは借用して読むだけで、所有権は移さない。
 pub fn verify_chain(blocks: &[Block], verifier: &dyn Verifier) -> Result<(), ChainError> {
@@ -200,6 +211,10 @@ fn verify_block(
             }
             if header.prev_hash != prev.block_hash {
                 return Err(ChainError::PrevHashMismatch { height });
+            }
+            // 直前のブロックと同じなら、帰納的にジェネシスとも同じ（直前のブロックは検証済み）。
+            if header.election_hash != prev.header.election_hash {
+                return Err(ChainError::ElectionHashMismatch { height });
             }
             if block.ballots.is_empty() {
                 return Err(ChainError::EmptyBlock { height });
@@ -259,7 +274,7 @@ mod tests {
 
     /// ジェネシス + 3 ブロック（5・4・3 票）のチェーン。
     fn sample_chain(signer: &Ed25519Signer) -> Vec<Block> {
-        let mut chain = vec![genesis(signer, 100)];
+        let mut chain = vec![genesis(signer, 100, ELECTION)];
         let mut next = 0u32;
         for (n, minute) in [(5u32, 101u64), (4, 102), (3, 103)] {
             let ballots: Vec<Ballot> = (next..next + n).map(ballot).collect();
@@ -270,6 +285,8 @@ mod tests {
         }
         chain
     }
+
+    const ELECTION: Hash32 = [0xe1; 32];
 
     fn signer() -> Ed25519Signer {
         Ed25519Signer::from_seed(&[42u8; 32])
@@ -287,18 +304,47 @@ mod tests {
 
     #[test]
     fn genesis_shape() {
-        let g = genesis(&signer(), 7);
+        let g = genesis(&signer(), 7, ELECTION);
         assert_eq!(g.header.height, 0);
         assert_eq!(g.header.prev_hash, [0u8; 32]);
         assert_eq!(g.header.ballot_count, 0);
         assert_eq!(g.header.merkle_root, empty_root());
+        assert_eq!(g.header.election_hash, ELECTION);
+        assert_eq!(g.header.version, 4);
         assert!(g.ballots.is_empty());
+    }
+
+    #[test]
+    fn sealed_blocks_inherit_the_election_hash_of_the_genesis() {
+        let chain = sample_chain(&signer());
+        assert!(chain.iter().all(|b| b.header.election_hash == ELECTION));
+    }
+
+    #[test]
+    fn detects_election_hash_mismatch_in_a_middle_block() {
+        // 途中のブロックの値を書き換え、ハッシュと署名まで作り直しても（署名鍵を持つ者の改ざん）、ジェネシスとの食い違いで検出する。
+        let signer = signer();
+        let mut chain = sample_chain(&signer);
+        chain[2].header.election_hash[0] ^= 1;
+        chain[2].block_hash = crate::encoding::block_hash(&chain[2].header);
+        chain[2].signature = signer.sign(&chain[2].block_hash);
+        chain[3].header.prev_hash = chain[2].block_hash;
+        chain[3].block_hash = crate::encoding::block_hash(&chain[3].header);
+        chain[3].signature = signer.sign(&chain[3].block_hash);
+        let err = verify_chain(&chain, &signer.verifier()).expect_err("should fail");
+        assert_eq!(err, ChainError::ElectionHashMismatch { height: 2 });
+        // 書き換えただけ（ハッシュを作り直さない）なら、ブロックのハッシュの不一致より先に、この食い違いで検出する。
+        assert_error(
+            |c| c[1].header.election_hash[31] ^= 1,
+            "ElectionHashMismatch",
+            1,
+        );
     }
 
     #[test]
     fn seal_sorts_by_ballot_id_hash_regardless_of_arrival_order() {
         let signer = signer();
-        let g = genesis(&signer, 0);
+        let g = genesis(&signer, 0, ELECTION);
         let ballots: Vec<Ballot> = (0..20).map(ballot).collect();
         let mut reversed = ballots.clone();
         reversed.reverse();
@@ -317,7 +363,7 @@ mod tests {
     #[test]
     fn seal_rejects_empty_and_duplicate() {
         let signer = signer();
-        let g = genesis(&signer, 0);
+        let g = genesis(&signer, 0, ELECTION);
         assert_eq!(
             seal_block(&g, vec![], 1, &signer),
             Err(SealError::EmptyBallots)

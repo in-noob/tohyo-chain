@@ -44,8 +44,9 @@
    **init の前にだけ**編集できる（理由と、後から変えたときに何が起きるかは [security.md](security.md#データを書き換えるときの決まり)）。
 2. **検証する**: `cargo run -q -p seedgen -- --check seed`（ファイル・行・原因つきで、すべての誤りを表示する）。
 3. **init（DB の初期化）**: DB を起動してスキーマを投入し（`scripts/db_reset.sh --all`、または `docker compose` の schema ジョブ）、
-   api と sealer を初めて起動する。最初の接続で、シャード数と署名鍵の公開鍵（`cluster_config`・`signer_keys`）と、
-   設定の期間（`election.voting_opens_at` / `voting_closes_at`）が DB に登録される。以後は DB が正。
+   api と sealer を初めて起動する。最初の接続で、シャード数と選挙定義のハッシュと署名鍵の公開鍵（`cluster_config`・`signer_keys`）と、
+   設定の期間（`election.voting_opens_at` / `voting_closes_at`）が DB に登録され、ジェネシスブロックに選挙定義のハッシュが入る。以後は DB が正。
+   この後に seed を変えると、api と sealer は起動を拒否する（`db_reset.sh --votes` の後も。選挙をやり直すなら `--all`）。
 4. **期間を設定する**: 設定で渡していなければ、`scripts/election.sh schedule --opens-at <RFC3339> --closes-at <RFC3339>`
    （状態が `scheduled` の間だけ）。
 5. **ID とパスワードを登録する**（`auth.mode=db`）: `APP__CREDENTIALS__OUTPUT_FILE_ENABLED=true cargo run -q -p credgen`。
@@ -87,7 +88,8 @@ CSV は表計算ソフトで編集できる（UTF-8・ヘッダ行あり・列�
 
 - 合区のように 1 つの選挙区が複数の都道府県にまたがる場合も、**ID は変えず**、選挙区の属性 `prefectures` で持つ
   （例: `sangiin_district.31_32` の `prefectures` は `31;32`）。区割りの変更などで将来変わり得る意味は、ID に埋め込まない。
-- 投票方式は `enum`（今は `single_choice` だけ）。候補者の氏名・政党・略歴は属性。
+- 投票方式は `enum`（今は `single_choice` だけ）。候補者の氏名・政党・略歴は属性。選挙区の中の候補者の表示順は、候補者コードの
+  連番の数値順（`c2` < `c10`。CSV の行の順番には依存しない）。
 - 投票用紙の**表示順**は、選挙の種類の `order`、次に選挙区の `order`。**投票する順番は固定**で、利用者は選べない
   （画面は先頭の未投票へ自動で進む）。
 - 有権者は、`voters.csv` の名簿にある選挙区の投票用紙にだけ投票できる（対象外は 403）。名簿に無い ID はログインできるが、

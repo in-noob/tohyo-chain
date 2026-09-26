@@ -34,6 +34,9 @@ pub struct SealerConfig {
     pub rules: ElectionRules,
     /// 再投票の鍵のファイル（`<secrets>/revote_key`）。締切の手続きの中で破棄する（ADR 0022）。
     pub revote_key_path: Option<std::path::PathBuf>,
+    /// 選挙データのディレクトリ（`<election.seed_dir>/<election.election_id>`）。選挙定義のハッシュを計算して、
+    /// ジェネシスに入れ、DB と照合する（ADR 0025）。
+    pub election_dir: std::path::PathBuf,
 }
 
 // 署名鍵の種がログに出ないよう、Debug では伏せる。
@@ -49,6 +52,7 @@ impl std::fmt::Debug for SealerConfig {
             .field("lease_ttl", &self.lease_ttl)
             .field("rules", &self.rules)
             .field("revote_key_path", &self.revote_key_path)
+            .field("election_dir", &self.election_dir)
             .finish()
     }
 }
@@ -116,7 +120,19 @@ impl SealerConfig {
                 max_revotes: app.vote.max_revotes,
             },
             revote_key_path: None,
+            election_dir: app.election.election_dir(),
         })
+    }
+
+    /// 選挙データ（seed）を読み込み、選挙定義のハッシュを計算する（ADR 0025）。
+    pub fn election_hash(&self) -> anyhow::Result<domain::Hash32> {
+        let election = seed::load_election(&self.election_dir).with_context(|| {
+            format!(
+                "選挙データ {} を読み込めません（election.seed_dir / election.election_id を確認してください）",
+                self.election_dir.display()
+            )
+        })?;
+        Ok(domain::election_definition_hash(&election))
     }
 }
 
@@ -143,12 +159,35 @@ mod tests {
         assert_eq!(c.signing_seed, [7u8; 32]);
         assert!(c.sealer_id.starts_with("sealer-"), "{}", c.sealer_id);
         assert_eq!(
+            c.election_dir,
+            std::path::PathBuf::from("seed/2026-general")
+        );
+        assert_eq!(
             c.rules,
             ElectionRules {
                 allow_blank: true,
                 ..ElectionRules::default()
             }
         );
+    }
+
+    #[test]
+    fn the_election_hash_is_computed_from_the_seed_and_an_unreadable_seed_is_an_error() {
+        // テストはクレートのディレクトリで動くので、リポジトリの seed/ を指す。
+        let mut pairs = BASE.to_vec();
+        pairs.push(("election.seed_dir", "../../seed"));
+        let c = config(&pairs).expect("valid");
+        let expected = domain::election_definition_hash(
+            &seed::load_election(&c.election_dir).expect("sample seed"),
+        );
+        assert_eq!(c.election_hash().expect("hash"), expected);
+
+        pairs.push(("election.election_id", "no-such-election"));
+        let err = config(&pairs)
+            .expect("valid")
+            .election_hash()
+            .expect_err("missing");
+        assert!(format!("{err:#}").contains("選挙データ"), "{err:#}");
     }
 
     #[test]

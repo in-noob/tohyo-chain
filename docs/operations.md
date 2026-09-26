@@ -181,7 +181,9 @@ cargo run -q -p verifier -- verify --api URL --public-key HEX      # 署名の�
 cargo run -q -p verifier -- demo                                   # ダミー票で、検証と改ざん検出を実演（オフライン）
 ```
 
-公開 API だけを使うので、運用者以外の誰でも実行できる。公開鍵は、選挙の前に別の経路（公報など）で公開した値を `--public-key` で
+公開 API と、手元の選挙データ（設定の `election.seed_dir` / `election.election_id`。`APP__ELECTION__SEED_DIR` で変えられる）だけを
+使うので、運用者以外の誰でも実行できる。全シャードのジェネシスの選挙定義のハッシュを、手元の選挙データと照合する（違えば NG・終了コード 3）。
+公開鍵は、選挙の前に別の経路（公報など）で公開した値を `--public-key` で
 渡すと、API を運用する側が鍵ごと差し替えた場合も検出できる。`chain.reveal_ballots=after_close` の締切前は、票が非公開なので
 検証できない（終了コード 4）。
 
@@ -213,6 +215,7 @@ scripts/bench.sh report --out bench/results/x                            # 集�
 | `scripts/election.sh` が「admin.token が未設定です」で終了する | `app.env` が `dev` 以外で、トークンを渡していない（`dev_up.sh` が api に渡す値は、別のシェルには引き継がれない） | `APP__ADMIN__TOKEN` か `secrets/admin_token` で、api と同じ値を渡す（`app.env=dev` なら開発用の固定値を自動で使う） |
 | `dev_up.sh cassandra` が「起動の完了を待つ」で必ず失敗していた | スクリプトが途中で `scripts/lib/common.sh` を読み直し、同じ名前の関数が置き換わっていた（修正済み） | `scripts/check/docs.sh#4` が、common.sh の読み込みが 1 回だけで、同じ名前の関数を定義していないことを確認する |
 | api / sealer が「旧いスキーマ」「再投票に対応する前のスキーマ」で起動を拒否する | 表の形が変わる前に作ったキースペースを使っている（`ALTER TABLE` では直せない） | `scripts/dev_down.sh` → `APP__APP__MODE=db scripts/db_reset.sh --all` で作り直す |
+| api / sealer が「選挙定義のハッシュ…が一致しません」で起動を拒否する。`verify` が NG・`tally` が終了コード 3 になる | init の後に seed（選挙・選挙区・候補者の名前・政党・略歴など）を書き換えた。または、別の選挙データ（`APP__ELECTION__SEED_DIR`）を読んでいる | seed を init の時点の内容に戻す（git なら `git diff seed/`）。`sample_data.sh` のデータなら `APP__ELECTION__SEED_DIR=out/sample/seed` を渡す。選挙をやり直すなら `db_reset.sh --all`（`--votes` では登録が消えない） |
 | sealer / api が、シャード数や署名鍵の食い違いで起動を拒否する | `shard.count` か `sealer.signing_seed` が、DB に最初に登録された値と違う（init で固定） | 登録済みの値に合わせる。変えたいときは `db_reset.sh --all` で作り直す（投票データも消える） |
 | 設定の検証で `auth.mode` について「db には app.mode=db が必要です」と出る | `config/dev.toml` や `config/local.toml` に `auth.mode = "db"` を書いた（memory モードでも読まれる） | 環境変数 `APP__AUTH__MODE` で渡す（`dev_up.sh --auth db`） |
 | api が起動しない（再投票の鍵が無い） | `vote.allow_revote = true` なのに `secrets/revote_key` が無い（締切の手続きで破棄された後を含む） | 新しい選挙なら鍵を作る: `(umask 077; od -An -tx1 -N32 /dev/urandom \| tr -d ' \n' > secrets/revote_key)`。`dev_up.sh` は自動で作る |

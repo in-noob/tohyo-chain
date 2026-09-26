@@ -190,3 +190,5 @@ revote_button = "投票をやり直す"
 revote_confirm = "前回の投票内容を変更します"
 # 再投票の上限（vote.max_revotes）に達した投票用紙を選べない理由。画面と API のエラーメッセージに使う。{max} は上限回数（必須）。
 revote_limit_reached = "やり直しの上限（{max}回）に達しています"
+# ブロックチェーンのビューア（/chain とブロックの詳細）で、選挙定義のハッシュ（ADR 0025）に付ける見出し。
+election_hash = "選挙定義のハッシュ"

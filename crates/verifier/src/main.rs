@@ -149,10 +149,20 @@ fn default_api() -> anyhow::Result<String> {
 }
 
 fn verify_command(api: &str, public_key: Option<&str>) -> anyhow::Result<ExitCode> {
-    // 表示に使う呼び名（設定の labels.ballot_item）。
-    let ballot_item = app_config::load()?.config.labels.ballot_item;
+    let config = app_config::load()?.config;
+    // 照合する選挙定義（手元の seed。設定の election.seed_dir / election.election_id。ADR 0025）。
+    let election_dir = config.election.election_dir();
+    let election = seed::load_election(&election_dir)
+        .with_context(|| format!("選挙データ {} を読み込めません", election_dir.display()))?;
     let source = HttpSource::new(api);
-    let verified = verify_and_print(api, &source, public_key, &ballot_item)?;
+    // 表示に使う呼び名は、設定の labels.ballot_item。
+    let verified = verify_and_print(
+        api,
+        &source,
+        public_key,
+        &config.labels.ballot_item,
+        &domain::election_definition_hash(&election),
+    )?;
     Ok(if verified.ok {
         ExitCode::SUCCESS
     } else {
@@ -184,12 +194,14 @@ impl Verified {
     }
 }
 
-/// 全シャードの検証と突合を行い、結果を表示する（`verify` と `tally` の共通の前提確認）。
+/// 全シャードの検証と突合を行い、結果を表示する（`verify` と `tally` の共通の前提確認）。`election_hash` は、手元の seed の
+/// 選挙定義のハッシュ（全シャードのジェネシスと照合する。ADR 0025）。
 fn verify_and_print(
     api: &str,
     source: &dyn ChainSource,
     public_key: Option<&str>,
     ballot_item: &str,
+    election_hash: &[u8; 32],
 ) -> anyhow::Result<Verified> {
     let pinned = public_key
         .map(|k| {
@@ -197,7 +209,11 @@ fn verify_and_print(
         })
         .transpose()?;
 
-    let verdicts = verify_all(source, pinned.as_ref())
+    println!(
+        "選挙定義のハッシュ（手元の選挙データ）: {}",
+        hex::encode(election_hash)
+    );
+    let verdicts = verify_all(source, pinned.as_ref(), election_hash)
         .with_context(|| format!("{api} からチェーンを検証できませんでした"))?;
 
     let mut invalid = 0;
@@ -378,8 +394,10 @@ fn tally_flow(
 ) -> anyhow::Result<Flow> {
     let ballot_item = run.ballot_item;
 
-    // 1. チェーン全体の検証と、投票済み記録との突合。失敗したら集計しない。
-    let verified = verify_and_print(run.api, source, run.public_key, ballot_item)
+    // 1. チェーン全体の検証（ジェネシスの選挙定義のハッシュと、集計に使う選挙データとの照合を含む。ADR 0025）と、
+    //    投票済み記録との突合。失敗したら集計しない。
+    let election_hash = domain::election_definition_hash(election);
+    let verified = verify_and_print(run.api, source, run.public_key, ballot_item, &election_hash)
         .with_context(|| format!("{} からチェーンを検証できませんでした", run.api))?;
     let (true, Some(audit), Some(revotes)) = (
         verified.ok,
@@ -612,54 +630,15 @@ mod tests {
     mod flow {
         use std::path::{Path, PathBuf};
 
-        use domain::election::{Candidate, District, Election, ElectionType, VotingMethod};
-        use domain::{CandidateCode, DistrictId, ElectionId, ElectionTypeCode};
+        use domain::election::{Candidate, Election};
 
         use super::super::*;
         use crate::tally::gate::Refusal;
-        use crate::verify::tests::{FakeSource, chain, counts_for, reports, source};
+        use crate::verify::tests::{
+            FakeSource, chain, chain_for, counts_for, reports, source, test_election as election,
+        };
         use domain::ElectionPhase;
         use serde_json::json;
-
-        /// `chain()` が作る票（2026-general の東京 1 区・2 区、候補者 c1〜c4）に合わせた選挙マスタ。
-        /// `districts` が 1 のときは、東京 2 区を含まない（チェーンにだけ存在する投票用紙を作る）。
-        fn election(districts: u32) -> Election {
-            let ty = ElectionTypeCode::new("shugiin_smd").expect("code");
-            let mut ds = Vec::new();
-            let mut cs = Vec::new();
-            for n in 1..=districts {
-                let id = format!("shugiin_smd.13.0{n}");
-                ds.push(District {
-                    id: DistrictId::new(&id).expect("district"),
-                    election_type: ty.clone(),
-                    name: format!("東京{n}区"),
-                    prefectures: vec!["13".to_string()],
-                    order: n,
-                });
-                for c in 1..=4 {
-                    cs.push(Candidate {
-                        id: CandidateCode::parse(&format!("{id}.c{c}")).expect("candidate"),
-                        name: format!("候補{n}-{c}"),
-                        party: "党".to_string(),
-                        profile: String::new(),
-                    });
-                }
-            }
-            let types = vec![ElectionType {
-                code: ty,
-                name: "衆議院小選挙区".to_string(),
-                order: 1,
-                method: VotingMethod::SingleChoice,
-            }];
-            Election::new(
-                ElectionId::new("2026-general").expect("election"),
-                "テスト選挙".to_string(),
-                types,
-                ds,
-                cs,
-            )
-            .expect("election")
-        }
 
         /// 2 シャード・12 票のチェーンと、突合の値（`extra`: participation の過不足、`pending`: 未封印）。
         fn fixture(extra: i64, pending: u64) -> FakeSource {
@@ -812,11 +791,46 @@ mod tests {
         #[test]
         fn a_contest_missing_from_the_election_data_is_not_tallied() {
             let out = temp_out();
-            // チェーンには東京 2 区の票があるが、選挙データには東京 1 区しかない。
+            // チェーンには東京 2 区の票があるが、選挙データには東京 1 区しかない。選挙定義のハッシュの照合を通すため、
+            // チェーンのジェネシスも東京 1 区だけの選挙定義で作る（集計の段階の検出を確かめる）。
+            let hash = domain::election_definition_hash(&election(1));
+            let mut src = source(vec![
+                chain_for(&[5, 3], 1, &hash),
+                chain_for(&[4], 2, &hash),
+            ]);
+            let r = crate::verify::tests::reports_for(&src, &hash);
+            src.counts = counts_for(&r, 0, 0);
+            let flow = tally_flow(&src, &election(1), &run(&out, ElectionPhase::Closed, true))
+                .expect("flow");
+            assert_eq!(flow, Flow::Invalid);
+            assert!(!out.exists());
+        }
+
+        #[test]
+        fn election_data_changed_after_init_is_never_tallied() {
+            let out = temp_out();
+            // 同じ ID のまま、候補者の名前を入れ替えた選挙データ（init の後に seed を書き換えた）。
+            let base = election(2);
+            let mut candidates: Vec<Candidate> = base
+                .contests()
+                .iter()
+                .flat_map(|c| c.candidates.clone())
+                .collect();
+            let (a, b) = (candidates[0].name.clone(), candidates[1].name.clone());
+            candidates[0].name = b;
+            candidates[1].name = a;
+            let swapped = Election::new(
+                base.id().clone(),
+                base.name().to_string(),
+                base.types().to_vec(),
+                base.contests().iter().map(|c| c.district.clone()).collect(),
+                candidates,
+            )
+            .expect("election");
             let flow = tally_flow(
                 &fixture(0, 0),
-                &election(1),
-                &run(&out, ElectionPhase::Closed, true),
+                &swapped,
+                &run(&out, ElectionPhase::Closed, false),
             )
             .expect("flow");
             assert_eq!(flow, Flow::Invalid);

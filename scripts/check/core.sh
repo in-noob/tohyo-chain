@@ -204,6 +204,7 @@ check_config() (
         chain.reveal_ballots admin.bind labels.site_title labels.done_message labels.login_heading
         labels.ballot_item labels.progress labels.voting_not_started_message labels.voting_closing_message
         labels.voting_closed_message vote.allow_blank labels.blank_option labels.blank_confirm labels.blank_name
+        labels.election_hash
     )
     for key in "${REQUIRED_KEYS[@]}"; do
         with_config /nonexistent "$EMPTY_SECRETS" -- "$CFG" get "$key" >/dev/null 2>&1 \
@@ -459,7 +460,8 @@ check_config() (
         --duration 1 --label t --out "$TMP/bench.json"
 
     start_api "$D_NONE" "$EMPTY_SECRETS" APP__SESSION__SECRET="$SECRET"
-    vout="$(with_config "$D_NONE" "$EMPTY_SECRETS" APP__API__PORT="$PORT" -- ./target/debug/verifier verify 2>&1)" \
+    # verify は、手元の選挙データとジェネシスの選挙定義のハッシュを照合する（ADR 0025）ので、api と同じ選挙データを渡す。
+    vout="$(with_config "$D_NONE" "$EMPTY_SECRETS" APP__API__PORT="$PORT" APP__ELECTION__SEED_DIR="$SEED_DIR" -- ./target/debug/verifier verify 2>&1)" \
         || { echo "$vout" >&2; fail "verifier verify（--api なし）が、設定の api.port の api を検証できません"; }
     grep -Fq '検証 OK' <<<"$vout" || { echo "$vout" >&2; fail "verifier verify の出力に「検証 OK」がありません"; }
     stop_api
@@ -477,10 +479,11 @@ check_config() (
     LABEL_BLANK_OPTION="設定確認用の白票の選択肢-$RANDOM"
     LABEL_BLANK_CONFIRM="設定確認用の白票の確認-$RANDOM"
     LABEL_BLANK_NAME="設定確認用の白票-$RANDOM"
+    LABEL_ELECTION_HASH="設定確認用の選挙定義のハッシュ-$RANDOM"
     web_env="$(with_config /nonexistent "$EMPTY_SECRETS" APP__LABELS__SITE_TITLE="$LABEL_TITLE" APP__LABELS__DONE_MESSAGE="$LABEL_DONE" \
         APP__LABELS__BALLOT_ITEM="$LABEL_ITEM" APP__LABELS__PROGRESS="$LABEL_PROGRESS" \
         APP__LABELS__BLANK_OPTION="$LABEL_BLANK_OPTION" APP__LABELS__BLANK_CONFIRM="$LABEL_BLANK_CONFIRM" \
-        APP__LABELS__BLANK_NAME="$LABEL_BLANK_NAME" -- "$CFG" web-env)"
+        APP__LABELS__BLANK_NAME="$LABEL_BLANK_NAME" APP__LABELS__ELECTION_HASH="$LABEL_ELECTION_HASH" -- "$CFG" web-env)"
     DIST="$TMP/dist"
     if ! build_log="$(cd crates/web && eval "$web_env" && trunk build --dist "$DIST" 2>&1)"; then
         echo "$build_log" >&2
@@ -495,7 +498,8 @@ check_config() (
     grep -aFq "$LABEL_BLANK_OPTION" "$wasm_file" || fail "labels.blank_option が web のビルドに反映されていません"
     grep -aFq "$LABEL_BLANK_CONFIRM" "$wasm_file" || fail "labels.blank_confirm が web のビルドに反映されていません"
     grep -aFq "$LABEL_BLANK_NAME" "$wasm_file" || fail "labels.blank_name が web のビルドに反映されていません"
-    echo "labels.site_title / done_message / ballot_item / progress / blank_option / blank_confirm / blank_name が、ビルド時の環境変数で web に渡る: OK"
+    grep -aFq "$LABEL_ELECTION_HASH" "$wasm_file" || fail "labels.election_hash が web のビルドに反映されていません"
+    echo "labels.site_title / done_message / ballot_item / progress / blank_option / blank_confirm / blank_name / election_hash が、ビルド時の環境変数で web に渡る: OK"
     if cargo tree -p web --edges normal,build 2>/dev/null | grep -q 'app-config'; then
         fail "web が app-config に依存しています（原則 5）"
     fi

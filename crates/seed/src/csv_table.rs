@@ -17,7 +17,7 @@ pub(crate) struct Table {
 }
 
 impl Table {
-    /// 列の値（前後の空白は取り除いてある）。列が無いときは空文字列（読み込み時に、必須の列は確認済み）。
+    /// 列の値（前後の空白は取り除き、セル内の改行は LF にそろえてある）。列が無いときは空文字列（読み込み時に、必須の列は確認済み）。
     pub(crate) fn get<'a>(&self, row: &'a Row, column: &str) -> &'a str {
         self.columns
             .get(column)
@@ -105,7 +105,7 @@ pub(crate) fn read_table(
         }
         rows.push(Row {
             line,
-            fields: record.iter().map(str::to_string).collect(),
+            fields: record.iter().map(normalize_newlines).collect(),
         });
     }
     ok.then_some(Table { columns, rows })
@@ -121,4 +121,10 @@ pub(crate) fn split_list(raw: &str) -> Vec<&str> {
         return Vec::new();
     }
     raw.split(';').map(str::trim).collect()
+}
+
+/// 値の中の改行コード（CRLF・CR）を LF にそろえる。表計算ソフトで保存し直して改行コードが変わっても、読み込んだ値
+/// （と選挙定義のハッシュ。ADR 0025）が変わらないようにする。
+pub(crate) fn normalize_newlines(raw: &str) -> String {
+    raw.replace("\r\n", "\n").replace('\r', "\n")
 }

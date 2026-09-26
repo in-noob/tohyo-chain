@@ -287,6 +287,8 @@ CLEANUP_ON_EXIT=0
 API="http://localhost:${API_PORT_CFG}"
 # 選挙データ（設定 election.seed_dir / election.election_id）と、名簿の有権者の例。
 ELECTION_DIR="$(cfg_get election.seed_dir)/$(cfg_get election.election_id)"
+# verify は、手元の選挙データと、ジェネシスの選挙定義のハッシュを照合する（ADR 0025）。api と同じ選挙データを渡すコマンドを案内する。
+VERIFY_CMD="APP__ELECTION__SEED_DIR=$(cfg_get election.seed_dir) cargo run -q -p verifier -- verify --api ${API}"
 ELECTION_SUMMARY="$(./target/debug/seedgen --check "$(cfg_get election.seed_dir)" --election-id "$(cfg_get election.election_id)" 2>/dev/null | sed 's/^OK: [^:]*: //' || true)"
 VOTER_EXAMPLES="$(sed -n '2,6p' "${ELECTION_DIR}/voters.csv" 2>/dev/null | cut -d, -f1 | paste -sd' ' || true)"
 NOTE_PERSIST=""
@@ -327,8 +329,8 @@ ${NOTE_PERSIST}
    （票は、未封印が 10 件以上になり、前回の封印から 10 秒以上経つと封印される（config/dev.toml）。
     10 件に満たない票は、scripts/election.sh close --now（締切の手続き）で封印される）
 
-■ チェーンを検証する（全シャード・突合・アンカー）:
-   cargo run -q -p verifier -- verify --api ${API}
+■ チェーンを検証する（全シャード・突合・アンカー・選挙定義のハッシュ）:
+   ${VERIFY_CMD}
 
 ■ 改ざんデモ:
 MSG
@@ -336,7 +338,7 @@ if [[ "$MODE" == memory ]]; then
     cat <<MSG
    1) 画面から数票投票し、封印（10 秒）を待つ
    2) curl -s -X POST ${API}/debug/tamper      # 封印済みの票を 1 件書き換える（メモリ上）
-   3) cargo run -q -p verifier -- verify --api ${API}   # 改ざんが検出され、NG になる
+   3) ${VERIFY_CMD}   # 改ざんが検出され、NG になる
    （元に戻すには、dev_down.sh → dev_up.sh で再起動する）
 MSG
 else

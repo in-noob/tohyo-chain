@@ -12,7 +12,10 @@
 #   9. 再投票（DB。ADR 0022）: A → B → 白票 → 上限を超えると拒否 → 同時に 2 つの再投票は 1 件だけ成功（LWT）→
 #      締切前のビューア・API で candidate と supersedes の中身が見えない → 締切の手続きで revote_key を破棄（締切後は
 #      存在しない）→ verify OK → tally は白票の 1 票だけ・変更の内訳 → ビューアに「#<前の票> を置き換え（A→B）」
-# 4・5・6・9 は DB（Cassandra/ScyllaDB）を使う。専用のキースペースを使い、共用の vote には触れない。
+#  10. 選挙定義のハッシュ（DB。ADR 0025）: init → 投票 → 封印 → verify OK（ジェネシス・election-status・ビューアに同じ値・版 4）→
+#      seed の候補者名を入れ替える → verify NG・tally が 3・api と sealer が起動を拒否（ジェネシスとの照合）→ seed を戻すと
+#      起動でき、verify・tally が OK → 票とチェーンを消しても（--votes と同じ）、cluster_config との照合で起動を拒否
+# 4・5・6・9・10 は DB（Cassandra/ScyllaDB）を使う。専用のキースペースを使い、共用の vote には触れない。
 # 環境変数（APP__DB__BACKEND / DB_PORT / KEEP_KEYSPACE / STOP_DB）は scripts/lib/common.sh を参照。
 set -euo pipefail
 
@@ -1525,6 +1528,203 @@ check_revote_db() (
     echo "OK: chain#9 再投票（DB_BACKEND=${DB_BACKEND}）"
 )
 
+# ===========================================================================
+# 10. 選挙定義のハッシュ（DB。ADR 0025）
+# ===========================================================================
+check_election_hash() (
+    set -euo pipefail
+    PORT="${CHECK_API_PORT:-18810}"
+    ADMIN_PORT="${CHECK_ADMIN_PORT:-18910}"
+    BASE="http://127.0.0.1:${PORT}"
+    ADMIN_BASE="http://127.0.0.1:${ADMIN_PORT}"
+    ADMIN_TOKEN="chain10-check-admin-token-0123456789abcdef"
+    export BASE
+
+    TMP="$(mktemp -d)"
+    OUT="$TMP/out"
+    API_LOG="$TMP/api.log"
+    SEALER_LOG="$TMP/sealer.log"
+
+    export APP__APP__MODE=db
+    export APP__DB__NODES="127.0.0.1:${DB_PORT}"
+    export APP__SHARD__COUNT=2
+    export APP__SEAL__MAX_BALLOTS=1000
+    export APP__SEAL__INTERVAL_SECS=600
+    export APP__SEALER__LEASE_TTL_SECS=6
+    export APP__SEALER__SIGNING_SEED="1010101010101010101010101010101010101010101010101010101010101010"
+    export APP__SESSION__SECRET="chain10-check-secret-0123456789abcdef"
+    export APP__API__PORT="$PORT"
+    export APP__ADMIN__BIND="127.0.0.1:${ADMIN_PORT}"
+    export APP__ADMIN__TOKEN="$ADMIN_TOKEN"
+    export APP__ELECTION__VOTING_OPENS_AT="2020-01-01T00:00:00+00:00"
+    export APP__ELECTION__STATE_CACHE_SECS=1
+    export APP__API__REQUEST_TIMEOUT_SECS=3
+    export RUST_LOG="info,tower_http=warn"
+
+    ks_init chain10
+
+    cleanup() {
+        common_cleanup
+        hard_stop api
+        hard_stop sealer
+        rm -rf "$TMP"
+        ks_drop
+        db_stop
+    }
+    trap cleanup EXIT
+    fail() {
+        echo "FAIL: $1" >&2
+        for f in "$API_LOG" "$SEALER_LOG"; do
+            if [[ -s "$f" ]]; then
+                echo "--- $(basename "$f")（末尾）---" >&2
+                tail -n 12 "$f" >&2
+            fi
+        done
+        exit 1
+    }
+
+    RC=0
+    RUN_OUT=""
+    run_verify() {
+        RC=0
+        RUN_OUT="$(./target/debug/verifier verify --api "$BASE" 2>&1)" || RC=$?
+    }
+    run_tally() {
+        RC=0
+        RUN_OUT="$(./scripts/tally.sh --api "$BASE" --out "$OUT" 2>&1)" || RC=$?
+    }
+    out_dirs() { { find "$OUT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '; } || true; }
+    admin_phase() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election" 2>/dev/null; }
+    json_field() { sed -n "s/.*\"$1\":\"\([0-9a-f]*\)\".*/\1/p"; }
+    start_services() {
+        spawn sealer "$SEALER_LOG" env APP__SEALER__ID=chain10-sealer ./target/debug/sealer
+        spawn api "$API_LOG" ./target/debug/api
+        wait_healthz "$BASE" 20 api || fail "api が応答しません"
+        for shard in 0 1; do
+            for _ in $(seq 1 200); do
+                [[ "$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/api/v1/chains/${shard}/head")" == 200 ]] && continue 2
+                sleep 0.2
+            done
+            fail "sealer がシャード ${shard} のチェーンを用意しません"
+        done
+    }
+    # refuses NAME CMD...: 起動を拒否して（0 以外で）終了し、理由と直し方をログに出すこと。
+    refuses() {
+        local name="$1" log="$TMP/refuse-$1.log" rc=0
+        shift
+        timeout 60 "$@" >"$log" 2>&1 || rc=$?
+        [[ "$rc" != 0 && "$rc" != 124 ]] || { cat "$log" >&2; fail "${name} が、書き換えた seed のまま起動しました（exit=${rc}）"; }
+        grep -q '選挙定義' "$log" && grep -q 'db_reset.sh --all' "$log" \
+            || { cat "$log" >&2; fail "${name} の拒否の理由に、選挙定義と直し方（db_reset.sh --all）がありません"; }
+        REFUSE_LOG="$log"
+    }
+
+    echo "== 1. init → 投票 → 締切（封印）"
+    db_ensure
+    ks_create skip
+    VOTERS=6
+    seed_generate "$TMP/seed" "$VOTERS"
+    CANDIDATES="$TMP/seed/$SEED_ID/candidates/shugiin_smd.csv"
+    cp "$CANDIDATES" "$TMP/shugiin_smd.csv.orig"
+    start_services
+    wait_election_open "$BASE" 15 || fail "自動で open になりませんでした"
+    for n in $(seq 1 "$VOTERS"); do
+        token="$(login "voter-${n}")"
+        [[ -n "$token" ]] || fail "voter-${n} がログインできません"
+        code="$(seed_vote "$n" 1 "$token")"
+        [[ "$code" == 201 ]] || fail "voter-${n} の投票が 201 ではありません（${code}）"
+    done
+    curl -sS -o /dev/null -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" "${ADMIN_BASE}/admin/v1/election/close"
+    for _ in $(seq 1 100); do
+        [[ "$(admin_phase)" == *'"phase":"closed"'* ]] && break
+        sleep 0.2
+    done
+    [[ "$(admin_phase)" == *'"phase":"closed"'* ]] || fail "closed になりませんでした: $(admin_phase)"
+    sleep "$((APP__ELECTION__STATE_CACHE_SECS + 1))"
+    echo "投票 ${VOTERS} 票 → 締切の手続きで封印 → closed: OK"
+
+    echo "== 2. 選挙定義のハッシュが、election-status・全シャードのジェネシス・以後のブロックで同じ（版 4）→ verify・tally が OK"
+    HASH="$(curl -s "${BASE}/api/v1/election-status" | json_field election_hash)"
+    [[ "${#HASH}" == 64 ]] || fail "election-status に election_hash（64 桁の hex）がありません"
+    sealed=0
+    for shard in 0 1; do
+        top="$(curl -s "${BASE}/api/v1/chains/${shard}/head" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')"
+        for h in $(seq 0 "${top:-0}"); do
+            body="$(curl -s "${BASE}/api/v1/chains/${shard}/blocks/${h}")"
+            [[ "$(json_field election_hash <<<"$body")" == "$HASH" ]] || fail "シャード ${shard} の高さ ${h} の election_hash が ${HASH} ではありません"
+            [[ "$body" == *'"version":4'* ]] || fail "シャード ${shard} の高さ ${h} の版が 4 ではありません"
+            [[ "$h" == 0 ]] || sealed=$((sealed + 1))
+        done
+    done
+    [[ "$sealed" -ge 1 ]] || fail "票のブロックが封印されていません"
+    grep -q 'labels::election_hash()' crates/web/src/pages/chain.rs && grep -q 'h.election_hash' crates/web/src/pages/chain.rs \
+        && grep -q 'status.election_hash' crates/web/src/pages/chain.rs \
+        || fail "ビューア（/chain とブロックの詳細）が、選挙定義のハッシュを labels::election_hash() の見出しで表示していません"
+    run_verify
+    [[ "$RC" == 0 && "$RUN_OUT" == *"検証 OK"* && "$RUN_OUT" == *"$HASH"* ]] || fail "verify が OK になりません（${RC}）: ${RUN_OUT}"
+    run_tally
+    [[ "$RC" == 0 ]] || fail "tally が終了コード 0 ではありません（${RC}）: ${RUN_OUT}"
+    echo "election_hash=${HASH:0:16}…: ジェネシス + ${sealed} ブロック・election-status・ビューアの表示・verify・tally: OK"
+
+    echo "== 3. init の後に、seed の候補者名を入れ替える（同じ選挙区の c1 と c2。ID はそのまま）"
+    d="$(sed -n 2p "$CANDIDATES" | cut -d, -f2)"
+    awk -F, -v OFS=, -v a="${d}.c1" -v b="${d}.c2" '
+        NR == FNR { if ($1 == a) na = $3; if ($1 == b) nb = $3; next }
+        $1 == a { $3 = nb } $1 == b { $3 = na } { print }' "$CANDIDATES" "$CANDIDATES" >"$TMP/swapped.csv"
+    cmp -s "$TMP/swapped.csv" "$CANDIDATES" && fail "候補者名を入れ替えられませんでした"
+    cp "$TMP/swapped.csv" "$CANDIDATES"
+    ./target/debug/seedgen --check "$TMP/seed" --election-id "$SEED_ID" >/dev/null || fail "入れ替えた seed が、seed としては正しくありません"
+    run_verify
+    [[ "$RC" == 3 && "$RUN_OUT" == *"選挙定義のハッシュが一致しません"* && "$RUN_OUT" == *"検証 NG"* ]] \
+        || fail "書き換えた seed で、verify が NG（終了コード 3）になりません（${RC}）: ${RUN_OUT}"
+    before="$(out_dirs)"
+    run_tally
+    [[ "$RC" == 3 && "$RUN_OUT" == *"集計を中止しました"* ]] || fail "書き換えた seed で、tally が終了コード 3 になりません（${RC}）: ${RUN_OUT}"
+    [[ "$(out_dirs)" == "$before" ]] || fail "拒否したのに、集計の出力ディレクトリが増えています"
+    echo "verify: NG（終了コード 3）・tally: 中止（終了コード 3。何も出力しない）: OK"
+
+    echo "== 4. 書き換えた seed では、api と sealer が起動を拒否する（既にあるチェーンのジェネシスとの照合）"
+    graceful_stop api
+    graceful_stop sealer
+    refuses sealer env APP__SEALER__ID=chain10-sealer-x ./target/debug/sealer
+    grep -q 'シャード' "$REFUSE_LOG" || { cat "$REFUSE_LOG" >&2; fail "sealer の拒否が、ジェネシスとの照合によるものではありません"; }
+    refuses api ./target/debug/api
+    grep -q 'シャード' "$REFUSE_LOG" || { cat "$REFUSE_LOG" >&2; fail "api の拒否が、ジェネシスとの照合によるものではありません"; }
+    # ジェネシスと照合してから登録するので、拒否したときに、書き換えた seed のハッシュが cluster_config に残らない。
+    [[ "$(ks_cql "SELECT value FROM ${KS}.cluster_config WHERE key = 'election_hash'" 2>/dev/null | grep -oE '[0-9a-f]{64}' || true)" == "$HASH" ]] \
+        || fail "cluster_config の election_hash が、init の時点の値のままではありません"
+    echo "api・sealer: 理由と直し方を出して起動を拒否・cluster_config は init の時点の値のまま: OK"
+
+    echo "== 5. seed を戻すと、起動でき、verify・tally が OK"
+    cp "$TMP/shugiin_smd.csv.orig" "$CANDIDATES"
+    start_services
+    [[ "$(curl -s "${BASE}/api/v1/election-status" | json_field election_hash)" == "$HASH" ]] || fail "戻した seed のハッシュが、init の時点と違います"
+    run_verify
+    [[ "$RC" == 0 && "$RUN_OUT" == *"検証 OK"* ]] || fail "seed を戻しても、verify が OK になりません（${RC}）: ${RUN_OUT}"
+    run_tally
+    [[ "$RC" == 0 ]] || fail "seed を戻しても、tally が終了コード 0 になりません（${RC}）: ${RUN_OUT}"
+    echo "起動・verify・tally: OK"
+
+    echo "== 6. チェーンが無くても（db_reset.sh --votes の後。cluster_config は残る）、書き換えた seed では起動を拒否する"
+    graceful_stop api
+    graceful_stop sealer
+    # db_reset.sh --votes と同じ表を消す（db_reset.sh は、このホストで動いている別の api / sealer も止めるよう求めるので、
+    # 確認スイートの中では直接消す）。
+    for t in participation slot_state ballot_pool blocks anchors sealer_lease; do
+        ks_cql "TRUNCATE ${KS}.${t}" >/dev/null 2>&1 || fail "${t} を消せません"
+    done
+    cp "$TMP/swapped.csv" "$CANDIDATES"
+    refuses api ./target/debug/api
+    grep -q 'DB には' "$REFUSE_LOG" || { cat "$REFUSE_LOG" >&2; fail "api の拒否が、cluster_config の照合によるものではありません"; }
+    refuses sealer env APP__SEALER__ID=chain10-sealer-y ./target/debug/sealer
+    grep -q 'DB には' "$REFUSE_LOG" || { cat "$REFUSE_LOG" >&2; fail "sealer の拒否が、cluster_config の照合によるものではありません"; }
+    [[ "$(ks_cql "SELECT count(*) FROM ${KS}.blocks" 2>/dev/null | grep -E '^\s*[0-9]+\s*$' | tr -d ' ')" == 0 ]] \
+        || fail "拒否したのに、書き換えた seed のジェネシスが作られています"
+    echo "api・sealer: cluster_config との照合で起動を拒否（ジェネシスも作らない）: OK"
+
+    echo "OK: chain#10 選挙定義のハッシュ（DB_BACKEND=${DB_BACKEND}）"
+)
+
 check_demo
 check_inprocess_sealer
 check_no_append_without_change
@@ -1534,5 +1734,6 @@ check_tally
 check_viewer_api
 check_seal_rules
 check_revote_db
+check_election_hash
 
 echo "OK: check/chain.sh"

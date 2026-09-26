@@ -18,6 +18,7 @@ pub type BlockRow = (
     Vec<u8>,                  // merkle_root
     i32,                      // ballot_count
     i64,                      // sealed_at_minute
+    Vec<u8>,                  // election_hash
     Vec<u8>,                  // block_hash
     Vec<u8>,                  // signature
     Option<Vec<BallotTuple>>, // ballots（空リストは NULL で返る）
@@ -166,6 +167,7 @@ pub struct BlockValues {
     pub merkle_root: Vec<u8>,
     pub ballot_count: i32,
     pub sealed_at_minute: i64,
+    pub election_hash: Vec<u8>,
     pub block_hash: Vec<u8>,
     pub signature: Vec<u8>,
     pub ballots: Vec<BallotTuple>,
@@ -180,6 +182,7 @@ pub fn block_to_values(block: &Block) -> Result<BlockValues, StoreError> {
         merkle_root: h.merkle_root.to_vec(),
         ballot_count: i32::try_from(h.ballot_count).map_err(|_| StoreError::Corrupt)?,
         sealed_at_minute: i64::try_from(h.sealed_at_minute).map_err(|_| StoreError::Corrupt)?,
+        election_hash: h.election_hash.to_vec(),
         block_hash: block.block_hash.to_vec(),
         signature: block.signature.to_vec(),
         ballots: block
@@ -191,7 +194,7 @@ pub fn block_to_values(block: &Block) -> Result<BlockValues, StoreError> {
 }
 
 pub fn block_from_row(row: BlockRow) -> Result<Block, StoreError> {
-    let (height, version, prev, root, count, minute, hash, signature, ballots) = row;
+    let (height, version, prev, root, count, minute, election, hash, signature, ballots) = row;
     let bad = |_| StoreError::Corrupt;
     Ok(Block {
         header: BlockHeader {
@@ -207,6 +210,10 @@ pub fn block_from_row(row: BlockRow) -> Result<Block, StoreError> {
                 .map_err(|_| StoreError::Corrupt)?,
             ballot_count: u32::try_from(count).map_err(bad)?,
             sealed_at_minute: u64::try_from(minute).map_err(bad)?,
+            election_hash: election
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupt)?,
         },
         ballots: ballots
             .unwrap_or_default()
@@ -249,6 +256,7 @@ mod tests {
             v.merkle_root,
             v.ballot_count,
             v.sealed_at_minute,
+            v.election_hash,
             v.block_hash,
             v.signature,
             ballots,
@@ -341,7 +349,7 @@ mod tests {
     #[test]
     fn block_roundtrip_including_genesis_with_null_ballots() {
         let signer = Ed25519Signer::from_seed(&[1u8; 32]);
-        let g = genesis(&signer, 100);
+        let g = genesis(&signer, 100, [0xe1; 32]);
         let b1 = seal_block(&g, vec![ballot(1), ballot(2), linked(3)], 101, &signer).expect("seal");
         for block in [g, b1] {
             let row = as_row(block_to_values(&block).expect("to values"));
@@ -393,7 +401,7 @@ mod tests {
     #[test]
     fn block_row_with_wrong_lengths_is_corrupt() {
         let signer = Ed25519Signer::from_seed(&[1u8; 32]);
-        let g = genesis(&signer, 100);
+        let g = genesis(&signer, 100, [0xe1; 32]);
         let good = as_row(block_to_values(&g).expect("to values"));
 
         let mut bad_hash = good.clone();

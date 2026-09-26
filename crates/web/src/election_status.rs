@@ -51,6 +51,7 @@ mod tests {
             display_timezone: "Asia/Tokyo".to_string(),
             display_timezone_offset_secs: 9 * 3600,
             rules: None,
+            election_hash: "e1".repeat(32),
         }
     }
 

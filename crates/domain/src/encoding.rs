@@ -10,7 +10,8 @@
 //!   `0x01 ‖ slot(32) ‖ seq(4)`（初回の投票。`supersedes` なし）/
 //!   `0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32)`（再投票）。つながりの無い票は版 2 と同じバイト列。最大 266 バイト。
 //! - ヘッダ = `version(2) ‖ height(8) ‖ prev_hash(32) ‖ merkle_root(32)
-//!            ‖ ballot_count(4) ‖ sealed_at_minute(8)`                  = 86 バイト（固定長）
+//!            ‖ ballot_count(4) ‖ sealed_at_minute(8) ‖ election_hash(32)` = 118 バイト（固定長）。
+//!   `election_hash`（選挙定義のハッシュ。[`crate::election_hash`]）はブロックの形式の版 4 から（ADR 0025）。
 //! - `block_hash = SHA256("vote/block/v1" ‖ ヘッダ)`
 
 use sha2::{Digest, Sha256};
@@ -32,7 +33,7 @@ const REVOTE_TAG_INITIAL: u8 = 0x01;
 const REVOTE_TAG_SUPERSEDES: u8 = 0x02;
 /// 票のハッシュ（Merkle 木の葉と同じ値）の接頭辞。
 const BALLOT_HASH_PREFIX: u8 = 0x00;
-pub const HEADER_LEN: usize = 86;
+pub const HEADER_LEN: usize = OFF_ELECTION_HASH + HASH_LEN;
 
 /// ブロックハッシュのドメイン分離タグ。
 pub const BLOCK_HASH_DOMAIN: &[u8] = b"vote/block/v1";
@@ -45,6 +46,7 @@ const OFF_PREV_HASH: usize = 10;
 const OFF_MERKLE_ROOT: usize = OFF_PREV_HASH + HASH_LEN;
 const OFF_COUNT: usize = OFF_MERKLE_ROOT + HASH_LEN;
 const OFF_MINUTE: usize = OFF_COUNT + 4;
+const OFF_ELECTION_HASH: usize = OFF_MINUTE + 8;
 
 /// 複数のバイト列を連結して SHA-256 を取る。
 pub fn sha256_parts(parts: &[&[u8]]) -> Hash32 {
@@ -196,6 +198,7 @@ pub fn encode_header(header: &BlockHeader) -> [u8; HEADER_LEN] {
     put(&mut out, OFF_MERKLE_ROOT, &header.merkle_root);
     put(&mut out, OFF_COUNT, &header.ballot_count.to_be_bytes());
     put(&mut out, OFF_MINUTE, &header.sealed_at_minute.to_be_bytes());
+    put(&mut out, OFF_ELECTION_HASH, &header.election_hash);
     out
 }
 
@@ -207,6 +210,7 @@ pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> BlockHeader {
         merkle_root: take(bytes, OFF_MERKLE_ROOT),
         ballot_count: u32::from_be_bytes(take(bytes, OFF_COUNT)),
         sealed_at_minute: u64::from_be_bytes(take(bytes, OFF_MINUTE)),
+        election_hash: take(bytes, OFF_ELECTION_HASH),
     }
 }
 
@@ -243,6 +247,7 @@ mod tests {
             merkle_root: [0xbb; 32],
             ballot_count: 0x0b0c_0d0e,
             sealed_at_minute: 0x0f10_1112_1314_1516,
+            election_hash: [0xcc; 32],
         }
     }
 
@@ -401,6 +406,8 @@ mod tests {
         expected.extend_from_slice(&[0xbb; 32]);
         expected.extend_from_slice(&[0x0b, 0x0c, 0x0d, 0x0e]);
         expected.extend_from_slice(&[0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16]);
+        expected.extend_from_slice(&[0xcc; 32]);
+        assert_eq!(HEADER_LEN, 118);
         assert_eq!(encoded.len(), HEADER_LEN);
         assert_eq!(encoded.to_vec(), expected);
         assert_eq!(decode_header(&encoded), sample_header());
@@ -410,7 +417,7 @@ mod tests {
     fn block_hash_known_vector() {
         // 独立実装（Python hashlib）で計算した期待値:
         // sha256(b"vote/block/v1" + encode_header(sample_header()))
-        let expected = "7dc101f7a01ce00e288c069bb402098f4d36b42d7e2e1a6929e341c971817c4e";
+        let expected = "9418c6b2ab476e97003d80f0da5bb89bc4643676a56b42d8c276358da686a273";
         let actual: String = block_hash(&sample_header())
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -439,6 +446,10 @@ mod tests {
             },
             BlockHeader {
                 sealed_at_minute: 1,
+                ..base
+            },
+            BlockHeader {
+                election_hash: [0; 32],
                 ..base
             },
         ];

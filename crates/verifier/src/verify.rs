@@ -147,6 +147,13 @@ pub enum VerifyFailure {
     HeadMismatch,
     #[error("不正なデータです: {0}")]
     Malformed(String),
+    /// ジェネシスの選挙定義のハッシュが、手元の選挙データ（seed）のハッシュと違う（ADR 0025）。全シャードをこの値と照合するので、
+    /// シャードの間でジェネシスの値が違う場合も、どれかがこれになる。
+    #[error(
+        "選挙定義のハッシュが一致しません（ジェネシス: {chain}、手元の選挙データ（seed）: {seed}）。init の後に選挙データが書き換えられたか、\
+         別の選挙のデータと照合しています"
+    )]
+    ElectionMismatch { chain: String, seed: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,20 +165,24 @@ pub enum ShardVerdict {
 /// シャード 0 から順に、head が 404 になるまでのすべてのチェーンを検証する。
 ///
 /// `pinned_key` があればそれを、なければ各シャードの head が示す公開鍵を使う。
+/// 各シャードのジェネシスの選挙定義のハッシュが `election_hash`（手元の seed から計算した値。ADR 0025）と同じことも確かめる。
 /// 通信エラーなどの実行時エラーは `Err`、チェーンの不整合は `ShardVerdict::Invalid`。
 pub fn verify_all(
     source: &dyn ChainSource,
     pinned_key: Option<&[u8; 32]>,
+    election_hash: &[u8; 32],
 ) -> anyhow::Result<Vec<ShardVerdict>> {
     let mut verdicts = Vec::new();
     for shard in 0..=u16::MAX {
         let Some(head) = source.head(shard)? else {
             break;
         };
-        verdicts.push(match verify_shard(source, shard, &head, pinned_key)? {
-            Ok(report) => ShardVerdict::Valid(report),
-            Err(failure) => ShardVerdict::Invalid { shard, failure },
-        });
+        verdicts.push(
+            match verify_shard(source, shard, &head, pinned_key, election_hash)? {
+                Ok(report) => ShardVerdict::Valid(report),
+                Err(failure) => ShardVerdict::Invalid { shard, failure },
+            },
+        );
     }
     if verdicts.is_empty() {
         bail!("チェーンが見つかりません（シャード 0 の head が存在しません）");
@@ -185,6 +196,7 @@ fn verify_shard(
     shard: u16,
     head: &HeadDto,
     pinned_key: Option<&[u8; 32]>,
+    election_hash: &[u8; 32],
 ) -> anyhow::Result<Result<ShardReport, VerifyFailure>> {
     let key = match pinned_key {
         Some(key) => *key,
@@ -212,6 +224,15 @@ fn verify_shard(
 
     if let Err(e) = verify_chain(&blocks, &verifier) {
         return Ok(Err(e.into()));
+    }
+    // 全ブロックの値はジェネシスと同じ（verify_chain が確認済み）。ジェネシスの値を、手元の seed と照合する。
+    if let Some(genesis) = blocks.first()
+        && &genesis.header.election_hash != election_hash
+    {
+        return Ok(Err(VerifyFailure::ElectionMismatch {
+            chain: hex::encode(&genesis.header.election_hash),
+            seed: hex::encode(election_hash),
+        }));
     }
     // head の主張（最新ブロックのハッシュ）が、取得したチェーンと一致していること。
     if blocks.last().map(|b| hex::encode(&b.block_hash)).as_deref() != Some(&head.block_hash) {
@@ -285,6 +306,8 @@ fn block_from_dto(dto: &BlockDto) -> Result<Block, VerifyFailure> {
                 .map_err(|e| bad("merkle_root", e))?,
             ballot_count: h.ballot_count,
             sealed_at_minute: h.sealed_at_minute,
+            election_hash: hex::decode_array::<32>(&h.election_hash)
+                .map_err(|e| bad("election_hash", e))?,
         },
         ballots,
         block_hash: hex::decode_array::<32>(&dto.block_hash).map_err(|e| bad("block_hash", e))?,
@@ -593,7 +616,11 @@ fn anchor_from_dto(dto: &AnchorDto) -> Result<Anchor, String> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use domain::{Ed25519Signer, Signer, genesis, seal_block};
+    use domain::election::{Candidate, District, Election, ElectionType, VotingMethod};
+    use domain::{
+        CandidateCode, DistrictId, Ed25519Signer, ElectionId, ElectionTypeCode, Signer, genesis,
+        seal_block,
+    };
     use shared_types::{BallotDto, HeaderDto};
 
     use super::*;
@@ -652,6 +679,7 @@ pub(crate) mod tests {
                 merkle_root: hex::encode(&b.header.merkle_root),
                 ballot_count: b.header.ballot_count,
                 sealed_at_minute: b.header.sealed_at_minute,
+                election_hash: hex::encode(&b.header.election_hash),
             },
             ballots: b
                 .ballots
@@ -681,10 +709,105 @@ pub(crate) mod tests {
         Ed25519Signer::from_seed(&[3u8; 32])
     }
 
+    /// [`chain`] が作る票（2026-general の東京 1 区・2 区、候補者 c1〜c4）に合わせた選挙マスタ。
+    /// `districts` が 1 のときは、東京 2 区を含まない（チェーンにだけ存在する投票用紙を作る）。
+    pub(crate) fn test_election(districts: u32) -> Election {
+        let ty = ElectionTypeCode::new("shugiin_smd").expect("code");
+        let mut ds = Vec::new();
+        let mut cs = Vec::new();
+        for n in 1..=districts {
+            let id = format!("shugiin_smd.13.0{n}");
+            ds.push(District {
+                id: DistrictId::new(&id).expect("district"),
+                election_type: ty.clone(),
+                name: format!("東京{n}区"),
+                prefectures: vec!["13".to_string()],
+                order: n,
+            });
+            for c in 1..=4 {
+                cs.push(Candidate {
+                    id: CandidateCode::parse(&format!("{id}.c{c}")).expect("candidate"),
+                    name: format!("候補{n}-{c}"),
+                    party: "党".to_string(),
+                    profile: String::new(),
+                });
+            }
+        }
+        let types = vec![ElectionType {
+            code: ty,
+            name: "衆議院小選挙区".to_string(),
+            order: 1,
+            method: VotingMethod::SingleChoice,
+        }];
+        Election::new(
+            ElectionId::new("2026-general").expect("election"),
+            "テスト選挙".to_string(),
+            types,
+            ds,
+            cs,
+        )
+        .expect("election")
+    }
+
+    /// テスト用のチェーンのジェネシスに入れる、選挙定義のハッシュ（[`test_election`]`(2)` のもの）。
+    pub(crate) fn test_election_hash() -> [u8; 32] {
+        domain::election_definition_hash(&test_election(2))
+    }
+
+    #[test]
+    fn a_genesis_with_a_different_election_hash_is_reported() {
+        // 手元の seed と違う選挙定義で作られたチェーン（または、init の後に seed を書き換えた）。
+        let other = [0xe2; 32];
+        let src = source(vec![chain(&[2], 1), chain_for(&[2], 2, &other)]);
+        let verdicts = verify_all(&src, None, &test_election_hash()).expect("fetch");
+        assert!(matches!(verdicts[0], ShardVerdict::Valid(_)));
+        assert_eq!(
+            verdicts[1],
+            ShardVerdict::Invalid {
+                shard: 1,
+                failure: VerifyFailure::ElectionMismatch {
+                    chain: hex::encode(&other),
+                    seed: hex::encode(&test_election_hash()),
+                }
+            }
+        );
+        // 候補者名を 1 文字変えた選挙データと照合すると、全シャードが NG。
+        let base = test_election(2);
+        let mut candidates: Vec<Candidate> = base
+            .contests()
+            .iter()
+            .flat_map(|c| c.candidates.clone())
+            .collect();
+        candidates[0].name.push('x');
+        let renamed = Election::new(
+            base.id().clone(),
+            base.name().to_string(),
+            base.types().to_vec(),
+            base.contests().iter().map(|c| c.district.clone()).collect(),
+            candidates,
+        )
+        .expect("election");
+        let src = source(vec![chain(&[2], 1)]);
+        let verdicts =
+            verify_all(&src, None, &domain::election_definition_hash(&renamed)).expect("fetch");
+        assert!(matches!(
+            verdicts[0],
+            ShardVerdict::Invalid {
+                failure: VerifyFailure::ElectionMismatch { .. },
+                ..
+            }
+        ));
+    }
+
     /// ジェネシス + `sizes` の各ブロックからなるチェーン。
     pub(crate) fn chain(sizes: &[u32], salt: u8) -> Vec<BlockDto> {
+        chain_for(sizes, salt, &test_election_hash())
+    }
+
+    /// [`chain`] と同じで、ジェネシスの選挙定義のハッシュを `election_hash` にしたもの。
+    pub(crate) fn chain_for(sizes: &[u32], salt: u8, election_hash: &[u8; 32]) -> Vec<BlockDto> {
         let signer = signer();
-        let mut blocks = vec![genesis(&signer, 100)];
+        let mut blocks = vec![genesis(&signer, 100, *election_hash)];
         let mut next = 0u32;
         for (i, &n) in sizes.iter().enumerate() {
             let ballots = (next..next + n)
@@ -728,7 +851,7 @@ pub(crate) mod tests {
     #[test]
     fn valid_chains_pass_and_report_counts() {
         let src = source(vec![chain(&[5, 3], 1), chain(&[4], 2)]);
-        let verdicts = verify_all(&src, None).expect("fetch");
+        let verdicts = verify_all(&src, None, &test_election_hash()).expect("fetch");
         let summary: Vec<(u16, usize, usize)> = verdicts
             .iter()
             .map(|v| match v {
@@ -743,7 +866,7 @@ pub(crate) mod tests {
     fn tampered_ballot_is_reported_for_that_shard_only() {
         let mut shards = vec![chain(&[5, 3], 1), chain(&[4], 2)];
         shards[1][1].ballots[0].candidate_id = "shugiin_smd.13.01.c99".to_string();
-        let verdicts = verify_all(&source(shards), None).expect("fetch");
+        let verdicts = verify_all(&source(shards), None, &test_election_hash()).expect("fetch");
         assert!(matches!(verdicts[0], ShardVerdict::Valid(_)));
         assert_eq!(
             verdicts[1],
@@ -759,7 +882,7 @@ pub(crate) mod tests {
         let src = source(vec![chain(&[2], 1)]);
         // API が示す鍵は正しいが、利用者が別の鍵を固定した場合は署名不一致になる。
         let other = Ed25519Signer::from_seed(&[4u8; 32]).public_key();
-        let verdicts = verify_all(&src, Some(&other)).expect("fetch");
+        let verdicts = verify_all(&src, Some(&other), &test_election_hash()).expect("fetch");
         assert_eq!(
             verdicts[0],
             ShardVerdict::Invalid {
@@ -770,7 +893,7 @@ pub(crate) mod tests {
         // 正しい鍵を固定すれば通る。
         let right = signer().public_key();
         assert!(matches!(
-            verify_all(&src, Some(&right)).expect("fetch")[0],
+            verify_all(&src, Some(&right), &test_election_hash()).expect("fetch")[0],
             ShardVerdict::Valid(_)
         ));
     }
@@ -799,7 +922,12 @@ pub(crate) mod tests {
                 self.0.rules()
             }
         }
-        let v = verify_all(&LyingHead(source(vec![chain(&[2], 1)])), None).expect("fetch");
+        let v = verify_all(
+            &LyingHead(source(vec![chain(&[2], 1)])),
+            None,
+            &test_election_hash(),
+        )
+        .expect("fetch");
         assert_eq!(
             v[0],
             ShardVerdict::Invalid {
@@ -831,7 +959,12 @@ pub(crate) mod tests {
                 self.0.rules()
             }
         }
-        let v = verify_all(&Hole(source(vec![chain(&[2, 2], 1)])), None).expect("fetch");
+        let v = verify_all(
+            &Hole(source(vec![chain(&[2, 2], 1)])),
+            None,
+            &test_election_hash(),
+        )
+        .expect("fetch");
         assert_eq!(
             v[0],
             ShardVerdict::Invalid {
@@ -843,7 +976,7 @@ pub(crate) mod tests {
         // hex が壊れている。
         let mut shards = vec![chain(&[2], 1)];
         shards[0][1].signature = "zz".to_string();
-        let v = verify_all(&source(shards), None).expect("fetch");
+        let v = verify_all(&source(shards), None, &test_election_hash()).expect("fetch");
         assert!(matches!(
             &v[0],
             ShardVerdict::Invalid {
@@ -855,7 +988,7 @@ pub(crate) mod tests {
 
     #[test]
     fn no_chain_at_all_is_a_runtime_error() {
-        assert!(verify_all(&source(vec![]), None).is_err());
+        assert!(verify_all(&source(vec![]), None, &test_election_hash()).is_err());
     }
 
     /// 取得エラー（通信障害など）は「不整合」ではなく実行時エラーとして扱う。
@@ -879,13 +1012,18 @@ pub(crate) mod tests {
                 anyhow::bail!("接続できません")
             }
         }
-        assert!(verify_all(&Broken, None).is_err());
+        assert!(verify_all(&Broken, None, &test_election_hash()).is_err());
     }
 
     // --- 突合・重複・アンカー ---
 
     pub(crate) fn reports(src: &FakeSource) -> Vec<ShardReport> {
-        verify_all(src, None)
+        reports_for(src, &test_election_hash())
+    }
+
+    /// [`reports`] と同じで、照合する選挙定義のハッシュを `election_hash` にしたもの。
+    pub(crate) fn reports_for(src: &FakeSource, election_hash: &[u8; 32]) -> Vec<ShardReport> {
+        verify_all(src, None, election_hash)
             .expect("fetch")
             .into_iter()
             .map(|v| match v {
@@ -1137,7 +1275,7 @@ pub(crate) mod tests {
     /// 1 シャードのチェーン。票は `blocks` の各ブロック（封印の順）。
     pub(crate) fn chain_of(blocks: Vec<Vec<Ballot>>) -> Vec<BlockDto> {
         let signer = signer();
-        let mut chain = vec![genesis(&signer, 100)];
+        let mut chain = vec![genesis(&signer, 100, test_election_hash())];
         for (i, ballots) in blocks.into_iter().enumerate() {
             let prev = chain.last().expect("non-empty");
             chain.push(seal_block(prev, ballots, 101 + i as u64, &signer).expect("seal"));
