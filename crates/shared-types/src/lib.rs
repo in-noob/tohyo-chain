@@ -60,6 +60,8 @@ pub struct ElectionStatusResponse {
     /// 再投票のつながりの検証（`allow_revote`・`max_revotes`）に使う。古い api では省かれる。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<ElectionRulesDto>,
+    /// api が読み込んだ選挙データの、選挙定義のハッシュ（64 桁の hex。ADR 0025）。起動時にチェーンと照合済み。
+    pub election_hash: String,
 }
 
 /// 選挙のルール（原則19。ADR 0021・0022）。
@@ -167,6 +169,8 @@ pub struct HeaderDto {
     pub ballot_count: u32,
     /// 封印時刻（UNIX 分）。
     pub sealed_at_minute: u64,
+    /// 選挙定義のハッシュ（64 桁の hex。ジェネシスの値を全ブロックが引き継ぐ。ブロックの形式の版 4。ADR 0025）。
+    pub election_hash: String,
 }
 
 /// 封印済みの 1 票。投票者を特定する情報は含まない。

@@ -12,7 +12,7 @@ use application::{
     VotingService,
 };
 use domain::election::Election;
-use domain::{Ed25519Signer, ElectionPhase, ElectionRules};
+use domain::{Ed25519Signer, ElectionPhase, ElectionRules, Hash32, ShardId};
 use infra_memory::{InMemoryStore, StaticElectionRepository, StaticVoterRoll};
 use infra_scylla::{ScyllaConfig, ScyllaStore};
 use sealer::{MonotonicClock, Sealer};
@@ -32,6 +32,8 @@ pub struct AppState {
     pub chains: Arc<dyn ChainRead>,
     /// 選挙マスタ（読み取り専用のキャッシュ）。ブロックの詳細に、選挙区・候補者の表示名を付けるのに使う。
     pub election: Arc<Election>,
+    /// 選挙定義のハッシュ（ADR 0025）。起動時にチェーンと照合済み。`/api/v1/election-status` で公開する。
+    pub election_hash: Hash32,
     /// シャード数（`shard.count`）。`/api/v1/chains` が、シャードの一覧を作るのに使う。
     pub shard_count: NonZeroU16,
     /// 票の中身を公開するタイミング（`chain.reveal_ballots`）。
@@ -151,6 +153,8 @@ pub async fn build(
             (election, None)
         }
     };
+    // 選挙定義のハッシュ（ADR 0025）。チェーン（と db モードでは cluster_config）と照合し、違えば起動しない。
+    let election_hash = domain::election_definition_hash(&election);
     let sessions = SessionSigner::new(config.session_secret.as_bytes(), config.session_ttl_secs)
         .context("session.secret が不正です")?;
 
@@ -184,6 +188,7 @@ pub async fn build(
                 mono,
                 config.seal_policy,
                 config.shard_count,
+                election_hash,
             );
             // 署名鍵の登録、各シャードの復旧とジェネシスの作成。
             sealer
@@ -212,6 +217,11 @@ pub async fn build(
                 .context("ScyllaDB への接続に失敗しました")?,
             );
             tracing::info!(%keyspace, nodes = nodes.len(), "ScyllaDB に接続しました");
+            // 先に起動した api / sealer が登録した値と照合する（ジェネシスがまだ無くても、ここで止まる）。
+            store
+                .ensure_election_hash(&election_hash)
+                .await
+                .context("選挙定義の照合に失敗しました")?;
             // 封印・ジェネシスの作成・アンカーは、独立した sealer プロセスが行う。api は持たない。
             Backend {
                 votes: store.clone(),
@@ -222,6 +232,12 @@ pub async fn build(
             }
         }
     };
+
+    ensure_chain_matches(&*chains, config.shard_count, &election_hash).await?;
+    tracing::info!(
+        election_hash = %shared_types::hex::encode(&election_hash),
+        "選挙定義のハッシュを照合しました"
+    );
 
     // 選挙状態（原則17）: init（スキーマを投入した後の最初の接続）で、設定の期間を取り込む。
     // その後に設定ファイルの期間と DB（memory モードではプロセス内）の期間が違っていたら、
@@ -305,6 +321,7 @@ pub async fn build(
         clock,
         chains,
         election,
+        election_hash,
         shard_count: config.shard_count,
         reveal: config.reveal,
         labels: config.labels.clone(),
@@ -319,4 +336,63 @@ pub async fn build(
         dev_store,
     });
     Ok(Built { state, sealer })
+}
+
+/// 既にあるチェーンの選挙定義のハッシュ（先頭ブロックの値。ジェネシスから引き継いでいる）が、手元の seed のハッシュと
+/// 同じことを確かめる（ADR 0025）。チェーンがまだ無いシャード（db モードで、sealer がジェネシスを作る前）は飛ばす。
+async fn ensure_chain_matches(
+    chains: &dyn ChainRead,
+    shard_count: NonZeroU16,
+    expected: &Hash32,
+) -> anyhow::Result<()> {
+    for shard in 0..shard_count.get() {
+        let Some(head) = chains
+            .head(ShardId(shard))
+            .await
+            .with_context(|| format!("シャード {shard} のチェーンを読めません"))?
+        else {
+            continue;
+        };
+        if &head.header.election_hash != expected {
+            anyhow::bail!(
+                "シャード {shard} のチェーンの選挙定義のハッシュ（{}）が、手元の選挙データ（seed）のハッシュ（{}）と一致しません。\
+                 init の後に選挙データを書き換えた可能性があります。seed を init の時点の内容に戻すか、\
+                 選挙をやり直すなら scripts/db_reset.sh --all で作り直してください",
+                shared_types::hex::encode(&head.header.election_hash),
+                shared_types::hex::encode(expected)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::genesis;
+
+    #[tokio::test]
+    async fn a_chain_with_a_different_election_hash_is_refused() {
+        let shards = NonZeroU16::new(2).expect("non-zero");
+        let store = InMemoryStore::new(shards);
+        let signer = Ed25519Signer::from_seed(&[7u8; 32]);
+        // チェーンがまだ無いシャードは飛ばす（db モードで、sealer がジェネシスを作る前）。
+        ensure_chain_matches(&store, shards, &[0xe1; 32])
+            .await
+            .expect("no chain yet");
+        store
+            .commit(ShardId(1), genesis(&signer, 1, [0xe1; 32]), 0)
+            .await
+            .expect("genesis");
+        ensure_chain_matches(&store, shards, &[0xe1; 32])
+            .await
+            .expect("same hash");
+        let err = ensure_chain_matches(&store, shards, &[0xe2; 32])
+            .await
+            .expect_err("mismatch");
+        let text = err.to_string();
+        assert!(text.contains("シャード 1"), "{text}");
+        assert!(text.contains(&"e1".repeat(32)), "{text}");
+        assert!(text.contains("db_reset.sh --all"), "{text}");
+    }
 }

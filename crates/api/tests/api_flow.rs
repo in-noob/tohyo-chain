@@ -733,6 +733,7 @@ fn to_block(v: &Value) -> Block {
             merkle_root: hex32(&h["merkle_root"]),
             ballot_count: h["ballot_count"].as_u64().expect("count") as u32,
             sealed_at_minute: h["sealed_at_minute"].as_u64().expect("minute"),
+            election_hash: hex32(&h["election_hash"]),
         },
         ballots: v["ballots"]
             .as_array()
@@ -1476,6 +1477,15 @@ async fn election_status_reports_phase_and_period() {
     assert_eq!(body["now"], json!(1_500));
     assert_eq!(body["display_timezone"], json!("Asia/Tokyo"));
     assert_eq!(body["display_timezone_offset_secs"], json!(9 * 3600));
+    // 選挙定義のハッシュ（ADR 0025）: 読み込んだ seed のハッシュで、ジェネシスのヘッダーと同じ値。
+    let expected = hex::encode(&domain::election_definition_hash(
+        &seed::load_election(&seed_dir().join("2026-general")).expect("seed"),
+    ));
+    assert_eq!(body["election_hash"], json!(expected));
+    let (status, genesis) = send(&app, "GET", "/api/v1/chains/0/blocks/0", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(genesis["header"]["election_hash"], json!(expected));
+    assert_eq!(genesis["header"]["version"], json!(4));
 }
 
 #[tokio::test]
