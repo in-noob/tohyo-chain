@@ -163,6 +163,118 @@ fn spreadsheet_friendly_csv_is_accepted() {
     assert_eq!(data.election.candidate_count(), 5);
 }
 
+/// 選挙定義のハッシュ（ADR 0025）。
+fn definition_hash(seed: &TempSeed) -> domain::Hash32 {
+    domain::election_definition_hash(&load_dir(seed).expect("valid").election)
+}
+
+#[test]
+fn the_definition_hash_ignores_row_order_column_order_and_line_endings() {
+    let base = definition_hash(&valid());
+    // 行の順番・列の順番・選挙の種類の順番を入れ替え、改行コードを CRLF にする（表計算ソフトで保存し直した形）。
+    let seed = valid();
+    let crlf = |text: &str| text.replace('\n', "\r\n");
+    seed.write(
+        "election.toml",
+        &crlf(
+            r#"name = "テスト選挙"
+id = "2026-general"
+
+[[types]]
+code = "governor"
+order = 10
+name = "知事選挙"
+method = "single_choice"
+
+[[types]]
+code = "shugiin_smd"
+name = "衆議院小選挙区"
+order = 20
+method = "single_choice"
+"#,
+        ),
+    );
+    seed.write(
+        "districts.csv",
+        &crlf(
+            "order,district_id,name,election_type,prefectures
+1,governor.13,東京都知事,governor,13
+3,shugiin_smd.31_32.01,鳥取・島根1区,shugiin_smd,32;31
+2,shugiin_smd.13.02,東京2区,shugiin_smd,13
+1,shugiin_smd.13.01,東京1区,shugiin_smd,13
+",
+        ),
+    );
+    seed.write(
+        "candidates/shugiin_smd.csv",
+        &crlf(
+            "profile,name,candidate_id,party,district_id
+,高橋 美咲,shugiin_smd.31_32.01.c1,A党,shugiin_smd.31_32.01
+,佐藤 健,shugiin_smd.13.02.c1,無所属,shugiin_smd.13.02
+,鈴木 花子,shugiin_smd.13.01.c2,B党,shugiin_smd.13.01
+元会社員,山田 太郎,shugiin_smd.13.01.c1,A党,shugiin_smd.13.01
+",
+        ),
+    );
+    assert_eq!(definition_hash(&seed), base);
+
+    // セル内の改行も、改行コードによらず同じ値になる。
+    let lf = valid();
+    lf.write(
+        "candidates/governor.csv",
+        "candidate_id,district_id,name,party,profile\ngovernor.13.c1,governor.13,田中 一郎,無所属,\"1 行目\n2 行目\"\ngovernor.13.c2,governor.13,伊藤 二郎,無所属,\n",
+    );
+    let crlf_seed = valid();
+    crlf_seed.write(
+        "candidates/governor.csv",
+        "candidate_id,district_id,name,party,profile\r\ngovernor.13.c1,governor.13,田中 一郎,無所属,\"1 行目\r\n2 行目\"\r\ngovernor.13.c2,governor.13,伊藤 二郎,無所属,\r\n",
+    );
+    assert_eq!(definition_hash(&crlf_seed), definition_hash(&lf));
+    assert_ne!(definition_hash(&lf), base);
+}
+
+#[test]
+fn the_definition_hash_changes_when_a_candidate_name_changes() {
+    let base = definition_hash(&valid());
+    // 候補者名を 1 文字変える。
+    let seed = valid();
+    seed.write(
+        "candidates/governor.csv",
+        &GOVERNOR_CANDIDATES.replace("田中 一郎", "田中 一朗"),
+    );
+    assert_ne!(definition_hash(&seed), base);
+    // 同じ選挙区の候補者の名前を入れ替える（ID はそのまま）。
+    let seed = valid();
+    seed.write(
+        "candidates/governor.csv",
+        &GOVERNOR_CANDIDATES
+            .replace("田中 一郎", "@")
+            .replace("伊藤 二郎", "田中 一郎")
+            .replace('@', "伊藤 二郎"),
+    );
+    assert_ne!(definition_hash(&seed), base);
+    // 有権者名簿は含めない。
+    let seed = valid();
+    seed.write("voters.csv", "voter_id,districts\nalice,governor.13\n");
+    assert_eq!(definition_hash(&seed), base);
+}
+
+#[test]
+fn candidates_are_displayed_in_sequence_order_not_row_order() {
+    let seed = valid();
+    seed.write(
+        "candidates/governor.csv",
+        "candidate_id,district_id,name\ngovernor.13.c10,governor.13,C\ngovernor.13.c2,governor.13,B\ngovernor.13.c1,governor.13,A\n",
+    );
+    let data = load_dir(&seed).expect("valid");
+    let contest = data
+        .election
+        .contest_for_district(&DistrictId::new("governor.13").expect("valid"))
+        .expect("exists");
+    let names: Vec<&str> = contest.candidates.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["A", "B", "C"]);
+}
+
 #[test]
 fn a_candidate_number_may_have_any_number_of_digits() {
     let seed = valid();

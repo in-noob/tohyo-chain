@@ -9,7 +9,7 @@ use domain::{
 };
 use serde::Deserialize;
 
-use crate::csv_table::{read_table, split_list};
+use crate::csv_table::{normalize_newlines, read_table, split_list};
 use crate::{Issues, SeedError};
 
 #[derive(Deserialize)]
@@ -131,7 +131,7 @@ fn read_election_toml(
         if let Some(code) = code {
             types.push(ElectionType {
                 code,
-                name: t.name.clone(),
+                name: normalize_newlines(&t.name),
                 order: t.order,
                 method,
             });
@@ -143,7 +143,7 @@ fn read_election_toml(
     if issues.len() > before {
         return None;
     }
-    Some((id?, parsed.name, types))
+    Some((id?, normalize_newlines(&parsed.name), types))
 }
 
 /// districts.csv。`(行番号, 選挙区)` を、ID → 値で返す（読み込み順は保たない。表示順は `Election` が決める）。
