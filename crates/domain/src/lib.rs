@@ -7,6 +7,7 @@
 pub mod anchor;
 pub mod chain;
 pub mod election;
+pub mod election_hash;
 pub mod election_state;
 pub mod encoding;
 pub mod ids;
@@ -26,6 +27,7 @@ pub use chain::{BLOCK_VERSION, ChainError, SealError, genesis, seal_block, verif
 pub use election::{
     Candidate, Contest, District, Election, ElectionError, ElectionType, VotingMethod,
 };
+pub use election_hash::election_definition_hash;
 pub use election_state::{
     ElectionPhase, ElectionRules, Period, VoteGate, automatic_transition, vote_gate,
     voting_started_at,

@@ -57,7 +57,7 @@ pub struct District {
     pub order: u32,
 }
 
-/// 候補者。氏名・政党・略歴は属性（将来の候補者詳細画面で使う）。
+/// 候補者。氏名・政党・略歴は属性（将来の候補者詳細画面で使う）。選挙区の中の表示順は、候補者コードの連番の数値順。
 /// ID は候補者コード（[`CandidateCode`]）なので、白票（[`CandidateId::Blank`]）は型の上で候補者になれない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -189,7 +189,7 @@ impl Election {
             }
         }
 
-        // 表示順に並べた投票用紙。候補者は、選挙区ごとに、入力の順で持つ。
+        // 表示順に並べた投票用紙。候補者は、選挙区ごとに持つ（並び順は下で決める）。
         let mut sorted: Vec<District> = districts;
         sorted.sort_by(|a, b| {
             let key = |d: &District| (type_order[&d.election_type], d.order, d.id.clone());
@@ -226,6 +226,11 @@ impl Election {
                 });
             };
             contests[i].candidates.push(candidate);
+        }
+        // 候補者の表示順は、候補者コードの連番の数値順（c2 < c10）。ファイルの行の順番には依存させない（並び順を変えるには
+        // ID を変えるしかなく、ID は選挙定義のハッシュに入るので、並び順のすり替えも検出できる。ADR 0025）。
+        for contest in &mut contests {
+            contest.candidates.sort_by_key(|c| c.id.sequence());
         }
         if let Some(empty) = contests.iter().find(|c| c.candidates.is_empty()) {
             return Err(ElectionError::EmptyDistrict(empty.district.id.clone()));
@@ -410,6 +415,26 @@ mod tests {
         }
         assert!(contest.accepts(&CandidateId::Blank, true));
         assert!(!contest.accepts(&CandidateId::Blank, false));
+    }
+
+    #[test]
+    fn candidates_are_in_sequence_order_regardless_of_input_order() {
+        let mut candidates = base_candidates();
+        candidates.push(candidate("shugiin_smd.13.01", 10));
+        candidates.reverse();
+        let e = build(base_types(), base_districts(), candidates).expect("valid");
+        let contest = e
+            .contest(&ContestId::parse("2026-general/shugiin_smd.13.01").expect("valid"))
+            .expect("exists");
+        let ids: Vec<&str> = contest.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "shugiin_smd.13.01.c1",
+                "shugiin_smd.13.01.c2",
+                "shugiin_smd.13.01.c10"
+            ]
+        );
     }
 
     #[test]

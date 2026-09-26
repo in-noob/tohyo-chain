@@ -33,7 +33,7 @@ fn sample_ids(cand: u32) -> (ContestId, CandidateId) {
 
 fn build_chain(seed: &[u8; 32], groups: &[BTreeMap<[u8; 16], u32>]) -> (Vec<Block>, Ed25519Signer) {
     let signer = Ed25519Signer::from_seed(seed);
-    let mut chain = vec![genesis(&signer, 1_000)];
+    let mut chain = vec![genesis(&signer, 1_000, [0x3c; 32])];
     for (i, group) in groups.iter().enumerate() {
         let ballots: Vec<Ballot> = group
             .iter()

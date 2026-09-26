@@ -79,6 +79,9 @@ pub struct BlockHeader {
     pub ballot_count: u32,
     /// 封印時刻。UNIX エポックからの経過「分」（秒以下は保存しない）。
     pub sealed_at_minute: u64,
+    /// 選挙定義のハッシュ（[`crate::election_hash::election_definition_hash`]）。ジェネシスが値を持ち、
+    /// 以後のブロックは前のブロックから引き継ぐ（ブロックの形式の版 4。ADR 0025）。
+    pub election_hash: Hash32,
 }
 
 /// 封印済みブロック。`ballots` は `ballot_id` のハッシュ昇順。
