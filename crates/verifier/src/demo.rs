@@ -53,7 +53,9 @@ pub fn run() -> anyhow::Result<()> {
     // (1) ダミー票 250 件から、ジェネシス + 100/100/50 件の 3 ブロックを作る。
     println!("== (1) チェーンの生成");
     let mut ballots = dummy_ballots(DEMO_BLOCK_SIZES.iter().sum()).into_iter();
-    let mut chain = vec![genesis(&signer, DEMO_BASE_MINUTE)];
+    // デモは選挙データを読まないので、選挙定義のハッシュには固定の代わりの値を入れる（ADR 0025）。
+    let election_hash = domain::encoding::sha256_parts(&[b"verifier demo"]);
+    let mut chain = vec![genesis(&signer, DEMO_BASE_MINUTE, election_hash)];
     for (i, size) in DEMO_BLOCK_SIZES.iter().enumerate() {
         let group: Vec<Ballot> = ballots.by_ref().take(*size).collect();
         let prev = chain.last().context("チェーンが空です")?;
