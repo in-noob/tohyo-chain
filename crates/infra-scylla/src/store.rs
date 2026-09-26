@@ -140,9 +140,11 @@ const ELECTION_SCOPE: &str = "election";
 /// 署名鍵の `key_id`（現在は 1 つのみ）。
 const SIGNER_KEY_ID: &str = "current";
 const SHARD_COUNT_KEY: &str = "shard_count";
+/// 選挙定義のハッシュ（64 桁の hex。ADR 0025）の `cluster_config` のキー。
+const ELECTION_HASH_KEY: &str = "election_hash";
 
 const BLOCK_COLUMNS: &str = "height, format_version, prev_hash, merkle_root, ballot_count, \
-                             sealed_at_minute, block_hash, signature, ballots";
+                             sealed_at_minute, election_hash, block_hash, signature, ballots";
 
 pub struct ScyllaStore {
     session: Session,
@@ -325,8 +327,8 @@ impl ScyllaStore {
             .await?,
             insert_block: p(
                 "INSERT INTO {ks}.blocks (shard, height, format_version, prev_hash, merkle_root, \
-                 ballot_count, sealed_at_minute, block_hash, signature, ballots) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+                 ballot_count, sealed_at_minute, election_hash, block_hash, signature, ballots) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
                     .into(),
                 quorum,
             )
@@ -528,12 +530,42 @@ impl ScyllaStore {
     /// 封印されなくなる。それを起動時に検出する。
     async fn check_cluster_config(&self) -> Result<(), ConnectError> {
         let wanted = self.shard_count.get().to_string();
+        self.register_config(SHARD_COUNT_KEY, &wanted, |stored| {
+            format!(
+                "shard.count={wanted} ですが、DB には {stored} が登録されています（api と sealer で同じ値にしてください）"
+            )
+        })
+        .await
+    }
+
+    /// 選挙定義のハッシュ（ADR 0025）を DB に登録する（最初の 1 回）。既に別の値が登録されていれば拒否する。
+    ///
+    /// api と sealer が起動時に呼ぶ。先に起動した側が値を決めるので、ジェネシスがまだ無い時点で起動した api も、
+    /// init の後に書き換えた seed のまま投票を受け付けることがない。
+    pub async fn ensure_election_hash(&self, hash: &domain::Hash32) -> Result<(), ConnectError> {
+        let wanted = shared_types::hex::encode(hash);
+        self.register_config(ELECTION_HASH_KEY, &wanted, |stored| {
+            format!(
+                "選挙データ（seed）の選挙定義のハッシュは {wanted} ですが、DB には {stored} が登録されています。\
+                 init の後に選挙データを書き換えた可能性があります。seed を init の時点の内容に戻すか、\
+                 選挙をやり直すなら scripts/db_reset.sh --all で作り直してください（--votes では登録は消えません）"
+            )
+        })
+        .await
+    }
+
+    /// `cluster_config` に `key = wanted` を LWT（`IF NOT EXISTS`）で登録する。既に別の値があれば、`mismatch(登録済みの値)`
+    /// の文言で `ClusterConfig` を返す。
+    async fn register_config(
+        &self,
+        key: &str,
+        wanted: &str,
+        mismatch: impl FnOnce(&str) -> String,
+    ) -> Result<(), ConnectError> {
         let map = |e: StoreError| ConnectError::ClusterConfig(e.to_string());
         let inserted = with_retry("cluster_config", || {
-            self.session.execute_unpaged(
-                &self.stmts.insert_config,
-                (SHARD_COUNT_KEY, wanted.as_str()),
-            )
+            self.session
+                .execute_unpaged(&self.stmts.insert_config, (key, wanted))
         })
         .await
         .map_err(map)?;
@@ -542,7 +574,7 @@ impl ScyllaStore {
         }
         let stored = with_retry("cluster_config", || {
             self.session
-                .execute_unpaged(&self.stmts.select_config, (SHARD_COUNT_KEY,))
+                .execute_unpaged(&self.stmts.select_config, (key,))
         })
         .await
         .map_err(map)?;
@@ -554,9 +586,8 @@ impl ScyllaStore {
             .map_err(map)?;
         match stored {
             Some((Some(value),)) if value == wanted => Ok(()),
-            Some((value,)) => Err(ConnectError::ClusterConfig(format!(
-                "shard.count={wanted} ですが、DB には {} が登録されています（api と sealer で同じ値にしてください）",
-                value.unwrap_or_default()
+            Some((value,)) => Err(ConnectError::ClusterConfig(mismatch(
+                value.as_deref().unwrap_or_default(),
             ))),
             None => Err(ConnectError::ClusterConfig(
                 "cluster_config を読めません".to_string(),
@@ -837,7 +868,40 @@ async fn ensure_schema_current(session: &Session, keyspace: &str) -> Result<(), 
         // テーブルが無い: スキーマの投入漏れ（準備の段階で、分かりやすいエラーになる）。
         None => Ok(()),
     }?;
-    ensure_revote_schema(session, keyspace).await
+    ensure_revote_schema(session, keyspace).await?;
+    ensure_election_hash_schema(session, keyspace).await
+}
+
+/// 選挙定義のハッシュ（ADR 0025。ブロックの形式の版 4）の列 `blocks.election_hash` があること。版 3 までのチェーンは、
+/// ヘッダーの形が違い、ブロックのハッシュも変わるので、列を足すだけでは使えない。作り直しの手順つきで知らせる。
+async fn ensure_election_hash_schema(
+    session: &Session,
+    keyspace: &str,
+) -> Result<(), ConnectError> {
+    let result = session
+        .query_unpaged(
+            "SELECT column_name FROM system_schema.columns \
+             WHERE keyspace_name = ? AND table_name = 'blocks'",
+            (keyspace.to_ascii_lowercase(),),
+        )
+        .await
+        .map_err(|e| ConnectError::Connect(e.to_string()))?;
+    let columns: Vec<String> = result
+        .into_rows_result()
+        .map_err(|e| ConnectError::Connect(e.to_string()))?
+        .rows::<(String,)>()
+        .map_err(|e| ConnectError::Connect(e.to_string()))?
+        .filter_map(Result::ok)
+        .map(|(c,)| c)
+        .collect();
+    if columns.is_empty() || columns.iter().any(|c| c == "election_hash") {
+        return Ok(());
+    }
+    Err(ConnectError::Schema(format!(
+        "キースペース {keyspace} のスキーマが古いです（blocks に、選挙定義のハッシュの election_hash 列がありません）。\
+         選挙定義のハッシュを入れたブロックの形式（版 4。ADR 0025）は、版 3 までのチェーンと互換性がありません。\
+         scripts/db_reset.sh --all で作り直してください（例: DROP KEYSPACE {keyspace} の後に docs/schema.cql を投入）。"
+    )))
 }
 
 /// 再投票（ADR 0022）のスキーマ（`ballot_pool` のクラスタリングキー `seq`・`slot_state` など）であること。
@@ -1277,6 +1341,7 @@ impl SealStore for ScyllaStore {
                     values.merkle_root.as_slice(),
                     values.ballot_count,
                     values.sealed_at_minute,
+                    values.election_hash.as_slice(),
                     values.block_hash.as_slice(),
                     values.signature.as_slice(),
                     &values.ballots as &Vec<BallotTuple>,

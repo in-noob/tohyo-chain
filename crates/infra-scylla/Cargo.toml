@@ -10,6 +10,7 @@ async-trait.workspace = true
 domain = { path = "../domain" }
 rand.workspace = true
 scylla.workspace = true
+shared-types = { path = "../shared-types" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

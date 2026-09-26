@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.ballot_pool (
 -- ballots: ballot_id のハッシュ昇順に並んだ票 (ballot_id, contest_id, candidate_id, revote)。
 -- contest_id / candidate_id は文字列の ID（例: `2026-general/shugiin_smd.13.01` / `shugiin_smd.13.01.c3`。
 -- 形式は domain::ids）。revote は再投票のつながりの正規化バイト列（無ければ空の 0x。cqlsh が tuple の中の NULL の blob を
--- 表示できないため）。ブロックの形式の版 3（ADR 0022）。
+-- 表示できないため）。election_hash は選挙定義のハッシュ（32 バイト。ジェネシスの値を全ブロックが引き継ぐ）。
+-- ブロックの形式の版 4（ADR 0025）。election_hash の列が無いスキーマ（版 3 まで）も、同じく作り直す。
 -- 再投票に対応する前のスキーマ（3 要素の tuple・ballot_pool に seq が無い）は、ALTER TABLE では直せないので、
 -- scripts/db_reset.sh --all で作り直す（api / sealer は接続時に検出して、手順つきで起動を拒否する）。
 -- 最新のブロックを LIMIT 1 で引けるよう、height の降順で持つ。
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.blocks (
   merkle_root      blob,
   ballot_count     int,
   sealed_at_minute bigint,
+  election_hash    blob,
   block_hash       blob,
   signature        blob,
   ballots          list<frozen<tuple<blob, text, text, blob>>>,
@@ -145,7 +147,7 @@ CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.voter_registry (
 );
 
 -- クラスタ共通の設定。shard_count が api と sealer で食い違うと、票が封印されなくなるため、
--- 最初に登録された値と一致しないプロセスは起動を拒否する。
+-- 最初に登録された値と一致しないプロセスは起動を拒否する。election_hash（選挙定義のハッシュ。ADR 0025）も同じ。
 CREATE TABLE IF NOT EXISTS {{KEYSPACE}}.cluster_config (
   key   text,
   value text,

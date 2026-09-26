@@ -407,7 +407,7 @@ async fn commit_appends_block_and_removes_sealed_ballots() {
     assert_eq!(s.head(ShardId(0)).await, Ok(None));
     assert_eq!(s.head(ShardId(9)).await, Ok(None));
 
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
     assert_eq!(s.head(ShardId(0)).await, Ok(Some(g.clone())));
     assert_eq!(s.block(ShardId(0), 0).await, Ok(Some(g.clone())));
@@ -440,7 +440,7 @@ async fn commit_appends_block_and_removes_sealed_ballots() {
 async fn commit_rejects_conflicts_without_changing_state() {
     let db = setup(1).await;
     let (s, signer) = (&db.store, signer());
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     cast_n(s, 0, 1, 3).await;
     let batch = s.peek_pending(ShardId(0), 3).await.expect("peek");
 
@@ -454,7 +454,8 @@ async fn commit_rejects_conflicts_without_changing_state() {
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
     // 別内容の高さ 0 は矛盾（LWT に負ける）。
     assert_eq!(
-        s.commit(ShardId(0), genesis(&signer, 999), 0).await,
+        s.commit(ShardId(0), genesis(&signer, 999, [0xe1; 32]), 0)
+            .await,
         Err(StoreError::Conflict)
     );
     // prev_hash 不一致 / 消費件数の不一致 / プールにない票。
@@ -537,7 +538,7 @@ async fn insert_block_only(db: &TestDb, block: &domain::Block) {
 async fn recover_and_retried_commit_clean_up_a_partially_applied_commit() {
     let db = setup(1).await;
     let (s, signer) = (&db.store, signer());
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
 
     // 落ちた状態 1: ブロックは書かれたが、票がプールに残っている。recover が取り除く（冪等）。
@@ -578,7 +579,7 @@ async fn recover_and_retried_commit_clean_up_a_partially_applied_commit() {
 async fn state_survives_a_new_connection() {
     let db = setup(1).await;
     let (s, signer) = (&db.store, signer());
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
     cast_n(s, 0, 1, 3).await;
     let batch = s.peek_pending(ShardId(0), 2).await.expect("peek");
@@ -747,7 +748,7 @@ async fn anchors_are_listed_newest_first_with_a_limit() {
 async fn blocks_are_read_in_pages_newest_first_per_shard() {
     let db = setup(2).await;
     let (s, signer) = (&db.store, signer());
-    let mut chain = vec![genesis(&signer, 100)];
+    let mut chain = vec![genesis(&signer, 100, [0xe1; 32])];
     s.commit(ShardId(0), chain[0].clone(), 0)
         .await
         .expect("genesis");
@@ -834,6 +835,52 @@ async fn connecting_with_a_different_shard_count_is_refused() {
 
 #[tokio::test]
 #[ignore = "requires ScyllaDB"]
+async fn a_different_election_hash_is_refused_after_the_first_registration() {
+    let db = setup(1).await;
+    // 最初に登録した値が正。同じ値は何度でも通る。
+    db.store
+        .ensure_election_hash(&[0xe1; 32])
+        .await
+        .expect("first registration");
+    db.store
+        .ensure_election_hash(&[0xe1; 32])
+        .await
+        .expect("same hash");
+    let other = ScyllaStore::connect(&config(&db.keyspace, 1), db.clock.clone())
+        .await
+        .expect("connect");
+    let err = other
+        .ensure_election_hash(&[0xe2; 32])
+        .await
+        .expect_err("mismatch");
+    assert!(matches!(err, ConnectError::ClusterConfig(_)), "{err}");
+    assert!(err.to_string().contains(&"e1".repeat(32)), "{err}");
+    assert!(err.to_string().contains("db_reset.sh --all"), "{err}");
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ScyllaDB"]
+async fn a_schema_without_the_election_hash_column_is_refused_with_instructions() {
+    let db = setup(1).await;
+    db.admin
+        .query_unpaged(
+            format!("ALTER TABLE {}.blocks DROP election_hash", db.keyspace),
+            (),
+        )
+        .await
+        .expect("drop column");
+    let err = ScyllaStore::connect(&config(&db.keyspace, 1), db.clock.clone())
+        .await
+        .expect_err("old schema");
+    assert!(matches!(err, ConnectError::Schema(_)), "{err}");
+    assert!(err.to_string().contains("election_hash"), "{err}");
+    assert!(err.to_string().contains("db_reset.sh --all"), "{err}");
+    db.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ScyllaDB"]
 async fn audit_counts_count_participation_and_pending_per_contest() {
     let db = setup(2).await;
     let s = &db.store;
@@ -869,7 +916,7 @@ async fn audit_counts_count_participation_and_pending_per_contest() {
 
     // 封印してプールから消えると、pending だけが減る。
     let signer = signer();
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
     let batch = s.peek_pending(ShardId(0), 10).await.expect("peek");
     let n = batch.len();
@@ -1047,7 +1094,7 @@ async fn revotes_bump_the_seq_with_lwt_and_track_the_slot() {
     );
     // 件数による封印（先頭の 1 件）でも、前の版から封印される。
     let signer = signer();
-    let g = genesis(&signer, 100);
+    let g = genesis(&signer, 100, [0xe1; 32]);
     s.commit(ShardId(0), g.clone(), 0).await.expect("genesis");
     let batch = s.peek_pending(ShardId(0), 1).await.expect("peek");
     assert_eq!(batch, vec![first]);
