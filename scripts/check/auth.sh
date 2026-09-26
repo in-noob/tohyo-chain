@@ -576,7 +576,9 @@ check_sample_data() (
             [[ "$(md5sum <"$OUT/credentials_patterns.csv")" == "$before_csv" ]] || fail "拒否したのに、CSV が変わりました"
             echo "  api の稼働中は拒否（DB・CSV はそのまま）: OK"
         else
-            ./target/debug/verifier verify --api "$BASE" >"$TMP/verify.out" 2>&1 || { cat "$TMP/verify.out" >&2; fail "締切後のチェーンの検証が失敗しました"; }
+            # verify は、手元の選挙データと、ジェネシスの選挙定義のハッシュを照合する（ADR 0025）。api・sealer と同じ seed を渡す。
+            APP__ELECTION__SEED_DIR="$OUT/seed" ./target/debug/verifier verify --api "$BASE" >"$TMP/verify.out" 2>&1 \
+                || { cat "$TMP/verify.out" >&2; fail "締切後のチェーンの検証が失敗しました"; }
             [[ ! -e "$APP_SECRETS_DIR/revote_key" ]] || fail "締切後も revote_key が残っています"
             echo "  締切後: verifier verify OK・revote_key は破棄済み: OK"
         fi

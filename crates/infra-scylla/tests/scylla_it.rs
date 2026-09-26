@@ -514,8 +514,8 @@ async fn insert_block_only(db: &TestDb, block: &domain::Block) {
         .query_unpaged(
             format!(
                 "INSERT INTO {}.blocks (shard, height, format_version, prev_hash, merkle_root, \
-                 ballot_count, sealed_at_minute, block_hash, signature, ballots) \
-                 VALUES (0, {}, {}, {}, {}, {}, {}, {}, {}, [{}])",
+                 ballot_count, sealed_at_minute, election_hash, block_hash, signature, ballots) \
+                 VALUES (0, {}, {}, {}, {}, {}, {}, {}, {}, {}, [{}])",
                 db.keyspace,
                 h.height,
                 h.version,
@@ -523,6 +523,7 @@ async fn insert_block_only(db: &TestDb, block: &domain::Block) {
                 hex(&h.merkle_root),
                 h.ballot_count,
                 h.sealed_at_minute,
+                hex(&h.election_hash),
                 hex(&block.block_hash),
                 hex(&block.signature),
                 ballots.join(", ")

@@ -460,7 +460,8 @@ check_config() (
         --duration 1 --label t --out "$TMP/bench.json"
 
     start_api "$D_NONE" "$EMPTY_SECRETS" APP__SESSION__SECRET="$SECRET"
-    vout="$(with_config "$D_NONE" "$EMPTY_SECRETS" APP__API__PORT="$PORT" -- ./target/debug/verifier verify 2>&1)" \
+    # verify は、手元の選挙データとジェネシスの選挙定義のハッシュを照合する（ADR 0025）ので、api と同じ選挙データを渡す。
+    vout="$(with_config "$D_NONE" "$EMPTY_SECRETS" APP__API__PORT="$PORT" APP__ELECTION__SEED_DIR="$SEED_DIR" -- ./target/debug/verifier verify 2>&1)" \
         || { echo "$vout" >&2; fail "verifier verify（--api なし）が、設定の api.port の api を検証できません"; }
     grep -Fq '検証 OK' <<<"$vout" || { echo "$vout" >&2; fail "verifier verify の出力に「検証 OK」がありません"; }
     stop_api
