@@ -103,6 +103,7 @@ impl Loaded {
             ("APP_WEB_BLANK_OPTION", &self.config.labels.blank_option),
             ("APP_WEB_BLANK_CONFIRM", &self.config.labels.blank_confirm),
             ("APP_WEB_BLANK_NAME", &self.config.labels.blank_name),
+            ("APP_WEB_ELECTION_HASH", &self.config.labels.election_hash),
             ("APP_WEB_REVOTE_BUTTON", &self.config.labels.revote_button),
             ("APP_WEB_REVOTE_CONFIRM", &self.config.labels.revote_confirm),
             (

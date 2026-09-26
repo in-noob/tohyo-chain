@@ -252,6 +252,7 @@ mod tests {
             merkle_root: "11".repeat(32),
             ballot_count: count,
             sealed_at_minute: 0,
+            election_hash: "e1".repeat(32),
         }
     }
 

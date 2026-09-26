@@ -93,6 +93,7 @@ fn default_toml_alone_is_valid_and_has_the_documented_defaults() {
         "白票として投票します。よろしいですか？"
     );
     assert_eq!(c.labels.blank_name, "白票");
+    assert_eq!(c.labels.election_hash, "選挙定義のハッシュ");
     loaded.ensure_supported().expect("defaults are supported");
 }
 
@@ -612,6 +613,7 @@ fn allow_blank_can_be_turned_off_and_must_be_a_boolean() {
         "labels.blank_option",
         "labels.blank_confirm",
         "labels.blank_name",
+        "labels.election_hash",
     ] {
         let text = err_text(load_for_test(&[(key, " ")]));
         assert!(text.contains(key) && text.contains("空"), "{text}");

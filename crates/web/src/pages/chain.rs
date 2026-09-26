@@ -63,6 +63,13 @@ fn header_rows(header: &HeaderDto, block_hash: &str) -> impl IntoView + use<> {
 pub fn ChainIndexPage() -> impl IntoView {
     let data = RwSignal::new(None::<Result<shared_types::ChainsResponse, ApiFailure>>);
     leptos::task::spawn_local(async move { data.set(Some(api::chains().await)) });
+    // 選挙定義のハッシュ（ADR 0025）。api が起動時にチェーンと照合した値。取得できなければ出さない。
+    let election_hash = RwSignal::new(None::<String>);
+    leptos::task::spawn_local(async move {
+        if let Ok(status) = api::election_status().await {
+            election_hash.set(Some(status.election_hash));
+        }
+    });
     let signer = Signal::derive(move || {
         data.with(|d| {
             d.as_ref()
@@ -78,6 +85,9 @@ pub fn ChainIndexPage() -> impl IntoView {
                 "封印された票のブロックを、だれでも確認できます。投票者を特定できる情報は含まれません。"
             </p>
             <p><A href=ANCHORS_PATH>"アンカーの一覧"</A></p>
+            {move || election_hash.get().map(|hash| view! {
+                <p class="hint">{labels::election_hash()}": "<code>{hash}</code></p>
+            })}
             {move || match data.get() {
                 None => view! { <p>"読み込み中…"</p> }.into_any(),
                 Some(Err(failure)) => view! { <p class="error">{error::alert_text(chain::failure_message(failure))}</p> }.into_any(),
@@ -338,6 +348,7 @@ fn block_detail(shard: u16, block: shared_types::BlockDto) -> impl IntoView {
                 {genesis.then(|| view! { <span class="hint">"（ジェネシス: 前のブロックはありません）"</span> })}
             </dd>
             <dt>"Merkle 根"</dt><dd><code>{h.merkle_root.clone()}</code></dd>
+            <dt>{labels::election_hash()}</dt><dd><code>{h.election_hash.clone()}</code></dd>
             <dt>"票数"</dt><dd>{h.ballot_count}</dd>
             <dt>"封印時刻（分単位）"</dt><dd>{minute}</dd>
             <dt>"署名"</dt><dd><code>{block.signature.clone()}</code></dd>
