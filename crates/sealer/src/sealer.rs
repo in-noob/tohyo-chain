@@ -212,6 +212,24 @@ impl Sealer {
         Ok(())
     }
 
+    /// 既にある全シャードのチェーン（先頭ブロックの値。ジェネシスから引き継いでいる）が、手元の seed の選挙定義のハッシュと
+    /// 同じことを確かめる（ADR 0025）。チェーンがまだ無いシャードは飛ばす。独立した sealer が起動時に呼び、違えば起動を拒否する
+    /// （リースを取った後の `init_shard` でも確かめるが、そこでの失敗はリースを返して続けるだけなので、先に止める）。
+    pub async fn check_existing_chains(&self) -> Result<(), SealerError> {
+        for shard in self.shards() {
+            if let Some(head) = self.store.head(shard).await?
+                && head.header.election_hash != self.election_hash
+            {
+                return Err(SealerError::ElectionMismatch {
+                    shard: shard.0,
+                    chain: head.header.election_hash,
+                    seed: self.election_hash,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// 全シャードの復旧とジェネシスの作成を行う（プロセス内で全シャードを扱う実行用）。
     /// 署名鍵も登録する。
     pub async fn init(&mut self) -> Result<(), SealerError> {

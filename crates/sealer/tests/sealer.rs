@@ -882,6 +882,15 @@ async fn the_genesis_carries_the_election_hash_and_a_different_seed_is_refused()
         NonZeroU16::new(2).expect("non-zero"),
         [0xe2; 32],
     );
+    assert_eq!(
+        other.check_existing_chains().await,
+        Err(SealerError::ElectionMismatch {
+            shard: 0,
+            chain: TEST_ELECTION_HASH,
+            seed: [0xe2; 32],
+        })
+    );
+    f.sealer.check_existing_chains().await.expect("same hash");
     let err = other.init_shard(ShardId(1)).await.expect_err("mismatch");
     assert_eq!(
         err,

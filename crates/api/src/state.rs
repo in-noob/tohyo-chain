@@ -217,11 +217,6 @@ pub async fn build(
                 .context("ScyllaDB への接続に失敗しました")?,
             );
             tracing::info!(%keyspace, nodes = nodes.len(), "ScyllaDB に接続しました");
-            // 先に起動した api / sealer が登録した値と照合する（ジェネシスがまだ無くても、ここで止まる）。
-            store
-                .ensure_election_hash(&election_hash)
-                .await
-                .context("選挙定義の照合に失敗しました")?;
             // 封印・ジェネシスの作成・アンカーは、独立した sealer プロセスが行う。api は持たない。
             Backend {
                 votes: store.clone(),
@@ -233,7 +228,15 @@ pub async fn build(
         }
     };
 
+    // 既にあるチェーンのジェネシスと照合してから、db モードでは cluster_config に登録・照合する（先に起動した api / sealer が
+    // 登録した値と違えば、ジェネシスがまだ無くても、ここで止まる。先に登録すると、チェーンと食い違う値が残ってしまう）。
     ensure_chain_matches(&*chains, config.shard_count, &election_hash).await?;
+    if let Some(store) = &scylla {
+        store
+            .ensure_election_hash(&election_hash)
+            .await
+            .context("選挙定義の照合に失敗しました")?;
+    }
     tracing::info!(
         election_hash = %shared_types::hex::encode(&election_hash),
         "選挙定義のハッシュを照合しました"
