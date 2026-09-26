@@ -22,6 +22,9 @@ use sealer::{FinalAnchor, ManualClock, SealEvent, Sealer, SealerError, TickOutco
 use std::sync::Mutex;
 
 /// テストの壁時計の起点（2027-01-15 相当。分単位に丸めると 30_000_000）。
+/// 選挙定義のハッシュ（テスト用の固定値）。
+const TEST_ELECTION_HASH: domain::Hash32 = [0xe1; 32];
+
 const WALL_BASE: u64 = 1_800_000_000;
 
 /// 固定の壁時計（`spy_sealer` 用）。
@@ -53,6 +56,7 @@ fn fixture(shards: u16, max_ballots: usize, interval_secs: u64, min_ballots: usi
         clock.clone(),
         SealPolicy::new(max_ballots, interval_secs, min_ballots).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     Fixture {
         store,
@@ -287,6 +291,7 @@ async fn after_a_restart_the_last_seal_is_taken_from_the_head_block_never_earlie
         f.clock.clone(),
         SealPolicy::new(100, 10, 1).expect("valid policy"),
         NonZeroU16::new(1).expect("non-zero"),
+        TEST_ELECTION_HASH,
     );
     next.set_voting_started_at(Some(i64::try_from(WALL_BASE).expect("fits")));
     next.init_shard(ShardId(0)).await.expect("init shard");
@@ -397,7 +402,7 @@ async fn close_flush_keeps_blocks_within_the_limit() {
 async fn failure_in_one_shard_does_not_block_others() {
     // init しないと head がなく、シャード 0 の封印は失敗する。シャード 1 はジェネシスを手で用意する。
     let mut f = fixture(2, 100, 10, 10);
-    let genesis = domain::genesis(&*f.signer, 1);
+    let genesis = domain::genesis(&*f.signer, 1, TEST_ELECTION_HASH);
     f.store
         .commit(ShardId(1), genesis, 0)
         .await
@@ -815,7 +820,7 @@ impl SealStore for SpyStore {
     ) -> Result<(), StoreError> {
         if self.lose_genesis_race && block.header.height == 0 {
             // 別のプロセスの、分が異なるジェネシスが先に書かれていた。
-            let other = domain::genesis(&*self.signer, 999);
+            let other = domain::genesis(&*self.signer, 999, TEST_ELECTION_HASH);
             self.inner.commit(shard, other, 0).await?;
             return Err(StoreError::Conflict);
         }
@@ -849,8 +854,55 @@ fn spy_sealer(shards: u16, lose_genesis_race: bool) -> (Sealer, Arc<SpyStore>) {
         Arc::new(ManualClock::new()),
         SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     (sealer, spy)
+}
+
+#[tokio::test]
+async fn the_genesis_carries_the_election_hash_and_a_different_seed_is_refused() {
+    let mut f = fixture(2, 100, 10, 10);
+    f.sealer.init().await.expect("init");
+    for shard in 0..2 {
+        let head = f
+            .store
+            .head(ShardId(shard))
+            .await
+            .expect("head")
+            .expect("genesis");
+        assert_eq!(head.header.election_hash, TEST_ELECTION_HASH);
+    }
+    // 同じストアを、別の選挙定義（init の後に seed を書き換えた）の sealer が担当しようとすると、拒否する。
+    let mut other = Sealer::new(
+        f.store.clone(),
+        f.signer.clone(),
+        f.clock.clone(),
+        f.clock.clone(),
+        SealPolicy::new(100, 10, 10).expect("valid policy"),
+        NonZeroU16::new(2).expect("non-zero"),
+        [0xe2; 32],
+    );
+    let err = other.init_shard(ShardId(1)).await.expect_err("mismatch");
+    assert_eq!(
+        err,
+        SealerError::ElectionMismatch {
+            shard: 1,
+            chain: TEST_ELECTION_HASH,
+            seed: [0xe2; 32],
+        }
+    );
+    assert!(err.to_string().contains("db_reset.sh --all"), "{err}");
+    // 封印済みのブロックも、ジェネシスの値を引き継ぐ。
+    cast(&f.store, 0, 0, 100).await;
+    f.sealer.tick().await;
+    let head = f
+        .store
+        .head(ShardId(0))
+        .await
+        .expect("head")
+        .expect("block");
+    assert_eq!(head.header.height, 1);
+    assert_eq!(head.header.election_hash, TEST_ELECTION_HASH);
 }
 
 #[tokio::test]
@@ -934,6 +986,7 @@ async fn init_fails_on_a_conflict_when_no_chain_exists() {
         Arc::new(ManualClock::new()),
         SealPolicy::new(100, 10, 10).expect("valid policy"),
         shard_count,
+        TEST_ELECTION_HASH,
     );
     assert_eq!(
         sealer.init().await,

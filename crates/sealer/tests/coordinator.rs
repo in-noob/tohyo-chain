@@ -24,6 +24,9 @@ use sealer::{
 
 /// 選挙状態の判定に使う、明示的に進める壁時計。
 /// 壁時計。単調時計（`ManualClock`）と一緒に進み（封印の経過時間は壁時計で測るため）、`set` で飛ばせる。
+/// 選挙定義のハッシュ（テスト用の固定値）。
+const TEST_ELECTION_HASH: domain::Hash32 = [0xe1; 32];
+
 struct ManualWall {
     clock: Arc<ManualClock>,
     offset: std::sync::atomic::AtomicU64,
@@ -170,6 +173,7 @@ impl World {
             // domain::seal_policy と sealer のテストが確認する）。
             SealPolicy::new(100, 10, 1).expect("valid policy"),
             NonZeroU16::new(self.shards).expect("non-zero"),
+            TEST_ELECTION_HASH,
         )
     }
 

@@ -16,6 +16,7 @@ application = { path = "../application" }
 domain = { path = "../domain" }
 infra-scylla = { path = "../infra-scylla" }
 rand.workspace = true
+seed = { path = "../seed" }
 shared-types = { path = "../shared-types" }
 thiserror.workspace = true
 tokio.workspace = true

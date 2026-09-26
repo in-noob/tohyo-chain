@@ -27,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = SealerConfig::load()?;
+    // 選挙定義のハッシュ（ADR 0025）。DB に登録済みの値（先に起動した api / sealer が登録）と違えば、起動を拒否する。
+    let election_hash = config.election_hash()?;
     let clock = Arc::new(SystemClock);
     let store = Arc::new(
         ScyllaStore::connect(
@@ -40,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ScyllaDB への接続に失敗しました")?,
     );
+    store
+        .ensure_election_hash(&election_hash)
+        .await
+        .context("選挙定義の照合に失敗しました")?;
 
     let signer = Arc::new(Ed25519Signer::from_seed(&config.signing_seed));
     let sealer = Sealer::new(
@@ -49,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(SystemMonotonic::new()),
         config.policy,
         config.shard_count,
+        election_hash,
     );
     // 別の署名鍵が既に登録されていれば、ここで起動を拒否する（1 本のチェーンに別の鍵の署名を混ぜない）。
     sealer.register_signer().await.context(
@@ -106,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         max_ballots = config.policy.max_ballots(),
         interval_secs = config.policy.interval_secs(),
         min_ballots_after_interval = config.policy.min_ballots_after_interval(),
+        election_hash = %shared_types::hex::encode(&election_hash),
         "sealer を起動しました"
     );
     let handle = spawn_coordinator(coordinator, DEFAULT_TICK);

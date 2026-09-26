@@ -70,6 +70,19 @@ pub enum SealerError {
     /// 直前のアンカーと矛盾する head（巻き戻し・分岐の疑い）。新しいアンカーで上書きしない。
     #[error("直前のアンカーと矛盾する head です（チェーンの巻き戻し・分岐の疑い）: {0}")]
     AnchorInconsistent(&'static str),
+    /// 既にあるチェーンの選挙定義のハッシュが、手元の seed のハッシュと違う（init の後に seed を書き換えた。ADR 0025）。
+    #[error(
+        "シャード {shard} のチェーンの選挙定義のハッシュ（{}）が、手元の選挙データ（seed）のハッシュ（{}）と一致しません。\
+         init の後に選挙データを書き換えた可能性があります。seed を init の時点の内容に戻すか、選挙をやり直すなら \
+         scripts/db_reset.sh --all で作り直してください",
+        hex::encode(chain),
+        hex::encode(seed)
+    )]
+    ElectionMismatch {
+        shard: u16,
+        chain: domain::Hash32,
+        seed: domain::Hash32,
+    },
 }
 
 /// [`Sealer::finalize_anchor`] の結果。
@@ -106,6 +119,8 @@ pub struct Sealer {
     /// リース・アンカーの周期・締切の待ち時間を測る単調時計。
     mono: Arc<dyn MonotonicClock>,
     policy: SealPolicy,
+    /// 選挙定義のハッシュ（`domain::election_definition_hash`）。ジェネシスに入れ、既にあるチェーンとは照合する。
+    election_hash: domain::Hash32,
     /// シャードごとの、経過時間の起点の材料。添字がシャード番号。
     shards: Vec<ShardClock>,
     /// 投票開始時刻（UNIX 秒）。選挙状態が open になるまでは `None`（[`Sealer::set_voting_started_at`]）。
@@ -130,6 +145,7 @@ impl Sealer {
         mono: Arc<dyn MonotonicClock>,
         policy: SealPolicy,
         shard_count: NonZeroU16,
+        election_hash: domain::Hash32,
     ) -> Self {
         let now = wall.now_unix_secs();
         Self {
@@ -138,6 +154,7 @@ impl Sealer {
             wall,
             mono,
             policy,
+            election_hash,
             shards: vec![
                 ShardClock {
                     last_sealed_at: None,
@@ -214,6 +231,9 @@ impl Sealer {
     /// 封印した後に引き継いだ場合や、再起動した場合）。時刻は分単位に丸めて保存しているので、その分の最後の秒
     /// （`分 * 60 + 59`）を使う。実際の封印時刻より遅い側に寄せることで、`seal.interval_secs` より早く時間による
     /// 封印をすることはない（遅れは最大 59 秒）。
+    ///
+    /// ジェネシスには、選挙定義のハッシュを入れる。チェーンが既にあれば、先頭ブロックの値（ジェネシスから引き継いだもの）が
+    /// 手元の seed のハッシュと同じことを確かめ、違えば `ElectionMismatch`（違う選挙定義のまま封印しない。ADR 0025）。
     pub async fn init_shard(&mut self, shard: ShardId) -> Result<(), SealerError> {
         if usize::from(shard.0) >= self.shards.len() {
             return Err(StoreError::InvalidShard.into());
@@ -221,7 +241,7 @@ impl Sealer {
         self.store.recover(shard).await?;
         if self.store.head(shard).await?.is_none() {
             let minute = unix_minutes(self.wall.now_unix_secs());
-            let block = genesis(&*self.signer, minute);
+            let block = genesis(&*self.signer, minute, self.election_hash);
             match self.store.commit(shard, block, 0).await {
                 Ok(()) => {}
                 // 別のプロセスが同時にジェネシスを作った（追加で競り負けた）。チェーンがあれば成功。
@@ -234,6 +254,13 @@ impl Sealer {
             .head(shard)
             .await?
             .ok_or(SealerError::NotInitialized(shard.0))?;
+        if head.header.election_hash != self.election_hash {
+            return Err(SealerError::ElectionMismatch {
+                shard: shard.0,
+                chain: head.header.election_hash,
+                seed: self.election_hash,
+            });
+        }
         let last_sealed_at = (head.header.height > 0).then(|| {
             head.header
                 .sealed_at_minute
