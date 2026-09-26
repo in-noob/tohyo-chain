@@ -71,6 +71,11 @@ Web投票システムのプロトタイプ。水平スケール可能なAPIと�
    白票の票は、candidate_id に予約値 "blank" をそのまま入れる（形式の版は変えない。ADR 0021）。
    版 3 から、再投票のつながりを持つ票だけ、後ろに 0x01 ‖ slot(32) ‖ seq(4)（初回）または
    0x02 ‖ slot(32) ‖ seq(4) ‖ supersedes(32) を足す（つながりの無い票は版 2 と同じバイト列。ADR 0022）。
+   版 4 から、ヘッダー（118 バイト）の末尾に選挙定義のハッシュ election_hash(32) を足す（ADR 0025）。値は
+   domain::election_definition_hash（読み込んだ後の選挙定義を ID 順に並べた固定長 BE バイナリ。接頭辞
+   "vote/election-definition/v1"。有権者名簿は含めない）で、ジェネシスが持ち、以後のブロックは引き継ぐ。api・sealer は起動時に、
+   既にあるチェーンと cluster_config の値を手元の seed と照合し、違えば起動を拒否する。verify・tally も手元の seed と照合する
+   （違えば NG。tally は終了コード 3）。scripts/check/chain.sh#10 が確認する。
 5. 分離: crates/web は crates/shared-types 以外のワークスペースクレートに依存しない。
    crates/domain は IO・async ランタイム・DBクレートに依存しない。
 6. api はステートレス。セッションは HMAC 署名トークン。サーバメモリに状態を持たない

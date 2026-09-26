@@ -64,6 +64,7 @@ scripts/check/chain.sh          # 1 つのスイートだけ
 | #7 | ビューアの API: ページ送り（新しい順・欠落なし・`limit`・`before_height` の境界）・Cache-Control（`no-cache` / `immutable` / `no-store`）・`reveal_ballots=after_close` の締切前は票が含まれず verifier は終了コード 4・締切後は票と表示名が含まれる・404 |
 | #8 | 封印ルール（dev の設定 interval=10 秒・min=10）: 9 票は 20 秒待っても封印されない → 10 票目で封印（`trigger=time`）→ 5 票 → `close --now` → `trigger=close` の 5 件のブロック → `closed` |
 | #9 | 再投票（DB）: A → B → 白票・上限・同時の再投票（participation の LWT）・`participation` と `slot_state` の行数と seq・締切前は candidate / supersedes / slot が見えず `cast` も返さない・締切で sealer が鍵を破棄・`verify` OK・`tally` は最後の票だけ・変更の内訳・ビューアの置き換えのリンク・締切後の再投票は 403 |
+| #10 | 選挙定義のハッシュ（DB。ADR 0025）: 全ブロック・`election-status` で同じ値・版 4・ビューアの表示 → `verify`・`tally` OK → seed の候補者名を入れ替えると `verify` NG・`tally` 終了コード 3・api と sealer が理由と直し方つきで起動を拒否（ジェネシスとの照合。`cluster_config` に食い違う値を残さない）→ 戻すと OK → 票とチェーンを消しても（`--votes` と同じ）`cluster_config` との照合で拒否 |
 
 ## election.sh — 投票フローと選挙データ・選挙状態
 

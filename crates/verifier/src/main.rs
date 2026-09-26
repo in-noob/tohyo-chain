@@ -635,14 +635,10 @@ mod tests {
         use super::super::*;
         use crate::tally::gate::Refusal;
         use crate::verify::tests::{
-            FakeSource, chain, chain_for, counts_for, reports, source, test_election,
+            FakeSource, chain, chain_for, counts_for, reports, source, test_election as election,
         };
         use domain::ElectionPhase;
         use serde_json::json;
-
-        fn election(districts: u32) -> Election {
-            test_election(districts)
-        }
 
         /// 2 シャード・12 票のチェーンと、突合の値（`extra`: participation の過不足、`pending`: 未封印）。
         fn fixture(extra: i64, pending: u64) -> FakeSource {

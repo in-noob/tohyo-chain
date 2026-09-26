@@ -31,10 +31,13 @@
   ジェネシスが値を持ち（`domain::genesis(signer, 分, election_hash)`）、`seal_block` は前のブロックの値を引き継ぐ。`verify_chain` は、
   全ブロックの値がジェネシスと同じことを確認する（違えば `ChainError::ElectionHashMismatch`）。値は `block_hash` の対象なので、
   書き換えればブロックのハッシュと署名も合わなくなる。
-- **起動時の照合**: api と sealer は、起動時に手元の seed のハッシュを計算し、
-  - db モードでは `cluster_config` の `election_hash` 行に LWT（`IF NOT EXISTS`）で登録し、登録済みの値と違えば起動を拒否する
-    （`shard.count` と同じ仕組み。先に起動した側が値を決めるので、起動の順番に関係なく検出できる）。
-  - 既にあるチェーンの先頭ブロック（ジェネシスから値を引き継いでいる）とも比べ、違えば起動を拒否する（memory モードはこちらだけ）。
+- **起動時の照合**: api と sealer は、起動時に手元の seed のハッシュを計算し、次の順で照合する。
+  1. 既にあるチェーンの先頭ブロック（ジェネシスから値を引き継いでいる）と比べ、違えば起動を拒否する（memory モードはこれだけ。
+     sealer は `Sealer::check_existing_chains`。リースを取った後の `init_shard` でも確かめるが、そこでの失敗はリースを返して続けるだけなので、
+     起動時に止める）。
+  2. db モードでは `cluster_config` の `election_hash` 行に LWT（`IF NOT EXISTS`）で登録し、登録済みの値と違えば起動を拒否する
+     （`shard.count` と同じ仕組み。先に起動した側が値を決めるので、ジェネシスがまだ無くても、起動の順番に関係なく検出できる）。
+     1 の後に行うので、チェーンと食い違う値を登録してしまうことはない。
   - エラーには、理由と直し方（seed を init の時点の内容に戻すか、`scripts/db_reset.sh --all` で作り直す）を出す。
   `db_reset.sh --votes` は `cluster_config` を残すので、選挙定義を変えるには `--all` が要る。
 - **verifier**: `verify` と `tally` は、手元の seed（設定の `election.seed_dir` / `election.election_id`）のハッシュと、全シャードの
