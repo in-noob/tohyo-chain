@@ -42,3 +42,19 @@ scripts/election.sh open --now --yes # 選挙状態を open にする（起動�
 | [docs/testing.md](docs/testing.md) | 確認スイート（`scripts/check/*.sh`）がそれぞれ何を確認しているか |
 | [docs/adr/](docs/adr/) | 設計判断の記録（背景・決定・理由・代替案） |
 | [docs/manual_check_step5.md](docs/manual_check_step5.md) ほか | 画面をブラウザで操作する手動の確認項目（投票画面・ビューア・テーマ） |
+
+## ライセンス
+
+このリポジトリのコードは [Apache License 2.0](LICENSE) で公開している。誰でも利用・改変・再配布できる（商用も可）。
+再配布するとき（改変したもの・組み込んだものを含む）は、[LICENSE](LICENSE) と [NOTICE](NOTICE) を同梱し、NOTICE の出典表示を残すこと。
+
+### 依存するソフトウェアのライセンス
+
+- Rust の依存クレート（`Cargo.lock` に記載のもの）は、すべて MIT・Apache-2.0 などの寛容なライセンス（2026 年 9 月に確認）。
+  このリポジトリは依存を名前と版で参照するだけで、そのコードは含まない。ビルドした成果物（特に、ブラウザに配布される `crates/web` の wasm）を
+  配布するときは、依存クレートの著作権表示とライセンス文も添えること（`cargo about` などで一覧を作れる）。
+- `docker-compose.yml` が参照する DB のコンテナイメージは、このリポジトリに含まれず、使うときに各提供元から取得される。
+  - Cassandra（`cassandra`。ローカル開発の既定）: Apache License 2.0
+  - ScyllaDB（`scylladb/scylla`。`--profile scylla` を明示したときだけ使う）: 2025.1 以降はオープンソースではなく、ScyllaDB 独自の
+    ソース公開型（source-available）ライセンス。使う前に [ScyllaDB のライセンスの FAQ](https://www.scylladb.com/source-available-faq/) で利用条件を確認すること。
+    条件が合わない場合は Cassandra を使う（同じ `docs/schema.cql` で動く）。
